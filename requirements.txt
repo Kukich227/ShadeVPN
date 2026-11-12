@@ -1,0 +1,10 @@
+aiogram>=3.13,<4
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+sqlalchemy[asyncio]>=2.0,<3
+aiosqlite>=0.20,<1
+# To use external PostgreSQL instead of BotHost App Data, install asyncpg separately.
+httpx>=0.27,<1
+cryptography>=43,<47
+pydantic>=2.8,<3
+psutil>=5.9,<8
