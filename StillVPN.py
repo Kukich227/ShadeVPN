@@ -1,4 +1,4 @@
-"""STILL VPN v3 — единый файл: Telegram Bot + админка в боте + Mini App + API + WireGuard-agent.
+"""STILL VPN v5 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -45,15 +45,25 @@ Python 3.11+. Файл развёртывается ДВАЖДЫ, с разны�
     Caddyfile: wg.example.org { reverse_proxy 127.0.0.1:8080 }
     НЕ открывайте порт 8080 в Интернет. Разрешите на VPS TCP/443 + UDP/51820.
     Агент не получает BOT_TOKEN, DATABASE_URL, приватные ключи пользователей.
+    Начиная с v4 агент сохраняет временные разрешения WireGuard в
+    /etc/stillvpn/peer_leases.json (root, chmod 600), проверяет их каждые 15 с.
+    При недоступности BotHost разрешение истечёт через <= 5 минут.
+    Для работы срока действия агент и BotHost должны быть обновлены до v4.
+    Первое обновление агента удалит устаревшие Peer без lease: BotHost восстановит
+    доступ действующим подписчикам после своей очередной синхронизации.
 
 BotFather: /newbot; /setmenubutton -> URL WEBAPP_URL. В BotHost: главный файл
-shade.py, Python, порт из PORT, свой HTTPS-поддомен, один экземпляр приложения.
+StillVPN.py, Python, порт из PORT, свой HTTPS-поддомен, один экземпляр приложения.
 BotHost использует Python-зависимости из интерфейса или requirements.txt
 (можно сгенерировать: python shade.py generate DIR).
 
 Первый запуск: /start, /admin; создать тариф /adm_plan 30 100 2 0 Месяц.
 Дополнительные команды /admin -> «Команды управления».
 Сервис считает покупку подтверждённой ТОЛЬКО при successful_payment Telegram.
+
+MINI APP АДМИНКА v5: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
+из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
+базу не удалять. Только v5 на BotHost, VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
     python shade.py selftest                  — автономные тесты криптографических проверок
@@ -156,6 +166,8 @@ WG_INTERFACE = os.getenv("WG_INTERFACE", "wg0")
 ENABLE_PAYMENTS = os.getenv("ENABLE_PAYMENTS", "0") == "1"
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
 TERMS_URL = os.getenv("TERMS_URL", "")
+WG_PEER_LEASE_SECONDS = min(900, max(120, int(os.getenv("WG_PEER_LEASE_SECONDS", "300"))))
+WG_AGENT_LEASE_PATH = pathlib.Path(os.getenv("WG_AGENT_LEASE_PATH", "/etc/stillvpn/peer_leases.json"))
 UTC = timezone.utc
 
 def now() -> datetime:
@@ -184,7 +196,7 @@ def validate_init_data(raw: str, max_age: int = 86400) -> dict:
     data = dict(pairs)
     if len(pairs) != len(data) or not data.get("hash"):
         bad(401, "Некорректные данные Telegram")
-    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs) if k not in ("hash", "signature"))
+    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs) if k != "hash")
     key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
     expected = hmac.new(key, check.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, data["hash"]):
@@ -487,6 +499,12 @@ def command_selftest():
         data["hash"] = hmac.new(auth_key, check.encode(), hashlib.sha256).hexdigest()
         raw = "&".join(f"{k}={quote(v, safe='')}" for k, v in data.items())
         assert validate_init_data(raw)["id"] == person["id"]
+        signed_data = dict(data)
+        signed_data["signature"] = "telegram-ed25519-signature-field"
+        signed_check = "\n".join(f"{k}={v}" for k, v in sorted(signed_data.items()) if k != "hash")
+        signed_data["hash"] = hmac.new(auth_key, signed_check.encode(), hashlib.sha256).hexdigest()
+        signed_raw = "&".join(f"{k}={quote(v, safe='')}" for k, v in signed_data.items())
+        assert validate_init_data(signed_raw)["id"] == person["id"]
         def should_fail(value):
             try: validate_init_data(value)
             except HTTPException as exc:
@@ -494,6 +512,7 @@ def command_selftest():
                 return
             raise AssertionError("Invalid initData was accepted")
         should_fail(raw.replace("testuser", "hacker"))
+        should_fail(signed_raw.replace("telegram-ed25519", "forged"))
         should_fail(raw + "&auth_date=5")
         expired = dict(data);expired["auth_date"] = str(auth_date - 90000)
         check = "\n".join(f"{k}={v}" for k,v in sorted(expired.items()) if k != "hash")
@@ -545,6 +564,7 @@ if MODE == "app":
         BotCommand
     )
     from cryptography.fernet import Fernet
+    from html import escape as html_escape
     import httpx
 
     class UTCDateTime(TypeDecorator):
@@ -789,7 +809,19 @@ if MODE == "app":
     dp = Dispatcher()
     router = Router()
     dp.include_router(router)
-    fernet = Fernet(GIFT_FERNET_KEY.encode()) if GIFT_FERNET_KEY else None
+    try:
+        fernet = Fernet(GIFT_FERNET_KEY.encode()) if GIFT_FERNET_KEY else None
+    except (ValueError, TypeError):
+        # A malformed optional key must not take down the entire VPN service.
+        # Gift code retrieval and new Stars invoices remain disabled.
+        LOG.error("GIFT_FERNET_KEY некорректен: подарочные коды и новые платежи отключены")
+        fernet = None
+
+    def payments_ready() -> bool:
+        # Only valid, complete payment configuration may create/accept new invoices.
+        # Existing successful_payment callbacks are still processed for idempotent fulfillment.
+        return bool(ENABLE_PAYMENTS and TERMS_URL.startswith("https://")
+                    and fernet is not None and len(WG_AGENT_SECRET) >= 32)
 
     async def db_session():
         async with Session() as s:
@@ -920,10 +952,17 @@ if MODE == "app":
             response.raise_for_status()
             return response.json()
 
-    async def apply_peer(device: Device, node: ServerNode, allow: bool) -> None:
-        await agent_request(node, "POST", "/agent/peer", {
-            "public_key": device.public_key, "ip": device.peer_ip, "allow": allow
-        })
+    async def apply_peer(device: Device, node: ServerNode, allow: bool,
+                         valid_until: datetime | None = None) -> None:
+        payload = {"public_key": device.public_key, "ip": device.peer_ip, "allow": allow}
+        if allow:
+            # Lease renewal is sent every minute; if BotHost goes offline, the VPS
+            # automatically removes access after at most WG_PEER_LEASE_SECONDS.
+            deadline = now() + timedelta(seconds=WG_PEER_LEASE_SECONDS)
+            if valid_until is not None:
+                deadline = min(deadline, valid_until)
+            payload["expires_at"] = int(deadline.timestamp())
+        await agent_request(node, "POST", "/agent/peer", payload)
 
     async def ensure_access(s: AsyncSession, uid: int):
         user = await s.get(User, uid)
@@ -936,10 +975,12 @@ if MODE == "app":
             if not node:
                 continue
             should = bool(granted and dev.enabled)
-            if dev.provisioned == should:
+            # Active devices must renew their short-lived leases even when
+            # already provisioned; inactive devices need a single revocation.
+            if not should and not dev.provisioned:
                 continue
             try:
-                await apply_peer(dev, node, should)
+                await apply_peer(dev, node, should, granted["end"] if should else None)
                 dev.provisioned = should
             except Exception as exc:
                 LOG.warning("Peer reconcile failed (%s): %s", dev.id, exc)
@@ -968,6 +1009,10 @@ if MODE == "app":
                 dev.provisioned = True
             else:
                 dev.provisioned = False
+                # The old kernel counters are no longer valid after removal;
+                # fresh peers start from zero, preventing missed traffic.
+                dev.peer_rx = 0
+                dev.peer_tx = 0
         health = await s.get(NodeHealth, node.id)
         if not health:
             health = NodeHealth(server_id=node.id)
@@ -1125,6 +1170,13 @@ if MODE == "app":
                     s.add(ServerNode(id=1, location=WG_SERVER_LOCATION, endpoint=WG_SERVER_ENDPOINT,
                                      public_key=WG_SERVER_PUBLIC_KEY, cidr=WG_SERVER_CIDR,
                                      agent_url=WG_AGENT_URL, next_host=2))
+                else:
+                    # Previously this applied only on first startup, leaving a
+                    # stale Funnel URL in existing App Data after changing env.
+                    node.agent_url = WG_AGENT_URL
+                    node.endpoint = WG_SERVER_ENDPOINT
+                    node.public_key = WG_SERVER_PUBLIC_KEY
+                    node.cidr = WG_SERVER_CIDR
 
     @router.message.middleware()
     async def private_admin_middleware(handler, event: Message, data: dict):
@@ -1134,28 +1186,98 @@ if MODE == "app":
             return None
         return await handler(event, data)
 
-    @router.message(CommandStart())
-    async def cmd_start(message: Message):
-        if not message.from_user:
+    def mini_url(section: str = "home") -> str:
+        # WebAppInfo URL is opened inside the same Telegram bot WebView.
+        # Keep navigation parameters separate from Telegram auth initData.
+        return WEBAPP_URL + "/?tab=" + section
+
+    def user_menu(admin: bool = False) -> InlineKeyboardMarkup:
+        links = [
+            [InlineKeyboardButton(text="Открыть Still VPN", web_app=WebAppInfo(url=mini_url()))],
+            [InlineKeyboardButton(text="Тарифы", web_app=WebAppInfo(url=mini_url("plans"))),
+             InlineKeyboardButton(text="Профиль", web_app=WebAppInfo(url=mini_url("account")))],
+            [InlineKeyboardButton(text="Подключение", web_app=WebAppInfo(url=mini_url("connect"))),
+             InlineKeyboardButton(text="Поддержка", callback_data="user:support")],
+        ]
+        if admin:
+            links.append([InlineKeyboardButton(text="Панель управления", web_app=WebAppInfo(url=mini_url("admin")))])
+        return InlineKeyboardMarkup(inline_keyboard=links)
+
+    async def send_user_menu(message: Message, focus: str = "home") -> None:
+        if not message.from_user or message.chat.type != "private":
             return
         async with Session.begin() as s:
             await upsert_user(s, message.from_user)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Открыть Still VPN", web_app=WebAppInfo(url=WEBAPP_URL))
-        ]])
-        await message.answer("STILL VPN · Тихая сторона сети.\nПодписки, устройства и подключение — в приложении.", reply_markup=kb)
+            role = await role_of(s, message.from_user.id)
+        name = html_escape(message.from_user.first_name or "друг")
+        if focus == "home":
+            text_msg = (f"<b>STILL VPN</b>  ·  PRIVATE NETWORK\n\n"
+                        f"Привет, {name}.\n"
+                        "Ваше подключение, устройства и подписка — в одном месте.\n\n"
+                        "<b>Откройте приложение</b>, чтобы проверить доступ или настроить VPN.\n"
+                        "Если нужна помощь, напишите /support.")
+        else:
+            names = {"plans": "Тарифы и подписка", "account": "Ваш профиль", "connect": "Подключение"}
+            text_msg = (f"<b>{names.get(focus, 'Still VPN')}</b>\n\n"
+                        "Выберите раздел ниже. Все изменения выполняются в защищённом Mini App.")
+        await message.answer(text_msg, parse_mode="HTML", reply_markup=user_menu(bool(role)))
+
+    @router.message(CommandStart())
+    async def cmd_start(message: Message):
+        await send_user_menu(message)
+
+    @router.message(Command("profile"))
+    async def cmd_profile(message: Message):
+        await send_user_menu(message, "account")
+
+    @router.message(Command("plans"))
+    async def cmd_plans(message: Message):
+        await send_user_menu(message, "plans")
+
+    @router.message(Command("connect"))
+    async def cmd_connect(message: Message):
+        await send_user_menu(message, "connect")
+
+    @router.callback_query(F.data == "user:support")
+    async def user_support_callback(callback: CallbackQuery):
+        await callback.answer()
+        if callback.message and callback.message.chat.type == "private":
+            await callback.message.answer(
+                "<b>Поддержка Still VPN</b>\n\n"
+                "Отправьте /support, затем опишите проблему обычным сообщением.\n"
+                "<i>Для вопросов по оплате используйте /paysupport.</i>", parse_mode="HTML")
 
     @router.message(Command("help"))
     async def cmd_help(message: Message):
-        await message.answer("Команды: /start, /help, /support, /terms, /paysupport.\nУправление VPN и оплата — в Mini App.")
+        await message.answer(
+            "<b>Still VPN · помощь</b>\n\n"
+            "<b>Быстрые команды</b>\n"
+            "/start — открыть приложение\n"
+            "/profile — профиль\n"
+            "/plans — тарифы\n"
+            "/connect — устройства и VPN\n"
+            "/support — написать в поддержку\n"
+            "/terms — условия использования\n"
+            "/paysupport — оплата и возвраты\n\n"
+            "<i>Управление подпиской, QR-коды и VPN-конфигурации доступны в Mini App.</i>",
+            parse_mode="HTML", reply_markup=user_menu(False))
 
     @router.message(Command("terms"))
     async def cmd_terms(message: Message):
-        await message.answer("Условия использования: " + (TERMS_URL or "Временно не опубликованы. Оплата отключена до публикации условий."))
+        if TERMS_URL.startswith("https://"):
+            msg = "<b>Условия Still VPN</b>\n\n" + html_escape(TERMS_URL)
+        else:
+            msg = "<b>Условия Still VPN</b>\n\nДокумент пока не опубликован. Новые платежи отключены."
+        await message.answer(msg, parse_mode="HTML")
 
     @router.message(Command("paysupport"))
     async def cmd_paysupport(message: Message):
-        await message.answer("Вопросы оплаты и возвратов: /support. По вопросам возврата Stars укажите ID платежа.")
+        await message.answer(
+            "<b>Оплата и возвраты</b>\n\n"
+            "Still VPN принимает Telegram Stars только после серверного подтверждения платежа.\n"
+            "Если возникла проблема, отправьте /support и укажите ID платежа из раздела «Тарифы».\n\n"
+            "<i>Не отправляйте пароли, ключи и банковские данные.</i>",
+            parse_mode="HTML")
 
     @router.message(Command("support"))
     async def cmd_support(message: Message):
@@ -1169,7 +1291,9 @@ if MODE == "app":
                 s.add(t)
                 await s.flush()
             ticket_id = t.id
-        await message.answer(f"Обращение #{ticket_id}. Отправьте следующим сообщением ваш вопрос.")
+        await message.answer(f"<b>Обращение #{ticket_id}</b>\n\nОпишите вашу проблему одним сообщением. "
+                             "Ответ придёт здесь, в Telegram.\n\n"
+                             "<i>Не пересылайте приватные ключи и пароли.</i>", parse_mode="HTML")
         staff_ids = set(OWNER_IDS)
         async with Session() as s:
             staff_ids.update((await s.scalars(select(Admin.user_id).where(
@@ -1181,7 +1305,7 @@ if MODE == "app":
     @router.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery):
         payload = query.invoice_payload
-        if not payload.startswith("shade:") or not ENABLE_PAYMENTS:
+        if not payload.startswith("shade:") or not payments_ready():
             await query.answer(ok=False, error_message="Оплата временно недоступна")
             return
         pid = payload[6:]
@@ -1280,14 +1404,19 @@ if MODE == "app":
         live_nodes = await s.scalar(select(func.count()).select_from(NodeHealth).where(
             NodeHealth.last_seen >= now() - timedelta(minutes=3))) or 0
         tickets = await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0
-        return ("STILL · статистика из базы данных\n"
-                f"Всего пользователей: {users} · за 24 ч: +{registrations}\n"
-                f"Активные подписки: {subscriptions} · истёкшие: {expired}\n"
-                f"Активные пробные: {trials}\nУстройства с доступом: {devices}\n"
-                f"Серверов включено: {servers}, отвечали за 3 мин: {live_nodes}\n"
-                f"Подтверждённых платежей: {payments}, возвратов: {refunds}\n"
-                f"Получено Stars за невозвращённые покупки: {stars}⭐\n"
-                f"Открытых обращений: {tickets}")
+        return ("STILL VPN · Администрирование\n\n"
+                "ПОЛЬЗОВАТЕЛИ\n"
+                f"Всего: {users} · новых за 24 ч: {registrations}\n"
+                f"Подписки: {subscriptions} активных, {expired} истёкших\n"
+                f"Пробные периоды: {trials} активных\n"
+                f"VPN-устройства: {devices}\n\n"
+                "ИНФРАСТРУКТУРА\n"
+                f"Серверы: {live_nodes}/{servers} отвечали за 3 минуты\n"
+                f"Открытые обращения: {tickets}\n\n"
+                "ПЛАТЕЖИ\n"
+                f"Подтверждено: {payments} · возвраты: {refunds}\n"
+                f"Получено Stars (без возвратов): {stars} ⭐\n\n"
+                "Полные данные и управление — кнопка «Открыть админ-панель».")
 
     def admin_keyboard(role: str):
         lines = []
@@ -1305,6 +1434,7 @@ if MODE == "app":
             if can(role, "servers"):
                 second.append(InlineKeyboardButton(text="🖥 Серверы", callback_data="adm:servers"))
             lines.append(second)
+        lines.append([InlineKeyboardButton(text="Открыть админ-панель", web_app=WebAppInfo(url=mini_url("admin")))])
         lines.append([InlineKeyboardButton(text="🧾 Команды управления", callback_data="adm:help")])
         return InlineKeyboardMarkup(inline_keyboard=lines)
 
@@ -1329,6 +1459,7 @@ if MODE == "app":
         "/adm_trial_users — история пробных периодов\n"
         "/adm_peer_list ID, /adm_peer_revoke UUID причина — устройства / отзыв\n"
         "/adm_server_status ID — живые CPU/RAM/диск/сеть/Peer\n"
+        "/adm_diag — проверить БД, Telegram-настройки, VPN-агент и платежи\n"
         "/adm_server_edit ID LOCATION HOST:PORT — обновить местоположение и endpoint\n"
         "/adm_server_delete ID причина — удалить сервер без устройств\n"
         "/adm_plan_on ID — показать тариф\n"
@@ -1883,6 +2014,33 @@ if MODE == "app":
             await ensure_access(s, uid)
         await message.answer("Peer отозван (если агент недоступен, повторит воркер)")
 
+    @router.message(Command("adm_diag"))
+    async def adm_diag(message: Message):
+        if not await require_role(message.from_user.id, {"owner", "administrator"}):
+            return
+        lines = ["Still VPN · диагностика без изменения данных"]
+        try:
+            async with Session() as check:
+                await check.execute(text("SELECT 1"))
+                node = await check.get(ServerNode, 1)
+            lines.append("База данных: OK")
+        except Exception as exc:
+            node = None
+            lines.append("База данных: ошибка (" + type(exc).__name__ + ")")
+        lines.append("Mini App HTTPS: " + ("OK" if WEBAPP_URL.startswith("https://") else "НЕ НАСТРОЕН"))
+        lines.append("Платежи Stars: " + ("ГОТОВЫ К ТЕСТАМ" if payments_ready() else "ВЫКЛЮЧЕНЫ/НЕ ГОТОВЫ"))
+        if node:
+            try:
+                stats = await agent_request(node, "GET", "/agent/stats")
+                lines.append("VPN агент HTTPS/HMAC: OK")
+                lines.append("Версия агента: " + str(stats.get("agent_version", "старая (<4)")))
+                lines.append("Активных Peer: " + str(len(stats.get("peers", []))))
+            except Exception as exc:
+                lines.append("VPN агент: ошибка " + type(exc).__name__ + " — " + str(exc)[:100])
+        else:
+            lines.append("VPN сервер #1: отсутствует в БД")
+        await message.answer("\n".join(lines))
+
     @router.message(Command("adm_server_status"))
     async def adm_server_status(message: Message):
         if not await require_role(message.from_user.id, {"owner", "administrator", "viewer"}): return
@@ -2025,6 +2183,11 @@ if MODE == "app":
         person = validate_init_data(raw)
         uid = person["id"]
         key = str(uid) + ":" + req.url.path
+        if len(rate) > 10000:
+            cutoff = time.monotonic() - 60
+            for old_key, (started, _) in list(rate.items()):
+                if started < cutoff:
+                    rate.pop(old_key, None)
         t, n = rate.get(key, (time.monotonic(), 0))
         if time.monotonic() - t >= 60:
             t, n = time.monotonic(), 0
@@ -2084,7 +2247,8 @@ if MODE == "app":
                 "created_at": user.created_at, "traffic_total": user.traffic_bytes,
                 "device_count": count, "trial_used": tr is not None,
                 "subscription": e and {**e, "end": e["end"].isoformat()},
-                "payments_enabled": ENABLE_PAYMENTS and TERMS_URL.startswith("https://") and bool(fernet)}
+                "payments_enabled": payments_ready(),
+                "admin_role": await role_of(s, user.id)}
 
     @app.get("/api/plans")
     async def api_plans(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
@@ -2124,7 +2288,7 @@ if MODE == "app":
 
     @app.post("/api/invoice")
     async def api_invoice(data: InvoiceIn, user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
-        if not ENABLE_PAYMENTS or not TERMS_URL.startswith("https://") or not fernet:
+        if not payments_ready():
             bad(503, "Оплата ещё не настроена администратором")
         if data.kind not in ("subscription", "gift"):
             bad(422, "Неизвестный тип покупки")
@@ -2197,9 +2361,18 @@ if MODE == "app":
     @app.get("/api/gifts")
     async def api_gifts(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
         rows = (await s.scalars(select(Gift).where(Gift.buyer_id == user.id).order_by(Gift.expires_at.desc()))).all()
-        return [{"id": x.id, "name": x.name, "code": fernet.decrypt(x.code_encrypted.encode()).decode()
-                 if fernet and not x.invalid and not x.used_by else None,
-                 "expires_at": x.expires_at, "used": bool(x.used_by), "invalid": x.invalid} for x in rows]
+        result = []
+        for x in rows:
+            code = None
+            if fernet and not x.invalid and not x.used_by:
+                try:
+                    code = fernet.decrypt(x.code_encrypted.encode()).decode()
+                except Exception:
+                    # Wrong/rotated key must not cause a 500 for the whole profile.
+                    LOG.error("Gift %s decrypt failed: restore original GIFT_FERNET_KEY", x.id)
+            result.append({"id": x.id, "name": x.name, "code": code,
+                           "expires_at": x.expires_at, "used": bool(x.used_by), "invalid": x.invalid})
+        return result
 
     class RedeemIn(BaseModel):
         code: str = Field(min_length=8, max_length=80)
@@ -2277,7 +2450,7 @@ if MODE == "app":
                         "server_key": node.public_key, "endpoint": node.endpoint,
                         "status": "provisioning"}
         try:
-            await apply_peer(d, node, True)
+            await apply_peer(d, node, True, entitlement_data["end"])
             async with Session.begin() as s2:
                 created = await s2.get(Device, d.id)
                 if created: created.provisioned = True
@@ -2314,6 +2487,375 @@ if MODE == "app":
             if not d or d.user_id != user.id or not d.enabled: bad(404, "Нет устройства")
             d.name = data.name
         return {"ok": True}
+
+    # Administrative Mini App API. No admin endpoint trusts a role from the browser;
+    # role/permission is resolved from the authenticated Telegram ID on every request.
+    def admin_scope(permission: str):
+        async def check(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+            role = await role_of(s, user.id)
+            if role not in ADMIN_ROLES or (permission != "access" and not can(role, permission)):
+                bad(403, "Недостаточно прав для этого раздела")
+            return (user.id, role)
+        return check
+
+    def dt_iso(v):
+        return v.isoformat() if v else None
+
+    class AdminReason(BaseModel):
+        reason: str = Field(min_length=3, max_length=500)
+
+    class AdminBlock(AdminReason):
+        blocked: bool
+
+    class AdminGrant(AdminReason):
+        days: int = Field(ge=1, le=365)
+        devices: int = Field(ge=1, le=20)
+        traffic_gb: int = Field(ge=0, le=10000, default=0)
+
+    class AdminPlanData(BaseModel):
+        title: str = Field(min_length=2, max_length=120)
+        days: int = Field(ge=1, le=3650)
+        stars: int = Field(ge=1, le=250000)
+        devices: int = Field(ge=1, le=20)
+        traffic_gb: int = Field(ge=0, le=10000, default=0)
+        enabled: bool = True
+
+    class AdminServerState(AdminReason):
+        enabled: bool
+
+    class AdminReply(BaseModel):
+        text: str = Field(min_length=1, max_length=3500)
+
+    class AdminTrialSettings(BaseModel):
+        enabled: bool
+        hours: int = Field(ge=1, le=720)
+        traffic_gb: int = Field(ge=0, le=10000)
+        devices: int = Field(ge=1, le=20)
+
+    class AdminStaffRole(AdminReason):
+        role: str
+
+    def plan_dict(p: Plan):
+        return {"id": p.id, "title": p.title, "days": p.days, "stars": p.stars,
+                "devices": p.devices, "traffic_gb": (p.traffic_bytes // 1024**3 if p.traffic_bytes else 0),
+                "enabled": p.enabled}
+
+    @app.get("/api/admin/summary")
+    async def admin_summary(actor=Depends(admin_scope("access")), s: AsyncSession = Depends(db_session)):
+        uid, role = actor
+        output = {"role": role, "permissions": sorted(ADMIN_PERMS.get(role, set()))}
+        if can(role, "stats"):
+            output["stats"] = {
+                "users": await s.scalar(select(func.count()).select_from(User)) or 0,
+                "new_users": await s.scalar(select(func.count()).select_from(User).where(User.created_at >= now()-timedelta(days=1))) or 0,
+                "subscriptions": await s.scalar(select(func.count()).select_from(Subscription).where(
+                    Subscription.starts_at <= now(), Subscription.ends_at > now(), Subscription.revoked.is_(False))) or 0,
+                "trials": await s.scalar(select(func.count()).select_from(Trial).where(Trial.ends_at > now())) or 0,
+                "devices": await s.scalar(select(func.count()).select_from(Device).where(Device.enabled.is_(True))) or 0,
+                "servers": await s.scalar(select(func.count()).select_from(ServerNode).where(ServerNode.enabled.is_(True))) or 0,
+                "healthy_servers": await s.scalar(select(func.count()).select_from(NodeHealth).join(
+                    ServerNode, NodeHealth.server_id == ServerNode.id).where(
+                    ServerNode.enabled.is_(True), NodeHealth.last_seen >= now()-timedelta(minutes=3))) or 0,
+                "expired_subs": await s.scalar(select(func.count()).select_from(Subscription).where(
+                    Subscription.ends_at <= now(), Subscription.revoked.is_(False))) or 0,
+                "tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0,
+            }
+        if can(role, "finance"):
+            output["finance"] = {
+                "payments": await s.scalar(select(func.count()).select_from(Payment).where(Payment.status == "paid")) or 0,
+                "stars": await s.scalar(select(func.coalesce(func.sum(Payment.amount),0)).where(Payment.status == "paid")) or 0,
+                "refunds": await s.scalar(select(func.count()).select_from(Payment).where(Payment.status == "refunded")) or 0,
+            }
+        if can(role, "support") and "stats" not in output:
+            output["support"] = {"open_tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0}
+        if can(role, "audit"):
+            events = (await s.scalars(select(Audit).order_by(Audit.id.desc()).limit(8))).all()
+            output["events"] = [{"date": dt_iso(x.created_at), "action": x.action, "target": x.target,
+                                 "admin_id": x.admin_id} for x in events]
+        return output
+
+    @app.get("/api/admin/users")
+    async def admin_users(q: str = "", actor=Depends(admin_scope("users")), s: AsyncSession = Depends(db_session)):
+        q = q.strip().lstrip("@")[:80]
+        stmt = select(User)
+        if q:
+            stmt = stmt.where(User.id == int(q)) if q.isdigit() else stmt.where(User.username.ilike("%" + q + "%"))
+        rows = (await s.scalars(stmt.order_by(User.created_at.desc()).limit(30))).all()
+        return [{"id": u.id, "username": u.username, "first_name": u.first_name,
+                 "blocked": u.blocked, "created_at": dt_iso(u.created_at)} for u in rows]
+
+    @app.get("/api/admin/users/{user_id}")
+    async def admin_user_detail(user_id: int, actor=Depends(admin_scope("users")), s: AsyncSession = Depends(db_session)):
+        u = await s.get(User, user_id)
+        if not u: bad(404, "Пользователь не найден")
+        subscriptions = (await s.scalars(select(Subscription).where(Subscription.user_id == user_id)
+                                          .order_by(Subscription.id.desc()).limit(30))).all()
+        devices = (await s.scalars(select(Device).where(Device.user_id == user_id)
+                                    .order_by(Device.created_at.desc()).limit(50))).all()
+        tr = await s.get(Trial, user_id)
+        output = {"id": u.id, "username": u.username, "first_name": u.first_name,
+                  "created_at": dt_iso(u.created_at), "blocked": u.blocked,
+                  "trial": ({"starts_at": dt_iso(tr.started_at), "ends_at": dt_iso(tr.ends_at)} if tr else None),
+                  "subscriptions": [{"id": x.id,"name":x.name,"starts_at":dt_iso(x.starts_at),
+                                     "ends_at":dt_iso(x.ends_at),"revoked":x.revoked,"source":x.source} for x in subscriptions],
+                  "devices": [{"id":x.id,"name":x.name,"ip":x.peer_ip,"enabled":x.enabled,
+                               "provisioned":x.provisioned,"last_handshake":dt_iso(x.last_handshake)} for x in devices]}
+        if can(actor[1], "finance"):
+            pays = (await s.scalars(select(Payment).where(Payment.user_id == user_id).order_by(Payment.created_at.desc()).limit(20))).all()
+            output["payments"] = [{"id":p.id,"amount":p.amount,"status":p.status} for p in pays]
+        return output
+
+    @app.post("/api/admin/users/{user_id}/block")
+    async def admin_user_block(user_id: int, data: AdminBlock, actor=Depends(admin_scope("users"))):
+        admin_id, role = actor
+        if role not in WRITERS: bad(403, "Блокировки разрешены только управляющим")
+        if user_id in OWNER_IDS or user_id == admin_id: bad(403, "Нельзя заблокировать владельца или самого себя")
+        async with Session.begin() as s:
+            u = await s.get(User, user_id, with_for_update=True)
+            if not u: bad(404, "Пользователь не найден")
+            u.blocked = data.blocked
+            audit(s, admin_id, "block" if data.blocked else "unblock", user_id, data.reason)
+        async with Session.begin() as s: await ensure_access(s, user_id)
+        return {"ok": True}
+
+    @app.post("/api/admin/users/{user_id}/grant")
+    async def admin_user_grant(user_id: int, data: AdminGrant, actor=Depends(admin_scope("users"))):
+        admin_id, role = actor
+        if role not in WRITERS: bad(403, "Выдавать подписки могут только управляющие")
+        async with Session.begin() as s:
+            u = await s.get(User, user_id, with_for_update=True)
+            if not u: bad(404, "Пользователь не найден")
+            sub = await add_subscription(s, u, "Выдано администратором", data.days,
+                                         data.devices, data.traffic_gb * 1024**3 if data.traffic_gb else None, "admin")
+            audit(s, admin_id, "subscription_give", user_id, data.reason)
+            await queue_notice(s, user_id, "manual", str(sub.id), "Администратор выдал подписку Still VPN.")
+        async with Session.begin() as s: await ensure_access(s, user_id)
+        return {"ok": True}
+
+    @app.post("/api/admin/devices/{device_id}/revoke")
+    async def admin_device_revoke(device_id: str, data: AdminReason, actor=Depends(admin_scope("users"))):
+        admin_id, role = actor
+        if role not in WRITERS: bad(403, "Отзыв Peer разрешён только управляющим")
+        async with Session.begin() as s:
+            d = await s.get(Device, device_id, with_for_update=True)
+            if not d: bad(404, "Устройство не найдено")
+            d.enabled = False
+            uid = d.user_id
+            audit(s, admin_id, "peer_revoke", device_id, data.reason)
+        async with Session.begin() as s: await ensure_access(s, uid)
+        return {"ok": True}
+
+    @app.post("/api/admin/users/{user_id}/revoke")
+    async def admin_revoke_all(user_id: int, data: AdminReason, actor=Depends(admin_scope("users"))):
+        admin_id, role = actor
+        if role not in WRITERS: bad(403, "Отзыв Peer разрешён только управляющим")
+        async with Session.begin() as s:
+            if not await s.get(User, user_id): bad(404, "Пользователь не найден")
+            await s.execute(update(Device).where(Device.user_id == user_id).values(enabled=False))
+            audit(s, admin_id, "revoke_all_peers", user_id, data.reason)
+        async with Session.begin() as s: await ensure_access(s, user_id)
+        return {"ok": True}
+
+    @app.get("/api/admin/plans")
+    async def admin_plans(actor=Depends(admin_scope("plans")), s: AsyncSession = Depends(db_session)):
+        rows = (await s.scalars(select(Plan).order_by(Plan.days, Plan.id))).all()
+        return [plan_dict(p) for p in rows]
+
+    @app.post("/api/admin/plans")
+    async def admin_plan_create(data: AdminPlanData, actor=Depends(admin_scope("plans"))):
+        if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
+        async with Session.begin() as s:
+            p = Plan(title=data.title.strip(),days=data.days,stars=data.stars,devices=data.devices,
+                     traffic_bytes=data.traffic_gb*1024**3 if data.traffic_gb else None,enabled=data.enabled)
+            s.add(p)
+            await s.flush()
+            audit(s, actor[0], "plan_create", p.id, p.title)
+            pid = p.id
+        return {"ok":True, "id":pid}
+
+    @app.put("/api/admin/plans/{plan_id}")
+    async def admin_plan_update(plan_id: int, data: AdminPlanData, actor=Depends(admin_scope("plans"))):
+        if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
+        async with Session.begin() as s:
+            p = await s.get(Plan, plan_id, with_for_update=True)
+            if not p: bad(404, "Тариф не найден")
+            p.title=data.title.strip();p.days=data.days;p.stars=data.stars;p.devices=data.devices
+            p.traffic_bytes=data.traffic_gb*1024**3 if data.traffic_gb else None
+            p.enabled=data.enabled
+            audit(s, actor[0], "plan_update", plan_id, "Изменены только будущие продажи")
+        return {"ok": True}
+
+    class AdminPromoIn(BaseModel):
+        kind: str
+        days_or_percent: int = Field(ge=1, le=365)
+        max_uses: int = Field(ge=1, le=10000)
+        hours: int = Field(ge=1, le=8760)
+
+    @app.get("/api/admin/promos")
+    async def admin_promos(actor=Depends(admin_scope("plans")),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Promo).order_by(Promo.id.desc()).limit(60))).all()
+        return [{"id":p.id,"type":"discount" if p.discount_percent else "days",
+                 "value":p.discount_percent if p.discount_percent else p.days,
+                 "uses":p.uses,"max_uses":p.max_uses,"enabled":p.enabled,
+                 "expires_at":dt_iso(p.expires_at)} for p in rows]
+
+    @app.post("/api/admin/promos")
+    async def admin_promo_create(data:AdminPromoIn,actor=Depends(admin_scope("plans"))):
+        if actor[1] not in WRITERS:bad(403,"Недостаточно прав")
+        if data.kind not in ("days","discount"):bad(422,"Неверный тип")
+        if data.kind=="discount" and not (1<=data.days_or_percent<=95):bad(422,"Скидка должна быть от 1 до 95%")
+        code=("STILL-" if data.kind=="days" else "STILL-D-")+secrets.token_urlsafe(18).upper()
+        async with Session.begin() as s:
+            p=Promo(code_hash=code_hash(code),days=data.days_or_percent if data.kind=="days" else 0,
+                    discount_percent=data.days_or_percent if data.kind=="discount" else 0,
+                    max_uses=data.max_uses,expires_at=now()+timedelta(hours=data.hours),devices=1)
+            s.add(p);await s.flush()
+            audit(s,actor[0],"promo_create",p.id,f"{data.kind} {data.days_or_percent}; limit={data.max_uses}")
+        return {"id":p.id,"code":code,"display_once":True}
+
+    @app.post("/api/admin/promos/{promo_id}/disable")
+    async def admin_promo_disable(promo_id:int,data:AdminReason,actor=Depends(admin_scope("plans"))):
+        if actor[1] not in WRITERS:bad(403,"Недостаточно прав")
+        async with Session.begin() as s:
+            p=await s.get(Promo,promo_id,with_for_update=True)
+            if not p:bad(404,"Промокод не найден")
+            p.enabled=False
+            audit(s,actor[0],"promo_disable",promo_id,data.reason)
+        return {"ok":True}
+
+    @app.get("/api/admin/servers")
+    async def admin_servers(actor=Depends(admin_scope("servers")), s: AsyncSession = Depends(db_session)):
+        nodes = (await s.scalars(select(ServerNode).order_by(ServerNode.id))).all()
+        out=[]
+        for n in nodes:
+            h = await s.get(NodeHealth,n.id)
+            online=bool(h and h.last_seen and h.last_seen >= now()-timedelta(minutes=3))
+            out.append({"id":n.id,"location":n.location,"enabled":n.enabled,"online":online,
+                        "endpoint":n.endpoint,"peer_count":h.peer_count if h else None,
+                        "cpu":round(h.cpu_percent,1) if h and h.cpu_percent is not None else None,
+                        "ram_used":h.memory_used if h else None,"ram_total":h.memory_total if h else None,
+                        "disk_free":h.disk_free if h else None,"network_rx":h.network_rx if h else None,
+                        "network_tx":h.network_tx if h else None,"last_seen":dt_iso(h.last_seen) if h else None,
+                        "error":h.error if h else ""})
+        return out
+
+    @app.post("/api/admin/servers/{server_id}/state")
+    async def admin_server_state(server_id:int, data:AdminServerState, actor=Depends(admin_scope("servers"))):
+        if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
+        async with Session.begin() as s:
+            node=await s.get(ServerNode,server_id,with_for_update=True)
+            if not node: bad(404,"Сервер не найден")
+            if data.enabled:
+                try: await agent_request(node,"GET","/agent/stats")
+                except Exception: bad(503,"Агент недоступен; включение отменено")
+            node.enabled=data.enabled
+            audit(s,actor[0],"server_enabled",server_id,data.reason+" enabled="+str(data.enabled))
+        return {"ok":True}
+
+    @app.get("/api/admin/payments")
+    async def admin_payments(actor=Depends(admin_scope("finance")),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(80))).all()
+        return [{"id":p.id,"user_id":p.user_id,"plan":p.plan_title,"amount":p.amount,
+                 "status":p.status,"date":dt_iso(p.created_at),"charge_id":p.telegram_charge_id,
+                 "refund_date":dt_iso(p.refunded_at)} for p in rows]
+
+    @app.get("/api/admin/tickets")
+    async def admin_tickets(actor=Depends(admin_scope("support")),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Ticket).order_by(Ticket.id.desc()).limit(60))).all()
+        return [{"id":t.id,"user_id":t.user_id,"status":t.status,
+                 "assigned_admin":t.assigned_admin,"created_at":dt_iso(t.created_at)} for t in rows]
+
+    @app.get("/api/admin/tickets/{ticket_id}")
+    async def admin_ticket_detail(ticket_id:int, actor=Depends(admin_scope("support")),s:AsyncSession=Depends(db_session)):
+        t=await s.get(Ticket,ticket_id)
+        if not t: bad(404,"Обращение не найдено")
+        rows=(await s.scalars(select(TicketMessage).where(TicketMessage.ticket_id==ticket_id)
+                              .order_by(TicketMessage.id).limit(150))).all()
+        return {"id":t.id,"user_id":t.user_id,"status":t.status,"assigned_admin":t.assigned_admin,
+                "messages":[{"sender":m.sender,"text":m.text,"date":dt_iso(m.created_at)} for m in rows]}
+
+    @app.post("/api/admin/tickets/{ticket_id}/reply")
+    async def admin_ticket_reply(ticket_id:int,data:AdminReply,actor=Depends(admin_scope("support"))):
+        async with Session() as s:
+            t=await s.get(Ticket,ticket_id)
+            if not t or t.status!="open": bad(404,"Нет открытого обращения")
+            target=t.user_id
+        # Send before persisting success, do not falsely mark undelivered replies as sent.
+        try:
+            await bot.send_message(target,"<b>Still VPN · Поддержка #"+str(ticket_id)+"</b>\n\n"+
+                                   html_escape(data.text),parse_mode="HTML")
+        except Exception:
+            LOG.exception("Support message delivery failed ticket=%s",ticket_id)
+            bad(502,"Сообщение Telegram не доставлено")
+        async with Session.begin() as s:
+            t=await s.get(Ticket,ticket_id,with_for_update=True)
+            if t:
+                s.add(TicketMessage(ticket_id=t.id,sender="admin",text=data.text))
+                audit(s,actor[0],"ticket_reply",ticket_id,"Ответ через Telegram")
+        return {"ok":True}
+
+    @app.post("/api/admin/tickets/{ticket_id}/close")
+    async def admin_ticket_close(ticket_id:int, data:AdminReason,actor=Depends(admin_scope("support"))):
+        async with Session.begin() as s:
+            t=await s.get(Ticket,ticket_id,with_for_update=True)
+            if not t: bad(404,"Обращение не найдено")
+            t.status="closed"
+            audit(s,actor[0],"ticket_close",ticket_id,data.reason)
+        return {"ok":True}
+
+    @app.get("/api/admin/audit")
+    async def admin_audit(actor=Depends(admin_scope("audit")),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Audit).order_by(Audit.id.desc()).limit(80))).all()
+        return [{"id":x.id,"admin":x.admin_id,"action":x.action,"target":x.target,
+                 "details":x.details,"result":x.result,"date":dt_iso(x.created_at)} for x in rows]
+
+    @app.get("/api/admin/trial-settings")
+    async def admin_trial_get(actor=Depends(admin_scope("settings")),s:AsyncSession=Depends(db_session)):
+        return {"enabled":await setting(s,"trial_enabled","1")=="1",
+                "hours":int(await setting(s,"trial_hours","24")),
+                "traffic_gb":int(await setting(s,"trial_gb","1")),
+                "devices":int(await setting(s,"trial_devices","1"))}
+
+    @app.put("/api/admin/trial-settings")
+    async def admin_trial_put(data:AdminTrialSettings,actor=Depends(admin_scope("settings"))):
+        if actor[1] not in WRITERS: bad(403,"Недостаточно прав")
+        values={"trial_enabled":"1" if data.enabled else "0","trial_hours":str(data.hours),
+                "trial_gb":str(data.traffic_gb),"trial_devices":str(data.devices)}
+        async with Session.begin() as s:
+            for k,v in values.items():
+                st=await s.get(Setting,k)
+                if st: st.value=v
+                else: s.add(Setting(key=k,value=v))
+            audit(s,actor[0],"trial_settings","trial",json.dumps(values))
+        return {"ok":True}
+
+    @app.get("/api/admin/staff")
+    async def admin_staff_list(actor=Depends(admin_scope("staff")),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Admin).order_by(Admin.user_id))).all()
+        return {"owners":sorted(OWNER_IDS),"members":[{"id":x.user_id,"role":x.role} for x in rows]}
+
+    @app.put("/api/admin/staff/{user_id}")
+    async def admin_staff_set(user_id:int,data:AdminStaffRole,actor=Depends(admin_scope("staff"))):
+        if actor[1]!="owner": bad(403,"Только владелец")
+        if user_id in OWNER_IDS: bad(403,"Роль владельца меняется только через OWNER_IDS")
+        if data.role not in ADMIN_ROLES-{"owner"}: bad(422,"Некорректная роль")
+        async with Session.begin() as s:
+            st=await s.get(Admin,user_id)
+            if st:st.role=data.role
+            else:s.add(Admin(user_id=user_id,role=data.role))
+            audit(s,actor[0],"staff_role",user_id,data.role+": "+data.reason)
+        return {"ok":True}
+
+    @app.delete("/api/admin/staff/{user_id}")
+    async def admin_staff_remove(user_id:int,data:AdminReason,actor=Depends(admin_scope("staff"))):
+        if actor[1]!="owner": bad(403,"Только владелец")
+        if user_id in OWNER_IDS: bad(403,"Владелец не удаляется")
+        async with Session.begin() as s:
+            st=await s.get(Admin,user_id)
+            if not st: bad(404,"Администратор не найден")
+            await s.delete(st)
+            audit(s,actor[0],"staff_remove",user_id,data.reason)
+        return {"ok":True}
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -2408,8 +2950,9 @@ if MODE == "app":
     async def lifespan_app(a: FastAPI):
         if not BOT_TOKEN or not WEBAPP_URL.startswith("https://") or not engine or not OWNER_IDS or len(CODE_PEPPER) < 32:
             raise RuntimeError("Нужны BOT_TOKEN, HTTPS WEBAPP_URL, база SQLite/PostgreSQL, OWNER_IDS и CODE_PEPPER (>=32)")
-        if ENABLE_PAYMENTS and (not TERMS_URL.startswith("https://") or not fernet or len(WG_AGENT_SECRET) < 32):
-            raise RuntimeError("Платежи требуют TERMS_URL (HTTPS), GIFT_FERNET_KEY, WG_AGENT_SECRET >=32")
+        if ENABLE_PAYMENTS and not payments_ready():
+            LOG.error("Telegram Stars выключены: проверьте TERMS_URL (HTTPS), GIFT_FERNET_KEY и WG_AGENT_SECRET >=32; "
+                      "бот и VPN продолжат работать, новые счета запрещены")
         await initialize_db()
         # Update the Telegram display name as well as the messages and Mini App.
         # Bot API cannot change @username; that is managed separately in BotFather.
@@ -2423,9 +2966,15 @@ if MODE == "app":
             ))
         except Exception as exc:
             LOG.warning("Не удалось обновить имя/описание бота через Telegram: %s", exc)
-        await bot.set_my_commands([BotCommand(command="start", description="Открыть Still VPN"),
-                                   BotCommand(command="support", description="Поддержка"),
-                                   BotCommand(command="help", description="Помощь")])
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Открыть Still VPN"),
+            BotCommand(command="profile", description="Профиль"),
+            BotCommand(command="plans", description="Тарифы"),
+            BotCommand(command="connect", description="Подключение"),
+            BotCommand(command="support", description="Поддержка"),
+            BotCommand(command="help", description="Помощь"),
+            BotCommand(command="terms", description="Условия"),
+        ])
         tasks = [asyncio.create_task(dp.start_polling(bot)), asyncio.create_task(periodic_worker())]
         try:
             yield
@@ -2440,6 +2989,8 @@ else:
     # Agent mode. NO bot token or application database access is needed on the VPN VPS.
     app = FastAPI(title="Still WireGuard Agent", docs_url=None, redoc_url=None, openapi_url=None)
     used_nonces: dict[str, float] = {}
+    lease_lock = asyncio.Lock()
+    peer_leases: dict[str, dict[str, Any]] = {}
     SAFE_WG_IFACE = re.compile(r"[a-zA-Z0-9_.\-]{1,15}$")
     if not SAFE_WG_IFACE.fullmatch(WG_INTERFACE):
         raise RuntimeError("Invalid WG_INTERFACE")
@@ -2448,6 +2999,7 @@ else:
         public_key: str
         ip: str
         allow: bool
+        expires_at: int | None = None
 
     async def require_agent(request: Request) -> None:
         if len(WG_AGENT_SECRET) < 32: bad(503, "Secret not configured")
@@ -2479,18 +3031,99 @@ else:
             LOG.exception("WireGuard command failed")
             bad(503, "WireGuard unavailable")
 
+    def read_peer_leases() -> dict[str, dict[str, Any]]:
+        if not WG_AGENT_LEASE_PATH.exists():
+            return {}
+        try:
+            raw = json.loads(WG_AGENT_LEASE_PATH.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("lease file is not an object")
+            result = {}
+            for key, obj in raw.items():
+                if not (validate_wg_key(key) and isinstance(obj, dict)
+                        and isinstance(obj.get("expires_at"), int)
+                        and isinstance(obj.get("ip"), str)):
+                    continue
+                result[key] = {"expires_at": obj["expires_at"], "ip": obj["ip"]}
+            return result
+        except (OSError, ValueError, TypeError) as exc:
+            LOG.error("Agent lease file invalid. Failing closed: %s", exc)
+            return {}
+
+    def save_peer_leases() -> None:
+        WG_AGENT_LEASE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = WG_AGENT_LEASE_PATH.with_name(WG_AGENT_LEASE_PATH.name + ".tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(peer_leases, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, WG_AGENT_LEASE_PATH)
+            os.chmod(WG_AGENT_LEASE_PATH, 0o600)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    async def sweep_peer_leases() -> None:
+        # Only use a DEDICATED managed wg0 interface. Peers not present in the
+        # authorized lease file are removed on startup or expiry.
+        async with lease_lock:
+            current = set(wg("show", WG_INTERFACE, "peers").split())
+            ts = int(time.time())
+            for pub in current:
+                lease = peer_leases.get(pub)
+                if not lease or lease["expires_at"] <= ts:
+                    wg("set", WG_INTERFACE, "peer", pub, "remove")
+                    peer_leases.pop(pub, None)
+            for pub, lease in list(peer_leases.items()):
+                if lease["expires_at"] <= ts:
+                    peer_leases.pop(pub, None)
+            save_peer_leases()
+
+    async def peer_lease_worker() -> None:
+        while True:
+            try:
+                await sweep_peer_leases()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Peer expiry sweep failed")
+            await asyncio.sleep(15)
+
     @app.post("/agent/peer", dependencies=[Depends(require_agent)])
     async def agent_peer(change: PeerChange):
         if not validate_wg_key(change.public_key): bad(422, "Invalid public key")
         try:
             ip = ipaddress.ip_address(change.ip)
-            if ip.version != 4 or not ip.is_private: raise ValueError
+            network = ipaddress.ip_network(WG_SERVER_CIDR, strict=False)
+            if (ip.version != 4 or network.version != 4 or ip not in network
+                    or ip in (network.network_address, network.broadcast_address,
+                              network.network_address + 1)):
+                raise ValueError
         except ValueError:
             bad(422, "Invalid internal peer IP")
-        if change.allow:
-            wg("set", WG_INTERFACE, "peer", change.public_key, "allowed-ips", str(ip) + "/32")
-        else:
-            wg("set", WG_INTERFACE, "peer", change.public_key, "remove")
+        async with lease_lock:
+            if change.allow:
+                ts = int(time.time())
+                expires = min(change.expires_at or ts + WG_PEER_LEASE_SECONDS,
+                              ts + WG_PEER_LEASE_SECONDS)
+                if expires <= ts:
+                    bad(409, "Access already expired")
+                wg("set", WG_INTERFACE, "peer", change.public_key, "allowed-ips", str(ip) + "/32")
+                peer_leases[change.public_key] = {"ip": str(ip), "expires_at": expires}
+                try:
+                    save_peer_leases()
+                except Exception:
+                    # Never keep an active peer whose expiry cannot be persisted.
+                    wg("set", WG_INTERFACE, "peer", change.public_key, "remove")
+                    peer_leases.pop(change.public_key, None)
+                    raise
+            else:
+                wg("set", WG_INTERFACE, "peer", change.public_key, "remove")
+                peer_leases.pop(change.public_key, None)
+                save_peer_leases()
         return {"ok": True}
 
     @app.get("/agent/stats", dependencies=[Depends(require_agent)])
@@ -2520,15 +3153,30 @@ else:
             network_rx, network_tx = counters.bytes_recv, counters.bytes_sent
         except (ImportError, OSError):
             pass
-        return {"peers": peers, "load_average": os.getloadavg()[0],
+        return {"agent_version": "4", "peers": peers, "load_average": os.getloadavg()[0],
                 "cpu_percent": cpu_percent, "memory": mem,
                 "network_rx": network_rx, "network_tx": network_tx,
                 "disk_free": disk.f_bavail * disk.f_frsize}
 
     @app.get("/health")
     async def agent_health():
-        wg("show", WG_INTERFACE, "interfaces")
+        wg("show", WG_INTERFACE, "public-key")
         return {"status": "ok", "interface": WG_INTERFACE}
+
+    @asynccontextmanager
+    async def lifespan_agent(a: FastAPI):
+        peer_leases.update(read_peer_leases())
+        # On rollout unknown existing peers are revoked once; BotHost renews
+        # authorized devices during its periodic reconciliation.
+        await sweep_peer_leases()
+        task = asyncio.create_task(peer_lease_worker())
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.router.lifespan_context = lifespan_agent
 
 # Telegram Web App UI is intentionally embedded here to honor the one-file request.
 # All data comes from the authenticated API; no fake subscriptions or statistics.
@@ -2576,6 +3224,33 @@ input:focus,select:focus{border-color:var(--violet)}.device{border-bottom:1px so
 .code{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--hair);background:#09070a;color:#e8dde5;border-radius:12px;padding:16px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;line-height:1.7;margin:13px 0}
 #qr{display:flex;justify-content:center;background:white;padding:15px;border-radius:12px;width:fit-content;max-width:100%;margin:14px auto}#qr img{max-width:100%}
 .link{color:#c3a1d5;text-decoration:none}a:focus,button:focus-visible{outline:2px solid var(--violet);outline-offset:2px}
+/* Admin-only surfaces: compact, data-first, no decorative cards. */
+.admin-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;margin:0 0 18px}
+.admin-head h1{font-size:29px;margin-bottom:4px}
+.admin-nav{display:flex;overflow-x:auto;gap:8px;margin:14px -22px 20px;padding:0 22px 9px;scrollbar-width:none}
+.admin-nav::-webkit-scrollbar{display:none}
+.admin-nav button{flex:0 0 auto;border:1px solid var(--hair);background:transparent;color:var(--muted);border-radius:9px;padding:10px 12px;font-size:12px}
+.admin-nav button.active{border-color:#794052;background:rgba(104,26,41,.19);color:var(--ink)}
+.admin-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 17px;margin:8px 0 22px;border-top:1px solid var(--hair)}
+.admin-metric{padding:15px 0;border-bottom:1px solid var(--hair)}
+.admin-metric strong{display:block;font-size:24px;font-variant-numeric:tabular-nums;letter-spacing:-.04em;margin-top:5px}
+.admin-table{margin-top:12px;border-top:1px solid var(--hair)}
+.admin-item{padding:13px 0;border-bottom:1px solid var(--hair);display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.admin-item b{font-weight:600;font-size:14px}.admin-item .small{line-height:1.5}
+.admin-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.admin-actions button{width:auto}
+.admin-form{padding:16px 0;border-top:1px solid var(--hair);margin-top:14px}
+.admin-form .row{align-items:flex-end}.admin-form .row>div{min-width:0;flex:1}
+.admin-form input,.admin-form select,.admin-form textarea{font-size:14px}
+.admin-form textarea{width:100%;min-height:88px;background:#1c171c;color:var(--ink);border:1px solid #49343d;border-radius:10px;padding:12px;resize:vertical}
+.admin-empty{color:var(--muted);font-size:13px;padding:18px 0;line-height:1.5}
+.admin-filter{display:flex;gap:8px}.admin-filter input{flex:1;min-width:0}.admin-filter button{flex:0 0 auto}
+.admin-status{font-size:11px;border:1px solid var(--hair);border-radius:20px;padding:5px 9px;color:var(--muted);white-space:nowrap}
+.admin-status.ok{color:#b7dbc6;border-color:rgba(112,188,143,.28)}
+.admin-breadcrumb{background:none;border:0;color:#c3a1d5;padding:0;font-size:12px;margin:0 0 14px}
+.admin-feed{padding:0;list-style:none}.admin-feed li{padding:10px 0;border-bottom:1px solid var(--hair);font-size:13px;line-height:1.5}
+@media(max-width:370px){.tabs button{min-width:52px;font-size:9px}.admin-form .row{flex-direction:column;align-items:stretch}}
+
 @media(min-width:700px){.tabs{max-width:620px;margin:0 auto;border-left:1px solid var(--hair);border-right:1px solid var(--hair)}#app{padding-left:32px;padding-right:32px}}
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
@@ -2598,12 +3273,12 @@ async function api(path,opts={}){
  if(!r.ok){const d=out.detail;throw new Error(typeof d==='string'?d:'Ошибка запроса '+r.status)}return out;
 }
 function nav(to){page=to;currentConfig=null;drawTabs();render();window.scrollTo(0,0)}
-const icons={home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
-function drawTabs(){const items=[['home','Главная'],['plans','Тарифы'],['connect','Подключить'],['account','Профиль']];tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" class="${page===id?'active':''}"><svg viewBox="0 0 24 24">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
+const icons={admin:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
+function drawTabs(){const items=[['home','Главная'],['plans','Тарифы'],['connect','Подключить'],['account','Профиль']];if(me?.admin_role)items.push(['admin','Админ']);tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" class="${page===id?'active':''}"><svg viewBox="0 0 24 24">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
 const section=(label,title,desc='')=>`<p class="kicker">${label}</p><h1>${title}</h1>${desc?`<p class="para muted">${desc}</p>`:''}`;
 function activeText(){if(!me.subscription)return 'Нет активной подписки';const ms=new Date(me.subscription.end)-Date.now();return ms>0?Math.ceil(ms/86400000)+' дн. осталось':'Срок действия истёк'}
 function render(){if(!me){main.innerHTML='<p class="muted">Подключение к Still VPN…</p>';return}
- if(page==='home')home(); else if(page==='plans')planPage(); else if(page==='connect')connectPage(); else accountPage()}
+ if(page==='home')home(); else if(page==='plans')planPage(); else if(page==='connect')connectPage(); else if(page==='admin')adminPage(); else accountPage()}
 function home(){const s=me.subscription;
 main.innerHTML=section('Личный кабинет',`Здравствуйте, ${esc(me.first_name||'друг')}.`,'Ваша приватная сеть под контролем.')+
 `<div class="hero"><div class="row"><span class="small muted">ВАШ ДОСТУП</span><span class="pill"><i class="dot"></i>${s?'Активен':'Неактивен'}</span></div>
@@ -2658,12 +3333,14 @@ async function createDevice(){const btn=$('#create-device');btn.disabled=true;bt
  const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:keys.publicKey})});
  const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
  currentConfig={name,conf};
- const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Сохраните конфигурацию прямо сейчас. Приватный ключ не отправлялся на сервер и не хранится в базе. При потере файла удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="row"><button id="download" class="button compact">Скачать .conf</button><button id="copy-conf" class="button secondary compact">Копировать</button></div><p class="small muted" id="install-help"></p></div>`;
+ const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Сохраните конфигурацию прямо сейчас. Приватный ключ не отправлялся на сервер и не хранится в базе. При потере файла удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="row"><button id="download" class="button compact">Скачать .conf</button><button id="share-conf" class="button secondary compact">Сохранить / Поделиться</button><button id="copy-conf" class="button secondary compact">Копировать</button></div><p class="small muted">Если Telegram не сохраняет файл, используйте «Сохранить / Поделиться» или «Копировать» и создайте локально файл .conf. Приватный ключ не отправляйте в мессенджеры и облачные сервисы.</p><p class="small muted" id="install-help"></p></div>`;
  $('#config-text').textContent=conf;
  const tips={android:'Android: установите WireGuard из Google Play или F-Droid, добавьте туннель из файла или QR-кода.',ios:'iPhone/iPad: установите WireGuard из App Store, откройте приложение и выберите «Создать туннель» → из файла или QR-кода.',windows:'Windows: установите официальный WireGuard с wireguard.com/install, затем «Import tunnel(s) from file».',macos:'macOS: установите WireGuard, выберите «Import tunnel(s) from file».',linux:'Linux: установите wireguard-tools, сохраните файл как /etc/wireguard/wg-still.conf (права 600) и запустите sudo wg-quick up wg-still.'};
  $('#install-help').textContent=(tips[platform]||'')+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
  if(window.QRCode){try{new QRCode($('#qr'),{text:conf,width:205,height:205,correctLevel:QRCode.CorrectLevel.L})}catch{$('#qr').textContent='QR слишком большой. Скачайте файл.'}}else $('#qr').textContent='QR не загрузился. Скачайте файл.';
- $('#download').onclick=()=>{const blob=new Blob([conf],{type:'application/x-wireguard-config'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='still-'+name.replace(/[^a-z0-9-_]/gi,'-')+'.conf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+ const confFilename='still-'+name.replace(/[^a-z0-9-_]/gi,'-')+'.conf';
+ $('#download').onclick=()=>{const blob=new Blob([conf],{type:'application/octet-stream'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=confFilename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)};
+ $('#share-conf').onclick=async()=>{try{if(!navigator.share||typeof File==='undefined')throw new Error('Системное сохранение недоступно. Нажмите «Копировать» и сохраните .conf вручную.');const file=new File([conf],confFilename,{type:'text/plain'});if(navigator.canShare&&!navigator.canShare({files:[file]}))throw new Error('Telegram не поддерживает передачу файла. Скопируйте конфигурацию.');await navigator.share({files:[file]});}catch(e){if(e.name!=='AbortError')toast(e.message||'Не удалось открыть сохранение',true)}};
  $('#copy-conf').onclick=async()=>{try{await navigator.clipboard.writeText(conf);toast('Конфигурация скопирована')}catch{toast('Буфер обмена недоступен',true)}};
  toast('Устройство создано');await loadDevices();await reload();root.scrollIntoView({behavior:'smooth'});
  }catch(e){toast(e.message,true)}finally{btn.disabled=false;btn.textContent='Создать конфигурацию'}}
@@ -2674,16 +3351,106 @@ function accountPage(){main.innerHTML=section('Ваш профиль','Прив�
 <div class="statrow"><span class="muted">Подписка</span><b>${esc(me.subscription?.name||'Не активна')}</b></div>
 <div class="statrow"><span class="muted">Статус аккаунта</span><b>${esc(me.account_status)}</b></div>
 <div class="section"><h2>Подарки и промокоды</h2><p class="muted small">Созданные подарки доступны после подтверждённой оплаты. Коды активируются один раз.</p><label>Код подарка / промокод</label><input id="redeem" placeholder="STILL-… или SH-…"><div style="height:12px"></div><button class="button" id="redeem-btn">Активировать код</button><div id="gift-list"></div></div>
-<div class="section"><h2>Помощь и документы</h2><p class="muted small">Вопросы решаются в переписке с ботом по команде /support. Платёжные вопросы: /paysupport.</p><button class="button secondary" id="support-btn">Вернуться в бот для /support</button></div>`;
+${me.admin_role?'<div class="section"><button id="open-admin" class="button secondary">Открыть админ-панель</button></div>':''}<div class="section"><h2>Помощь и документы</h2><p class="muted small">Вопросы решаются в переписке с ботом по команде /support. Платёжные вопросы: /paysupport.</p><button class="button secondary" id="support-btn">Вернуться в бот для /support</button></div>`;
 $('#redeem-btn').onclick=async()=>{const code=$('#redeem').value.trim();try{const r=await api('redeem',{method:'POST',body:JSON.stringify({code})});toast(`Активировано: +${r.days} дней`);$('#redeem').value='';await reload();accountPage()}catch(e){toast(e.message,true)}};
-$('#support-btn').onclick=()=>{tg?.close();};
+$('#support-btn').onclick=()=>{tg?.close();};if($('#open-admin'))$('#open-admin').onclick=()=>nav('admin');
 loadGifts();}
 async function loadGifts(){try{gifts=await api('gifts');if(page!=='account')return;
 $('#gift-list').innerHTML=gifts.map(g=>`<div class="panel"><h3>${esc(g.name)}</h3><p class="small muted">Действует до ${day(g.expires_at)} · ${g.used?'Активирован':g.invalid?'Аннулирован':'Ожидает'}</p>${g.code?`<div class="code">${esc(g.code)}</div><button class="button secondary compact" data-code="${esc(g.id)}">Скопировать код</button>`:''}</div>`).join('');
 $('#gift-list').querySelectorAll('[data-code]').forEach(b=>b.onclick=async()=>{const g=gifts.find(x=>x.id===b.dataset.code);if(g?.code){await navigator.clipboard.writeText(g.code);toast('Код скопирован')}});
 }catch(e){toast(e.message,true)}}
 async function reload(){me=await api('me');if(page==='home')render()}
-async function boot(){drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const start=new URLSearchParams(location.search).get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account'].includes(start))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
+async function boot(){drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const query=new URLSearchParams(location.search);const start=query.get('tab')||query.get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account'].includes(start)||(start==='admin'&&me.admin_role))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
+// Only users with an authenticated admin role see this entrance. Every request
+// is also authorized by role on the FastAPI side; UI checks are cosmetic.
+let adminSection='overview', adminSelectedUser=null, adminSelectedTicket=null, adminPlanEdit=null;
+const adminSections=[['overview','Сводка','access'],['users','Пользователи','users'],
+ ['plans','Тарифы','plans'],['promos','Промокоды','plans'],['servers','Серверы','servers'],['payments','Платежи','finance'],
+ ['support','Поддержка','support'],['settings','Настройки','settings'],
+ ['staff','Роли','staff'],['audit','Журнал','audit']];
+const adminPerms={owner:['access','stats','users','plans','servers','finance','support','settings','staff','audit'],
+ administrator:['access','stats','users','plans','servers','finance','support','settings','audit'],
+ support:['access','users','support'],finance:['access','stats','finance'],viewer:['access','stats']};
+function acan(perm){return (adminPerms[me?.admin_role]||[]).includes(perm)}
+function stateTag(s,ok){return `<span class="admin-status ${ok?'ok':''}">${esc(s)}</span>`}
+function adminReason(){const r=prompt('Причина изменения (для журнала действий):');return r&&r.trim().length>=3?r.trim():null}
+function adminPage(){if(!me?.admin_role){nav('account');return}
+ const available=adminSections.filter(x=>acan(x[2]));if(!available.some(x=>x[0]===adminSection))adminSection=available[0][0];
+ main.innerHTML=`<div class="admin-head"><div><p class="kicker">Управление Still VPN</p><h1>Админ-панель</h1><p class="small muted">Роль: ${esc(me.admin_role)} · данные из системы</p></div><button id="admin-refresh" class="button secondary compact">Обновить</button></div>`+
+ `<div class="admin-nav">${available.map(x=>`<button type="button" class="${x[0]===adminSection?'active':''}" data-admin-tab="${x[0]}">${x[1]}</button>`).join('')}</div><div id="admin-content" aria-live="polite"></div>`;
+ document.querySelectorAll('[data-admin-tab]').forEach(b=>b.onclick=()=>{adminSection=b.dataset.adminTab;adminSelectedUser=null;adminSelectedTicket=null;adminPlanEdit=null;adminPage()});
+ $('#admin-refresh').onclick=()=>adminLoad();adminLoad();}
+async function adminLoad(){const box=$('#admin-content');if(!box)return;box.innerHTML='<p class="admin-empty">Загрузка данных…</p>';
+ try{if(adminSection==='overview')await adminOverview(box);
+ else if(adminSection==='users')await adminUsers(box);
+ else if(adminSection==='plans')await adminPlans(box);
+ else if(adminSection==='promos')await adminPromos(box);
+ else if(adminSection==='servers')await adminServers(box);
+ else if(adminSection==='payments')await adminPayments(box);
+ else if(adminSection==='support')await adminTickets(box);
+ else if(adminSection==='settings')await adminSettings(box);
+ else if(adminSection==='staff')await adminStaff(box);
+ else if(adminSection==='audit')await adminAudit(box);
+ }catch(e){if($('#admin-content')===box)box.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="admin-again" class="button secondary">Повторить</button>`,$('#admin-again').onclick=adminLoad}}
+function adminList(items,fn){return items.length?`<div class="admin-table">${items.map(fn).join('')}</div>`:'<p class="admin-empty">Пока нет записей.</p>'}
+function mval(label,n){return `<div class="admin-metric"><span class="small muted">${label}</span><strong>${esc(n??0)}</strong></div>`}
+async function adminOverview(box){const d=await api('admin/summary');const x=d.stats||{}, f=d.finance||{};
+ let html='';if(d.stats)html+=`<div class="admin-metrics">${mval('Пользователи',x.users)}${mval('Новые за сутки',x.new_users)}${mval('Активные подписки',x.subscriptions)}${mval('Пробные периоды',x.trials)}${mval('Устройства',x.devices)}${mval('Серверы онлайн',`${x.healthy_servers}/${x.servers}`)}${mval('Истёкшие подписки',x.expired_subs)}${mval('Открытые обращения',x.tickets)}</div>`;
+ if(d.finance)html+=`<div class="section"><h2>Платежи</h2><div class="statrow"><span class="muted">Подтверждено</span><b>${f.payments}</b></div><div class="statrow"><span class="muted">Получено Stars (без возвратов)</span><b>${f.stars} ⭐</b></div><div class="statrow"><span class="muted">Возвраты</span><b>${f.refunds}</b></div></div>`;
+ if(d.support)html+=`<h2>Обращения</h2>${mval('Открыто',d.support.open_tickets)}`;
+ if(d.events?.length)html+=`<div class="section"><h2>Последние действия</h2>${adminList(d.events,x=>`<div class="admin-item"><div><b>${esc(x.action)}</b><div class="small muted">${esc(x.target)} · ${esc(x.admin_id)}</div></div><span class="small muted">${day(x.date)}</span></div>`)}</div>`;
+ box.innerHTML=html||'<p class="admin-empty">Нет доступных показателей для вашей роли.</p>';}
+async function adminUsers(box, query=''){if(adminSelectedUser){await adminUserDetail(box,adminSelectedUser);return}
+ const data=await api('admin/users?q='+encodeURIComponent(query));box.innerHTML=`<h2>Пользователи</h2><p class="small muted">Поиск по Telegram ID или @username.</p><div class="admin-filter"><input id="admin-search" placeholder="ID или username" maxlength="80" value="${esc(query)}"><button id="admin-search-btn" class="button compact">Найти</button></div>`+
+ adminList(data,u=>`<div class="admin-item"><div><b>${esc(u.first_name||u.username||u.id)}</b><div class="small muted">${esc(u.username?'@'+u.username:'Без username')} · ID ${u.id}<br>Регистрация ${day(u.created_at)}</div></div><button class="button secondary compact" data-user="${u.id}">Открыть</button></div>`);
+ $('#admin-search-btn').onclick=()=>adminUsers(box,$('#admin-search').value);$('#admin-search').onkeydown=e=>{if(e.key==='Enter')adminUsers(box,e.target.value)};
+ box.querySelectorAll('[data-user]').forEach(b=>b.onclick=()=>{adminSelectedUser=Number(b.dataset.user);adminLoad()});}
+async function adminUserDetail(box,uid){const u=await api('admin/users/'+uid);box.innerHTML=`<button id="admin-back" class="admin-breadcrumb">← К пользователям</button><h2>${esc(u.first_name||u.username||u.id)}</h2>
+ <div class="statrow"><span class="muted">Telegram ID</span><b>${u.id}</b></div><div class="statrow"><span class="muted">Username</span><b>${esc(u.username?'@'+u.username:'—')}</b></div><div class="statrow"><span class="muted">Статус</span>${stateTag(u.blocked?'Заблокирован':'Активен',!u.blocked)}</div><div class="statrow"><span class="muted">Пробный доступ</span><b>${u.trial?day(u.trial.ends_at):'Не использован'}</b></div>`+
+ (['owner','administrator'].includes(me.admin_role)?`<div class="admin-actions"><button class="button secondary compact" id="admin-block">${u.blocked?'Разблокировать':'Заблокировать'}</button><button class="button secondary compact" id="admin-grant">Выдать подписку</button><button class="button ghost compact" id="admin-revoke-all">Отозвать все устройства</button></div>`:'')+
+ `<div class="section"><h2>Подписки</h2>${adminList(u.subscriptions,s=>`<div class="admin-item"><div><b>${esc(s.name)}</b><div class="small muted">${day(s.starts_at)} — ${day(s.ends_at)} · ${esc(s.source)}</div></div>${stateTag(s.revoked?'Отозвана':'Выдана',!s.revoked)}</div>`)}</div>`+
+ `<div class="section"><h2>Устройства</h2>${adminList(u.devices,d=>`<div class="admin-item"><div><b>${esc(d.name)}</b><div class="small muted">${esc(d.ip)} · ${d.last_handshake?day(d.last_handshake):'Нет handshake'}</div></div>${['owner','administrator'].includes(me.admin_role)&&d.enabled?`<button class="button ghost compact" data-revoke="${esc(d.id)}">Отозвать</button>`:stateTag(d.enabled?'Активно':'Отозвано',d.enabled)}</div>`)}</div>`;
+ $('#admin-back').onclick=()=>{adminSelectedUser=null;adminLoad()};
+ if($('#admin-block'))$('#admin-block').onclick=async()=>{const r=adminReason();if(!r)return;try{await api('admin/users/'+uid+'/block',{method:'POST',body:JSON.stringify({reason:r,blocked:!u.blocked})});toast('Статус изменён');adminLoad()}catch(e){toast(e.message,true)}};
+ if($('#admin-grant'))$('#admin-grant').onclick=async()=>{const days=Number(prompt('На сколько дней?','30'));if(!Number.isInteger(days)||days<1||days>365)return;const devices=Number(prompt('Количество устройств (1–20)','2'));if(!Number.isInteger(devices)||devices<1||devices>20)return;const traffic_gb=Number(prompt('Лимит в ГБ (0 = безлимит)','0'));if(!Number.isInteger(traffic_gb)||traffic_gb<0||traffic_gb>10000)return;const reason=adminReason();if(!reason)return;try{await api('admin/users/'+uid+'/grant',{method:'POST',body:JSON.stringify({days,devices,traffic_gb,reason})});toast('Подписка выдана');adminLoad()}catch(e){toast(e.message,true)}};
+ if($('#admin-revoke-all'))$('#admin-revoke-all').onclick=async()=>{if(!confirm('Отозвать VPN-доступ всех устройств пользователя?'))return;const reason=adminReason();if(!reason)return;try{await api('admin/users/'+uid+'/revoke',{method:'POST',body:JSON.stringify({reason})});toast('Отзыв отправлен');adminLoad()}catch(e){toast(e.message,true)}};
+ box.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/devices/'+b.dataset.revoke+'/revoke',{method:'POST',body:JSON.stringify({reason})});toast('Peer отозван');adminLoad()}catch(e){toast(e.message,true)}});}
+async function adminPlans(box){const data=await api('admin/plans');box.innerHTML=`<h2>Тарифы</h2><p class="small muted">Изменения влияют только на будущие покупки. Уже выданные подписки сохраняют свои условия.</p>`+
+ adminList(data,p=>`<div class="admin-item"><div><b>${esc(p.title)}</b><div class="small muted">${p.days} дн. · ${p.stars} ⭐ · ${p.devices} устр. · ${p.traffic_gb||'∞'} ГБ</div></div><div>${stateTag(p.enabled?'Включён':'Скрыт',p.enabled)}${['owner','administrator'].includes(me.admin_role)?`<button class="button secondary compact" data-plan="${p.id}" style="margin-top:7px">Изменить</button>`:''}</div></div>`)+
+ (['owner','administrator'].includes(me.admin_role)?`<div class="admin-form"><h3 id="admin-plan-form-title">Новый тариф</h3><label>Название</label><input id="ap-title" maxlength="120" placeholder="Например, 30 дней"><div class="row"><div><label>Дни</label><input type="number" id="ap-days" min="1" max="3650" value="30"></div><div><label>Stars</label><input type="number" id="ap-stars" min="1" value="100"></div></div><div class="row"><div><label>Устройства</label><input type="number" id="ap-devices" min="1" max="20" value="2"></div><div><label>Трафик, ГБ (0 = ∞)</label><input type="number" id="ap-gb" min="0" value="0"></div></div><label><input type="checkbox" id="ap-enabled" checked style="width:auto;min-height:0"> Показывать в Mini App</label><button id="admin-plan-save" class="button">Сохранить тариф</button></div>`:'');
+ box.querySelectorAll('[data-plan]').forEach(b=>b.onclick=()=>{const p=data.find(x=>x.id===Number(b.dataset.plan));adminPlanEdit=p.id;$('#admin-plan-form-title').textContent='Редактировать тариф #'+p.id;$('#ap-title').value=p.title;$('#ap-days').value=p.days;$('#ap-stars').value=p.stars;$('#ap-devices').value=p.devices;$('#ap-gb').value=p.traffic_gb;$('#ap-enabled').checked=p.enabled;$('#ap-title').scrollIntoView({behavior:'smooth'})});
+ if($('#admin-plan-save'))$('#admin-plan-save').onclick=async()=>{const p={title:$('#ap-title').value.trim(),days:Number($('#ap-days').value),stars:Number($('#ap-stars').value),devices:Number($('#ap-devices').value),traffic_gb:Number($('#ap-gb').value),enabled:$('#ap-enabled').checked};try{await api('admin/plans'+(adminPlanEdit?'/'+adminPlanEdit:''),{method:adminPlanEdit?'PUT':'POST',body:JSON.stringify(p)});toast('Тариф сохранён');adminPlanEdit=null;plans=await api('plans');adminLoad()}catch(e){toast(e.message,true)}};}
+async function adminPromos(box){const rows=await api('admin/promos');box.innerHTML=`<h2>Промокоды</h2><p class="small muted">Коды не сохраняются в открытом виде. Новый код будет показан один раз, затем его можно передать пользователю.</p>`+
+ adminList(rows,p=>`<div class="admin-item"><div><b>#${p.id} · ${p.type==='discount'?'-'+p.value+'%':'+'+p.value+' дней'}</b><div class="small muted">Использовано ${p.uses}/${p.max_uses} · до ${day(p.expires_at)}</div></div><div>${stateTag(p.enabled?'Активен':'Выключен',p.enabled)}${['owner','administrator'].includes(me.admin_role)&&p.enabled?`<button class="button ghost compact" data-promo-off="${p.id}" style="margin-top:7px">Отключить</button>`:''}</div></div>`)+
+ (['owner','administrator'].includes(me.admin_role)?`<div class="admin-form"><h3>Новый промокод</h3><label>Тип</label><select id="pr-kind"><option value="days">Бесплатные дни</option><option value="discount">Скидка на Stars</option></select><label>Количество дней или процентов</label><input id="pr-value" type="number" min="1" max="365" value="7"><div class="row"><div><label>Максимум активаций</label><input id="pr-uses" type="number" min="1" value="10"></div><div><label>Действует, часов</label><input id="pr-hours" type="number" min="1" value="168"></div></div><div style="height:15px"></div><button id="pr-create" class="button">Создать код</button><div id="pr-created"></div></div>`:'');
+ box.querySelectorAll('[data-promo-off]').forEach(b=>b.onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/promos/'+b.dataset.promoOff+'/disable',{method:'POST',body:JSON.stringify({reason})});toast('Промокод отключён');adminLoad()}catch(e){toast(e.message,true)}});
+ if($('#pr-create'))$('#pr-create').onclick=async()=>{const d={kind:$('#pr-kind').value,days_or_percent:Number($('#pr-value').value),max_uses:Number($('#pr-uses').value),hours:Number($('#pr-hours').value)};try{const out=await api('admin/promos',{method:'POST',body:JSON.stringify(d)});$('#pr-created').innerHTML=`<div class="notice">Код создан. Сохраните сейчас — повторно получить его невозможно.</div><div class="code" id="pr-code"></div><button id="pr-copy" class="button secondary compact">Копировать</button>`;$('#pr-code').textContent=out.code;$('#pr-copy').onclick=()=>navigator.clipboard.writeText(out.code).then(()=>toast('Скопировано'),()=>toast('Нет доступа к буферу',true));}catch(e){toast(e.message,true)}};
+}
+async function adminServers(box){const rows=await api('admin/servers');box.innerHTML=`<h2>VPN-серверы</h2><p class="small muted">Состояние из последней реальной проверки агента. Выключение запрещает новые подключения, но не удаляет действующие.</p>`+
+ adminList(rows,n=>`<div class="admin-item"><div><b>#${n.id} · ${esc(n.location)}</b><div class="small muted">${esc(n.endpoint)}<br>Peer: ${n.peer_count??'—'} · CPU: ${n.cpu===null?'—':n.cpu+'%'}<br>RAM: ${n.ram_used===null?'—':(n.ram_used/1048576).toFixed(0)+' MiB'} · Диск: ${n.disk_free===null?'—':(n.disk_free/1073741824).toFixed(1)+' GiB'}<br>${n.error?'Ошибка: '+esc(n.error):'Обновлено: '+(n.last_seen?day(n.last_seen):'нет данных')}</div></div><div>${stateTag(n.online?'Онлайн':'Нет связи',n.online)}${stateTag(n.enabled?'Для новых: да':'Для новых: нет',n.enabled)}${['owner','administrator'].includes(me.admin_role)?`<button class="button secondary compact" data-server="${n.id}" style="margin-top:8px">${n.enabled?'Выключить':'Включить'}</button>`:''}</div></div>`);
+ box.querySelectorAll('[data-server]').forEach(b=>b.onclick=async()=>{const n=rows.find(x=>x.id===Number(b.dataset.server));const reason=adminReason();if(!reason)return;try{await api('admin/servers/'+n.id+'/state',{method:'POST',body:JSON.stringify({enabled:!n.enabled,reason})});toast('Состояние обновлено');adminLoad()}catch(e){toast(e.message,true)}});}
+async function adminPayments(box){const rows=await api('admin/payments');box.innerHTML=`<h2>Платежи</h2><p class="small muted">Показаны реальные транзакции Telegram Stars. Возврат выполняется владельцем через команду /adm_refund в боте с обязательной причиной и проверкой Telegram.</p>`+
+ adminList(rows,p=>`<div class="admin-item"><div><b>${esc(p.plan)}</b><div class="small muted">Telegram ${p.user_id} · ${day(p.date)}<br>ID: ${esc(p.id)}<br>Charge: ${esc(p.charge_id||'—')}</div></div><div style="text-align:right"><b>${p.amount} ⭐</b><div>${stateTag(p.status,p.status==='paid')}</div></div></div>`);}
+async function adminTickets(box){if(adminSelectedTicket){await adminTicketDetail(box,adminSelectedTicket);return}
+ const rows=await api('admin/tickets');box.innerHTML='<h2>Обращения</h2><p class="small muted">Ответ доставляется пользователю через Telegram-бота.</p>'+
+ adminList(rows,t=>`<div class="admin-item"><div><b>Обращение #${t.id}</b><div class="small muted">Telegram ${t.user_id} · ${day(t.created_at)}<br>Ответственный: ${t.assigned_admin||'—'}</div></div><button class="button secondary compact" data-ticket="${t.id}">${t.status==='open'?'Открыть':'История'}</button></div>`);
+ box.querySelectorAll('[data-ticket]').forEach(b=>b.onclick=()=>{adminSelectedTicket=Number(b.dataset.ticket);adminLoad()});}
+async function adminTicketDetail(box,id){const t=await api('admin/tickets/'+id);box.innerHTML=`<button id="admin-ticket-back" class="admin-breadcrumb">← Все обращения</button><h2>Обращение #${t.id}</h2><p class="small muted">Telegram ID ${t.user_id} · ${esc(t.status)}</p>`+
+ adminList(t.messages,m=>`<div class="admin-item"><div><b>${m.sender==='admin'?'Поддержка':'Пользователь'}</b><div class="small muted">${day(m.date)}</div><div style="margin-top:5px;white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</div></div></div>`)+
+ (t.status==='open'?`<div class="admin-form"><label>Ответ пользователю</label><textarea id="admin-ticket-text" maxlength="3500" placeholder="Напишите ответ…"></textarea><div class="admin-actions"><button id="admin-ticket-send" class="button compact">Отправить</button><button id="admin-ticket-close" class="button ghost compact">Закрыть</button></div></div>`:'');
+ $('#admin-ticket-back').onclick=()=>{adminSelectedTicket=null;adminLoad()};
+ if($('#admin-ticket-send'))$('#admin-ticket-send').onclick=async()=>{const text=$('#admin-ticket-text').value.trim();if(!text)return;try{await api('admin/tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text})});toast('Ответ отправлен');adminLoad()}catch(e){toast(e.message,true)}};
+ if($('#admin-ticket-close'))$('#admin-ticket-close').onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/tickets/'+id+'/close',{method:'POST',body:JSON.stringify({reason})});toast('Обращение закрыто');adminLoad()}catch(e){toast(e.message,true)}};}
+async function adminSettings(box){const d=await api('admin/trial-settings');box.innerHTML=`<h2>Пробный доступ</h2><p class="small muted">Настройки применяются только к новым активациям. Ранее выданный доступ не изменяется.</p><div class="admin-form"><label><input id="at-enabled" type="checkbox" ${d.enabled?'checked':''} style="width:auto;min-height:0"> Доступен новым пользователям</label><div class="row"><div><label>Часов</label><input type="number" id="at-hours" min="1" max="720" value="${d.hours}"></div><div><label>Устройства</label><input type="number" id="at-devices" min="1" max="20" value="${d.devices}"></div></div><label>Трафик, ГБ (0 = без лимита)</label><input type="number" id="at-gb" min="0" max="10000" value="${d.traffic_gb}"><div style="height:15px"></div><button id="at-save" class="button">Сохранить настройки</button></div>`;
+ $('#at-save').onclick=async()=>{const d={enabled:$('#at-enabled').checked,hours:Number($('#at-hours').value),devices:Number($('#at-devices').value),traffic_gb:Number($('#at-gb').value)};try{await api('admin/trial-settings',{method:'PUT',body:JSON.stringify(d)});toast('Настройки сохранены');adminLoad()}catch(e){toast(e.message,true)}};}
+async function adminStaff(box){const d=await api('admin/staff');box.innerHTML=`<h2>Доступ сотрудников</h2><p class="small muted">Owner назначается через OWNER_IDS на BotHost. Остальные роли имеют отдельные API-права.</p>`+
+ adminList([...d.owners.map(id=>({id,role:'owner'})),...d.members],x=>`<div class="admin-item"><div><b>${x.id}</b><div class="small muted">${esc(x.role)}</div></div>${x.role!=='owner'?`<button class="button ghost compact" data-staff-remove="${x.id}">Снять роль</button>`:''}</div>`)+
+ `<div class="admin-form"><h3>Назначить роль</h3><label>Telegram ID</label><input id="staff-id" inputmode="numeric" placeholder="123456789"><label>Роль</label><select id="staff-role"><option value="administrator">Administrator</option><option value="support">Support</option><option value="finance">Finance</option><option value="viewer">Viewer</option></select><div style="height:15px"></div><button id="staff-save" class="button">Назначить</button></div>`;
+ $('#staff-save').onclick=async()=>{const id=$('#staff-id').value.trim();const reason=adminReason();if(!id||!reason)return;try{await api('admin/staff/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify({role:$('#staff-role').value,reason})});toast('Роль изменена');adminLoad()}catch(e){toast(e.message,true)}};
+ box.querySelectorAll('[data-staff-remove]').forEach(b=>b.onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/staff/'+b.dataset.staffRemove,{method:'DELETE',body:JSON.stringify({reason})});toast('Доступ отозван');adminLoad()}catch(e){toast(e.message,true)}});}
+async function adminAudit(box){const rows=await api('admin/audit');box.innerHTML='<h2>Журнал действий</h2><p class="small muted">Дата, сотрудник, действие и результат. Записи формируются сервером.</p>'+
+ adminList(rows,a=>`<div class="admin-item"><div><b>${esc(a.action)}</b><div class="small muted">${esc(a.details||'—')}<br>Цель: ${esc(a.target)} · Админ: ${a.admin}</div></div><div style="text-align:right">${stateTag(a.result,a.result==='ok')}<div class="small muted">${day(a.date)}</div></div></div>`);}
+
 boot();
 })();
 </script></body></html>"""
