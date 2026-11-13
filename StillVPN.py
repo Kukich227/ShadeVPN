@@ -1,4 +1,4 @@
-"""STILL VPN v6 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
+"""STILL VPN v7 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -61,7 +61,7 @@ BotHost использует Python-зависимости из интерфей
 Дополнительные команды /admin -> «Команды управления».
 Сервис считает покупку подтверждённой ТОЛЬКО при successful_payment Telegram.
 
-STILL VPN WEB v6 (на BotHost, без Telegram):
+STILL VPN WEB v7 (на BotHost, без Telegram):
     Адрес: https://<домен-WEBAPP_URL>/web — один FastAPI процесс, одна SQLite.
     WEB_REGISTRATION_ENABLED=1  # самостоятельная регистрация логин/пароль (по умолчанию).
     BOT_USERNAME=<username без @>  # необязательно: бот попробует получить через Bot API.
@@ -75,9 +75,17 @@ STILL VPN WEB v6 (на BotHost, без Telegram):
     Без отдельного платёжного провайдера сайт не может принимать платные платежи.
     Требуется тестирование российских сетей без VPN и юридические документы.
 
-MINI APP АДМИНКА v5: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
+v7: /api/admin/users/{id}/trial/shorten доступен только Owner, требует причину,
+    не продлевает срок, записывает Audit Log и синхронизирует доступ с агентом.
+    В админке пользователя действия «До 5 минут» и «Завершить сейчас».
+    Экспорт .conf: сначала локальное системное сохранение/передача файла,
+    затем обычная загрузка/копирование. Telegram WebView может запрещать
+    загрузку blob:-URL: полноценная гарантия скачивания невозможна без
+    платформенной поддержки. Приватные клиентские ключи на сервер не отправляются.
+
+MINI APP АДМИНКА v7: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
 из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
-базу не удалять. Только v5 на BotHost, VPN-агент v4 на VPS остаётся совместимым.
+базу не удалять. Только v7 на BotHost, VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
     python shade.py selftest                  — автономные тесты криптографических проверок
@@ -2609,6 +2617,11 @@ if MODE == "app":
     class AdminStaffRole(AdminReason):
         role: str
 
+    class AdminTrialShorten(AdminReason):
+        # 0 = expire now; 5 = expire no later than five minutes from now.
+        # Never extend an already earlier expiry.
+        remaining_minutes: int = Field(ge=0, le=1440)
+
     def plan_dict(p: Plan):
         return {"id": p.id, "title": p.title, "days": p.days, "stars": p.stars,
                 "devices": p.devices, "traffic_gb": (p.traffic_bytes // 1024**3 if p.traffic_bytes else 0),
@@ -2678,6 +2691,44 @@ if MODE == "app":
             pays = (await s.scalars(select(Payment).where(Payment.user_id == user_id).order_by(Payment.created_at.desc()).limit(20))).all()
             output["payments"] = [{"id":p.id,"amount":p.amount,"status":p.status} for p in pays]
         return output
+
+    @app.post("/api/admin/users/{user_id}/trial/shorten")
+    async def admin_trial_shorten(
+        user_id: int,
+        data: AdminTrialShorten,
+        actor=Depends(admin_scope("users")),
+    ):
+        # Test-only administrative control: owner, explicit audit reason, only shorten.
+        admin_id, role = actor
+        if role != "owner":
+            bad(403, "Завершить действующий пробный период может только владелец")
+        if len(data.reason.strip()) < 5:
+            bad(422, "Укажите причину не короче 5 символов")
+        async with Session.begin() as s:
+            tr = await s.get(Trial, user_id, with_for_update=True)
+            if tr is None:
+                bad(404, "Пробный период пользователя не найден")
+            old_end = tr.ends_at
+            if old_end <= now():
+                bad(409, "Пробный период уже завершён")
+            target_end = now() + timedelta(minutes=data.remaining_minutes)
+            tr.ends_at = min(old_end, target_end)
+            if data.remaining_minutes == 0:
+                # Ensure it is strictly expired even with timestamp rounding.
+                tr.ends_at = min(tr.ends_at, now() - timedelta(seconds=1))
+            audit(s, admin_id, "trial_shortened", user_id,
+                  f"old={old_end.isoformat()}; new={tr.ends_at.isoformat()}; "
+                  f"remaining_minutes={data.remaining_minutes}; reason={data.reason.strip()}")
+            if data.remaining_minutes == 0 and user_id > 0:
+                await queue_notice(s, user_id, "trial_admin_expired", str(int(now().timestamp())),
+                                   "Still VPN: ваш пробный доступ завершён администрацией.")
+            new_end = tr.ends_at
+        # A failed network request must never undo the earlier committed expiry.
+        # The periodic worker / agent's short-lived lease will reconcile/revoke it.
+        async with Session.begin() as s:
+            await ensure_access(s, user_id)
+        return {"ok": True, "ends_at": dt_iso(new_end),
+                "note": "Проверьте удаление Peer на SKRIME. Платная подписка, если есть, продолжит действовать."}
 
     @app.post("/api/admin/users/{user_id}/block")
     async def admin_user_block(user_id: int, data: AdminBlock, actor=Depends(admin_scope("users"))):
@@ -3792,13 +3843,55 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding:29px 0;display:f
 @media(max-width:820px){.intro{grid-template-columns:1fr;gap:24px;min-height:0}.intro-art{height:180px;max-width:100%}.intro-art:before{width:170px;height:170px}.intro-art:after{width:100px;height:100px}.intro-art .symbol{width:65px;height:65px}.layout{grid-template-columns:1fr}.side{display:none}.intro-list{gap:16px}.shell{padding:39px 22px 110px}header{height:72px;padding:0 22px}.topnav{gap:13px}.topnav .hide-mobile{display:none}}
 @media(max-width:520px){.micro.desktop{display:none}.logotype{font-size:17px}.pill-link{padding:8px 10px;font-size:11px}.intro-list{grid-template-columns:1fr;gap:3px}.intro-list div{padding:9px 0;border-bottom:1px solid var(--line)}.intro-art{height:145px}.intro{padding-bottom:35px}.shell{padding-top:30px}.subnav{display:grid;grid-template-columns:repeat(4,1fr);gap:0}.subnav button{font-size:11px;padding:10px 3px}.overview{padding:22px 18px}.grid2{grid-template-columns:1fr}.planline{align-items:flex-start}.listrow strong{font-size:13px}.buttons .cta{width:100%}h1{font-size:36px}}
 @media(prefers-reduced-motion:no-preference){.cta,.subnav button{transition:background .14s,border-color .14s}}
+
+/* STILL / EDITION 07 — asymmetric editorial layout, measured type, data-first member pages. */
+:root{--trim:#a96a7e}
+body{font-feature-settings:"tnum" 1}
+header{max-width:1260px}.shell{max-width:1210px;padding-top:48px}
+.logotype{letter-spacing:.24em;font-weight:720}.topnav{gap:23px}
+h1{font-weight:570;letter-spacing:-.065em;line-height:1.03}
+.intro{grid-template-columns:minmax(0,1fr) 360px;gap:8vw;min-height:540px;align-items:start;padding-top:40px;padding-bottom:58px}
+.intro-copy{padding:28px 0 6px}.intro h1{max-width:790px;font-size:clamp(47px,6.4vw,84px);margin:24px 0 25px}
+.intro h1 em{font-style:normal;color:#b77c91}
+.intro .lead{max-width:525px;font-size:16px;line-height:1.85}
+.intro-footnote{margin-top:31px;font-size:11px;letter-spacing:.07em;color:var(--muted)}
+.intro-art{height:auto;min-height:412px;display:block;overflow:hidden;border:1px solid #422f3c;border-radius:4px;background:#161116;padding:27px 25px}
+.intro-art::before,.intro-art::after{display:none!important}
+.workflow-title{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #4b3642;padding-bottom:22px;gap:6px}
+.workflow-tag{color:#927f8c;font:11px ui-monospace,monospace;white-space:nowrap}
+.workflow{margin:30px 0;padding:0;list-style:none;counter-reset:none}
+.workflow li{display:grid;grid-template-columns:37px 1fr;align-items:start;gap:17px;padding:18px 0 20px;border-bottom:1px solid #32272f}
+.workflow li:last-child{border-bottom:0}
+.workflow strong{display:block;font-size:16px;font-weight:580;line-height:1.5}.workflow small{color:var(--muted);font-size:12px;display:block;margin-top:3px}
+.step-no{font:12px ui-monospace,monospace;color:#a37388;padding-top:4px}
+.workflow-bottom{display:block;border-top:1px solid #4b3642;padding-top:18px;margin-top:7px;color:#95818d;font-size:10px;letter-spacing:.15em}
+.intro-list{border-bottom:1px solid var(--line);grid-template-columns:repeat(3,1fr);gap:12px;padding:21px 0}
+.intro-list div{padding:10px 22px 7px 0;border-right:1px solid var(--line)}.intro-list div:last-child{border-right:0}
+.intro-list strong{font-size:12px;letter-spacing:.01em}.intro-list p{font-size:12px;line-height:1.5}
+.auth-shell{margin-top:90px}
+.subnav{gap:4px}.subnav button{border-radius:5px;padding:10px 14px}
+.overview{border:0;border-left:2px solid #774056;border-radius:0;padding:23px 22px;background:#191217}
+.overview::after{display:none!important}
+.big-info{font-size:clamp(30px,3.9vw,52px);font-weight:590}
+.planline{padding:27px 0}.planline strong{font-weight:600}
+.panel{background:#141015;border-radius:9px}
+.cta{border-radius:7px;font-weight:600}.pill-link{border-radius:6px}
+.listrow strong{font-variant-numeric:tabular-nums}
+.site-subtitle{border-top:1px solid var(--line);padding-top:17px;font-size:12px;color:var(--muted)}
+.config-output{border-radius:7px;background:#171217}
+.export-row{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:15px}
+.export-copy{border-top:1px solid var(--line);margin-top:17px;padding-top:15px;color:var(--muted);font-size:12px;line-height:1.65}
+@media(max-width:900px){.intro{grid-template-columns:1fr 320px;gap:34px;min-height:0}.intro h1{font-size:clamp(43px,6vw,67px)}}
+@media(max-width:780px){.intro{grid-template-columns:1fr;gap:25px;padding-top:4px}.intro-copy{padding-top:9px}.intro-art{min-height:unset;padding:23px}.workflow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:18px 0}.workflow li{display:block;padding:10px 0;border:0}.workflow strong{font-size:13px}.workflow small{font-size:11px}.step-no{display:block;margin-bottom:9px}.intro-list{grid-template-columns:1fr}.intro-list div{border-right:0;border-bottom:1px solid var(--line);padding:10px 0}.intro-list div:last-child{border:0}}
+@media(max-width:520px){.shell{padding-top:24px}.intro h1{font-size:clamp(39px,11.8vw,56px)}.intro .lead{font-size:14px;line-height:1.7}.workflow{grid-template-columns:1fr}.workflow li{display:grid;grid-template-columns:29px 1fr;border-bottom:1px solid #382b35}.intro-art{padding:17px}.intro-list{gap:0}.intro-footnote{font-size:10px}.auth-shell{margin-top:52px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head>
 <body>
 <header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#ab9ba7">VPN</span></a><span class="micro desktop">Quietly connected.</span><nav class="topnav"><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram-бот ↗</a></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
-<section class="intro"><div><p class="kicker">STILL VPN / WEB ACCESS</p><h1>Свобода подключения.<br>Без лишнего шума.</h1><p class="lead">Личный VPN-кабинет в браузере. Управляйте подключениями и подпиской, даже когда Telegram недоступен.</p><div class="buttons"><button class="cta" id="intro-create">Создать аккаунт <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти</button></div></div><div class="intro-art" aria-hidden="true"><i class="symbol"></i><span class="sidenote">PRIVATE BY DESIGN / WIREGUARD</span></div></section>
-<div class="intro-list"><div><strong>Отдельные ключи</strong><p>Уникальная конфигурация для каждого устройства.</p></div><div><strong>Точный контроль</strong><p>Управляйте доступом и наблюдайте расход трафика.</p></div><div><strong>Без Telegram</strong><p>Независимый вход в веб-кабинет по логину и паролю.</p></div></div>
+<section class="intro"><div class="intro-copy"><p class="kicker">STILL / PRIVATE NETWORK</p><h1>Интернет остаётся<br><em>на связи.</em></h1><p class="lead">Ваш VPN-кабинет без зависимости от Telegram. Отдельные ключи для устройств, ясные лимиты и управление доступом в одном месте.</p><div class="buttons"><button class="cta" id="intro-create">Создать аккаунт <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Уже есть аккаунт</button></div><p class="intro-footnote">WireGuard · защищённые ключи · вход из браузера</p></div><div class="intro-art"><div class="workflow-title"><span class="micro">КАК ЭТО РАБОТАЕТ</span><span class="workflow-tag">STILL / 01—03</span></div><ol class="workflow"><li><span class="step-no">01</span><div><strong>Создайте профиль</strong><small>В кабинете Still VPN</small></div></li><li><span class="step-no">02</span><div><strong>Сохраните .conf</strong><small>Локально на своём устройстве</small></div></li><li><span class="step-no">03</span><div><strong>Включите WireGuard</strong><small>Отдельный ключ для каждого устройства</small></div></li></ol><span class="workflow-bottom">НЕЗАВИСИМЫЙ ВХОД / HTTPS</span></div></section>
+<div class="intro-list"><div><strong>01 / Своё устройство</strong><p>Уникальная конфигурация для каждого устройства.</p></div><div><strong>02 / Прозрачные лимиты</strong><p>Управляйте доступом и наблюдайте расход трафика.</p></div><div><strong>03 / Второй вход</strong><p>Независимый вход в веб-кабинет по логину и паролю.</p></div></div>
 <section class="auth-shell" id="authorization" style="margin-top:80px"><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
 </div>
 <div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
@@ -3831,8 +3924,14 @@ async function loadMe(activate=false){try{me=await api('me');csrf=me.csrf;$('#gu
 $$('[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));function nav(p){page=p;$$('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===p));render();window.scrollTo({top:0,behavior:'smooth'})}
 function subhead(k,title,desc=''){return `<p class="kicker">${esc(k)}</p><h1 style="font-size:clamp(30px,4.5vw,53px)">${esc(title)}</h1><p class="lead">${esc(desc)}</p>`}
 function render(){if(!me)return;const c=$('#content');if(page==='home')home(c);else if(page==='plans')plansPage(c);else if(page==='devices')devicesPage(c);else profilePage(c)}
-function home(c){const s=me.subscription;c.innerHTML=subhead('ЛИЧНЫЙ КАБИНЕТ',`Привет, ${me.username}.`,'Управляйте VPN без лишних действий и зависимостей.')+`<div class="overview"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><div class="big-info">${s?esc(s.name):'Оставайтесь на связи'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Активируйте доступ, чтобы создать VPN-подключение.'}</p>${s&&s.limit!==null?`<div class="progress"><i style="width:${Math.min(100,Math.max(0,s.used/s.limit*100))}%"></i></div>`:''}</div>
-<div class="listrow"><span class="muted">Трафик за период</span><strong>${s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?s.devices:'—'}</strong></div><div class="listrow"><span class="muted">VPN-серверы</span><strong>${me.service.responsive_nodes} из ${me.service.enabled_nodes} доступны</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Управлять устройствами':'Посмотреть подписки'}</button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Включить пробный доступ</button>':''}</div>`;$('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}}
+function home(c){const s=me.subscription;
+const pct=(s&&s.limit!==null&&s.limit>0)?Math.min(100,Math.max(0,s.used/s.limit*100)):null;
+const network=(me.service&&me.service.responsive_nodes>0)?'Сервер отвечает':'Статус уточняется';
+c.innerHTML=subhead('ОБЗОР / STILL VPN',`На связи, ${me.username}.`,'Ваша сеть, устройства и срок доступа — без лишних меню.')+
+`<div class="overview"><div class="splithead"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><span class="micro">АККАУНТ / ${me.id>0?'TG':'WEB'}</span></div><div class="big-info">${s?esc(s.name):'Управляйте подключением'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Выберите подписку, чтобы добавить WireGuard-устройство.'}</p>${pct!==null?`<div class="progress" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div>`:''}</div>
+<div class="listrow"><span class="muted">Израсходовано за период</span><strong>${s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?s.devices:'—'}</strong></div><div class="listrow"><span class="muted">VPN-инфраструктура</span><strong>${network}</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Перейти к устройствам':'Посмотреть тарифы'} <span aria-hidden="true">↗</span></button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Активировать пробный доступ</button>':''}</div>`;
+$('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}
+}
 async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
 try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} устройств · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
 async function devicesPage(c){c.innerHTML=subhead('WIREGUARD','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
@@ -3842,9 +3941,23 @@ $$('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id=
 $$('[data-revoke]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать доступ устройства? Старая конфигурация перестанет работать.'))return;try{await api('devices/'+b.dataset.revoke,{method:'DELETE',body:'{}'});toast('Отзыв доступа запрошен');await loadDevices();await loadMe()}catch(e){toast(e.message,true)}})}catch(e){toast(e.message,true)}}
 function b64(a){return btoa(String.fromCharCode(...new Uint8Array(a)))}
 async function keypair(){if(!isSecureContext||!crypto.subtle)throw Error('Для создания ключей требуется HTTPS и современный браузер');try{const kp=await crypto.subtle.generateKey({name:'X25519'},true,['deriveBits']);const pub=b64(await crypto.subtle.exportKey('raw',kp.publicKey)),der=new Uint8Array(await crypto.subtle.exportKey('pkcs8',kp.privateKey));if(der.length<32)throw Error('Invalid X25519 private key');return {pub,priv:b64(der.slice(-32))}}catch{throw Error('Этот браузер не поддерживает X25519. Используйте современный Chrome, Firefox или Safari.')}}
+function saveBlobConfig(conf,filename){
+ const blob=new Blob([conf],{type:'application/octet-stream'});const url=URL.createObjectURL(blob);
+ const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();
+ setTimeout(()=>URL.revokeObjectURL(url),120000);
+}
+async function saveConfigLocally(conf,filename){
+ if(typeof File==='undefined'){saveBlobConfig(conf,filename);toast('Если загрузка не появилась, используйте «Копировать».',true);return;}
+ const file=new File([conf],filename,{type:'text/plain'});
+ if(window.showSaveFilePicker){try{const handle=await window.showSaveFilePicker({suggestedName:filename,types:[{description:'WireGuard',accept:{'text/plain':['.conf']}}]});const out=await handle.createWritable();await out.write(file);await out.close();toast('Конфигурация сохранена');return}catch(e){if(e.name==='AbortError')return}}
+ if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){try{await navigator.share({files:[file],title:'Still VPN WireGuard'});toast('Выберите локальное сохранение файла');return}catch(e){if(e.name==='AbortError')return}}
+ saveBlobConfig(conf,filename);toast('Проверьте загрузки. Если файла нет, скопируйте текст в .conf вручную.',true);
+}
 async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
-lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Приватный ключ хранится только на этой странице, не отправляется серверу. Сохраните файл сейчас. Если потеряете его, отзовите устройство и создайте новое.</p><div class="codebox" id="conf-display"></div><div class="buttons"><button class="cta tiny" id="conf-download">Скачать .conf</button><button class="cta outline tiny" id="conf-copy">Копировать</button></div></div>`;$('#conf-display').textContent=configText;
-$('#conf-download').onclick=()=>{const blob=new Blob([configText],{type:'application/octet-stream'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='still-vpn-'+r.id.slice(0,8)+'.conf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)};
+lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Приватный ключ хранится только на этой странице, не отправляется серверу. Сохраните файл сейчас. Если потеряете его, отзовите устройство и создайте новое.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-save">Сохранить .conf на устройство</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Выбирайте локальное сохранение. Конфигурация содержит приватный ключ и не отправляется нашему серверу.</p></div>`;$('#conf-display').textContent=configText;
+const configFilename='still-vpn-'+r.id.slice(0,8)+'.conf';
+$('#conf-save').onclick=()=>saveConfigLocally(configText,configFilename);
+$('#conf-download').onclick=()=>saveBlobConfig(configText,configFilename);
 $('#conf-copy').onclick=()=>navigator.clipboard.writeText(configText).then(()=>toast('Конфигурация скопирована'),()=>toast('Не удалось скопировать',true));await loadDevices();me.device_count+=1;box.scrollIntoView({behavior:'smooth'});
 }catch(e){toast(e.message,true)}finally{button.disabled=false;button.textContent='Создать конфигурацию'}}
 function profilePage(c){c.innerHTML=subhead('АККАУНТ','Ваш профиль.','Простые настройки и понятный контроль доступа.')+`<div class="listrow"><span class="muted">Логин</span><strong>${esc(me.username)}</strong></div><div class="listrow"><span class="muted">Дата регистрации</span><strong>${date(me.created_at)}</strong></div><div class="listrow"><span class="muted">Email</span><strong>${esc(me.email||'Не указан')}</strong></div><div class="listrow"><span class="muted">Подтверждение email</span><strong>${me.email_verified?'Подтверждён':'Нет'}</strong></div><div class="listrow"><span class="muted">Telegram</span><strong>${me.id>0?'Связан':'Не привязан'}</strong></div><section class="section" id="email-options"></section><section class="section"><h3>Поддержка Still VPN</h3><p class="muted small">Обращения доступны здесь, даже если Telegram недоступен. Не отправляйте приватные ключи или пароли.</p><form id="ticket-form"><label class="field"><span>Опишите проблему</span><textarea id="ticket-text" maxlength="3500" minlength="5" required placeholder="Что не работает?" style="width:100%;min-height:95px;background:#1b151a;border:1px solid #43343e;border-radius:9px;color:#F3EEF0;padding:12px;font:inherit"></textarea></label><button class="cta tiny">Создать обращение</button></form><div id="my-tickets" class="section">Загрузка обращений…</div></section><section class="section"><h3>Привязка Telegram</h3><p class="muted small">Если Telegram доступен, отправьте боту /linkweb и вставьте одноразовый код. Привязка доступна только для нового веб-аккаунта без использованных подписок и VPN-профилей.</p><form id="link-form"><label class="field"><span>Код привязки</span><input id="link-code" placeholder="STILL-..." maxlength="80" required></label><button type="submit" class="cta outline tiny">Привязать Telegram</button></form></section><section class="section"><h3>Сменить пароль</h3><p class="muted small">После смены пароля все сессии будут завершены. Сохраните новый код восстановления.</p><form id="change-form"><label class="field"><span>Текущий пароль</span><input id="old-pass" type="password" required></label><label class="field"><span>Новый пароль (от 12 символов)</span><input id="new-pass" type="password" minlength="12" required></label><button class="cta outline tiny">Сменить пароль</button></form></section><div class="line"></div><button class="cta danger tiny" id="logout">Выйти из аккаунта</button>`;
@@ -3934,9 +4047,43 @@ input:focus,select:focus{border-color:var(--violet)}.device{border-bottom:1px so
 .admin-status.ok{color:#b7dbc6;border-color:rgba(112,188,143,.28)}
 .admin-breadcrumb{background:none;border:0;color:#c3a1d5;padding:0;font-size:12px;margin:0 0 14px}
 .admin-feed{padding:0;list-style:none}.admin-feed li{padding:10px 0;border-bottom:1px solid var(--hair);font-size:13px;line-height:1.5}
+.admin-trial-test{padding:19px 0;margin:14px 0;border-top:1px solid #61384b;border-bottom:1px solid var(--hair)}
+.admin-trial-test h3{margin:6px 0 5px;font-size:16px}
 @media(max-width:370px){.tabs button{min-width:52px;font-size:9px}.admin-form .row{flex-direction:column;align-items:stretch}}
 
 @media(min-width:700px){.tabs{max-width:620px;margin:0 auto;border-left:1px solid var(--hair);border-right:1px solid var(--hair)}#app{padding-left:32px;padding-right:32px}}
+
+/* STILL / SIGNAL: editorial hierarchy, quiet linework instead of decorative cards. */
+:root{--signal:#b67b91}
+body{font-feature-settings:"tnum" 1}
+.top{padding-bottom:17px;border-bottom:1px solid var(--hair);margin-bottom:30px}
+.wordmark{font-weight:760;letter-spacing:.23em;font-size:19px}
+.top>.muted{font-size:9px;text-transform:uppercase;letter-spacing:.16em}
+.hero{margin:24px 0 10px;padding:24px 0 22px;border:0;border-radius:0;background:transparent;border-top:2px solid #673043;border-bottom:1px solid var(--hair)}
+.hero .big{font-size:clamp(29px,8.4vw,46px);line-height:1.06;letter-spacing:-.058em;font-weight:640;margin:19px 0 9px}
+.hero .pill{background:transparent;border:1px solid #51404e;color:#d4c4d0}
+.hero .dot{background:#94b9a6}
+.statrow{padding:20px 0;align-items:flex-start;line-height:1.4}
+.statrow .muted{font-size:13px}.statrow b{font-variant-numeric:tabular-nums;font-weight:580;max-width:65%}
+.button{border-radius:9px;font-weight:620;min-height:48px;background:#681A29}
+.button:focus-visible{outline:2px solid #b89ac6;outline-offset:3px}
+.panel{border:1px solid var(--hair);background:#151116;border-radius:11px}
+.plan{border-left:2px solid transparent;padding:22px 10px 22px 0}.plan:hover{border-left-color:#681A29;padding-left:10px}
+.section{margin-top:32px}
+.kicker{color:#b294c5;letter-spacing:.18em}
+.usage-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin:24px 0 4px;font-size:13px;color:var(--muted)}
+.usage-head strong{color:var(--ink);font-variant-numeric:tabular-nums;font-weight:620}
+.usage-track{height:5px;width:100%;background:#342630;overflow:hidden;border-radius:5px}
+.usage-track span{height:100%;display:block;background:#915268;border-radius:5px}
+.status-rail{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--hair);padding:15px 0}
+.status-rail span{font-size:12px;color:var(--muted)}.status-rail b{font-size:13px;font-weight:610}
+.export-primary{border-top:1px solid var(--hair);margin-top:18px;padding-top:14px}
+.export-info{font-size:12px;color:var(--muted);line-height:1.65}
+.export-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:9px;margin:13px 0}
+.export-actions button{min-width:0;white-space:normal}
+#config-text{max-height:132px;overflow:auto;color:#c6b7c2}
+@media(max-width:370px){.export-actions{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
 <div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">PRIVATE NETWORK</span></div><main id="main"><p class="muted">Загружаем Still VPN…</p></main></div>
@@ -3968,10 +4115,10 @@ function home(){const s=me.subscription;
 main.innerHTML=section('Личный кабинет',`Здравствуйте, ${esc(me.first_name||'друг')}.`,'Ваша приватная сеть под контролем.')+
 `<div class="hero"><div class="row"><span class="small muted">ВАШ ДОСТУП</span><span class="pill"><i class="dot"></i>${s?'Активен':'Неактивен'}</span></div>
 <div class="big">${s?esc(s.name):'Начните со Still VPN'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Активируйте пробный доступ или выберите подписку'}</div></div>
-<div class="statrow"><span class="muted">Трафик за период</span><b>${s?gb(s.used)+' / '+gb(s.limit):'—'}</b></div>
-<div class="statrow"><span class="muted">Устройства</span><b>${me.device_count} / ${s?s.devices:'—'}</b></div>
-<div class="statrow"><span class="muted">Право доступа</span><b>${s?'Предоставлено':'Не активно'}</b></div>
-<div class="statrow"><span class="muted">Состояние серверов</span><b>${me.service?.responsive_nodes||0} / ${me.service?.enabled_nodes||0} отвечали за 3 мин</b></div>
+<div class="usage-head"><span>Трафик за период</span><strong>${s?gb(s.used)+' / '+gb(s.limit):'—'}</strong></div>
+${s&&s.limit!==null&&s.limit>0?`<div class="usage-track" aria-label="Использовано трафика"><span style="width:${Math.min(100,Math.max(0,s.used/s.limit*100)).toFixed(1)}%"></span></div>`:''}
+<div class="status-rail"><span>Устройства</span><b>${me.device_count} из ${s?s.devices:'—'}</b></div>
+<div class="status-rail"><span>Состояние сети</span><b>${me.service?.responsive_nodes||0} из ${me.service?.enabled_nodes||0} серверов доступно</b></div>
 <div class="section"><button class="button" id="home-action">${s?'Настроить подключение':'Посмотреть тарифы'}</button></div>
 ${!s&&!me.trial_used?'<div class="section"><button class="button secondary" id="trial">Активировать пробный доступ</button><p class="small muted">Один раз на аккаунт · параметры задаёт администрация</p></div>':''}`;
 $('#home-action').onclick=()=>nav(s?'connect':'plans');if($('#trial'))$('#trial').onclick=async()=>{try{await api('trial',{method:'POST'});toast('Пробный доступ активирован');await reload();nav('home')}catch(e){toast(e.message,true)}};
@@ -4013,19 +4160,44 @@ async function wgKeyPair(){
  return {publicKey,privateKey};
  }catch(e){throw new Error('WebView не поддерживает генерацию X25519. Обновите Telegram и ОС. Сервер не генерирует приватные ключи.');}
 }
+function wireguardBlobDownload(conf,filename){
+ const blob=new Blob([conf],{type:'application/octet-stream'});
+ const url=URL.createObjectURL(blob);
+ const a=document.createElement('a');a.href=url;a.download=filename;
+ document.body.appendChild(a);a.click();a.remove();
+ setTimeout(()=>URL.revokeObjectURL(url),120000);
+}
+async function saveWireguardConf(conf,filename){
+ if(typeof File==='undefined'){wireguardBlobDownload(conf,filename);toast('Если загрузка не появилась, используйте «Копировать».',true);return;}
+ // Preserve user gesture: launch the native chooser before awaiting other async work.
+ const file=new File([conf],filename,{type:'text/plain'});
+ if(window.showSaveFilePicker){
+   try{const handle=await window.showSaveFilePicker({suggestedName:filename,types:[{description:'WireGuard',accept:{'text/plain':['.conf']}}]});
+       const writable=await handle.createWritable();await writable.write(file);await writable.close();
+       toast('Файл сохранён на устройство');return;
+   }catch(e){if(e.name==='AbortError')return;}
+ }
+ if(typeof navigator.share==='function'&&(!navigator.canShare||navigator.canShare({files:[file]}))){
+   try{await navigator.share({files:[file],title:'WireGuard — Still VPN'});
+       toast('Сохраните файл локально через системное меню');return;
+   }catch(e){if(e.name==='AbortError')return;}
+ }
+ wireguardBlobDownload(conf,filename);
+ toast('Если файл не появился в загрузках Telegram, нажмите «Копировать» и сохраните .conf локально.',true);
+}
 async function createDevice(){const btn=$('#create-device');btn.disabled=true;btn.textContent='Создание ключа…';
  try{const name=$('#dev-name').value.trim(),platform=$('#dev-platform').value;if(!name)throw new Error('Введите название устройства');
  const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:keys.publicKey})});
- const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
+ const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
  currentConfig={name,conf};
- const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Сохраните конфигурацию прямо сейчас. Приватный ключ не отправлялся на сервер и не хранится в базе. При потере файла удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="row"><button id="download" class="button compact">Скачать .conf</button><button id="share-conf" class="button secondary compact">Сохранить / Поделиться</button><button id="copy-conf" class="button secondary compact">Копировать</button></div><p class="small muted">Если Telegram не сохраняет файл, используйте «Сохранить / Поделиться» или «Копировать» и создайте локально файл .conf. Приватный ключ не отправляйте в мессенджеры и облачные сервисы.</p><p class="small muted" id="install-help"></p></div>`;
+ const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Сохраните конфигурацию прямо сейчас. Приватный ключ не отправлялся на сервер и не хранится в базе. При потере файла удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><div class="export-actions"><button id="share-conf" class="button compact">Сохранить на телефон</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">На Android выберите «Файлы» или локальное сохранение в системном меню. Не отправляйте конфигурацию в чаты и облако. Telegram может блокировать обычные загрузки — поэтому есть два способа.</p><p class="small muted" id="install-help"></p></div>`;
  $('#config-text').textContent=conf;
  const tips={android:'Android: установите WireGuard из Google Play или F-Droid, добавьте туннель из файла или QR-кода.',ios:'iPhone/iPad: установите WireGuard из App Store, откройте приложение и выберите «Создать туннель» → из файла или QR-кода.',windows:'Windows: установите официальный WireGuard с wireguard.com/install, затем «Import tunnel(s) from file».',macos:'macOS: установите WireGuard, выберите «Import tunnel(s) from file».',linux:'Linux: установите wireguard-tools, сохраните файл как /etc/wireguard/wg-still.conf (права 600) и запустите sudo wg-quick up wg-still.'};
  $('#install-help').textContent=(tips[platform]||'')+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
  if(window.QRCode){try{new QRCode($('#qr'),{text:conf,width:205,height:205,correctLevel:QRCode.CorrectLevel.L})}catch{$('#qr').textContent='QR слишком большой. Скачайте файл.'}}else $('#qr').textContent='QR не загрузился. Скачайте файл.';
  const confFilename='still-'+name.replace(/[^a-z0-9-_]/gi,'-')+'.conf';
- $('#download').onclick=()=>{const blob=new Blob([conf],{type:'application/octet-stream'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=confFilename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)};
- $('#share-conf').onclick=async()=>{try{if(!navigator.share||typeof File==='undefined')throw new Error('Системное сохранение недоступно. Нажмите «Копировать» и сохраните .conf вручную.');const file=new File([conf],confFilename,{type:'text/plain'});if(navigator.canShare&&!navigator.canShare({files:[file]}))throw new Error('Telegram не поддерживает передачу файла. Скопируйте конфигурацию.');await navigator.share({files:[file]});}catch(e){if(e.name!=='AbortError')toast(e.message||'Не удалось открыть сохранение',true)}};
+ $('#download').onclick=()=>wireguardBlobDownload(conf,confFilename);
+ $('#share-conf').onclick=()=>saveWireguardConf(conf,confFilename);
  $('#copy-conf').onclick=async()=>{try{await navigator.clipboard.writeText(conf);toast('Конфигурация скопирована')}catch{toast('Буфер обмена недоступен',true)}};
  toast('Устройство создано');await loadDevices();await reload();root.scrollIntoView({behavior:'smooth'});
  }catch(e){toast(e.message,true)}finally{btn.disabled=false;btn.textContent='Создать конфигурацию'}}
@@ -4058,7 +4230,7 @@ const adminPerms={owner:['access','stats','users','plans','servers','finance','s
  support:['access','users','support'],finance:['access','stats','finance'],viewer:['access','stats']};
 function acan(perm){return (adminPerms[me?.admin_role]||[]).includes(perm)}
 function stateTag(s,ok){return `<span class="admin-status ${ok?'ok':''}">${esc(s)}</span>`}
-function adminReason(){const r=prompt('Причина изменения (для журнала действий):');return r&&r.trim().length>=3?r.trim():null}
+function adminReason(){const r=prompt('Причина изменения (не менее 5 символов, для журнала действий):');if(!r)return null;if(r.trim().length<5){toast('Причина должна содержать минимум 5 символов',true);return null}return r.trim()}
 function adminPage(){if(!me?.admin_role){nav('account');return}
  const available=adminSections.filter(x=>acan(x[2]));if(!available.some(x=>x[0]===adminSection))adminSection=available[0][0];
  main.innerHTML=`<div class="admin-head"><div><p class="kicker">Управление Still VPN</p><h1>Админ-панель</h1><p class="small muted">Роль: ${esc(me.admin_role)} · данные из системы</p></div><button id="admin-refresh" class="button secondary compact">Обновить</button></div>`+
@@ -4091,12 +4263,25 @@ async function adminUsers(box, query=''){if(adminSelectedUser){await adminUserDe
  $('#admin-search-btn').onclick=()=>adminUsers(box,$('#admin-search').value);$('#admin-search').onkeydown=e=>{if(e.key==='Enter')adminUsers(box,e.target.value)};
  box.querySelectorAll('[data-user]').forEach(b=>b.onclick=()=>{adminSelectedUser=Number(b.dataset.user);adminLoad()});}
 async function adminUserDetail(box,uid){const u=await api('admin/users/'+uid);box.innerHTML=`<button id="admin-back" class="admin-breadcrumb">← К пользователям</button><h2>${esc(u.first_name||u.username||u.id)}</h2>
- <div class="statrow"><span class="muted">Telegram ID</span><b>${u.id}</b></div><div class="statrow"><span class="muted">Username</span><b>${esc(u.username?'@'+u.username:'—')}</b></div><div class="statrow"><span class="muted">Статус</span>${stateTag(u.blocked?'Заблокирован':'Активен',!u.blocked)}</div><div class="statrow"><span class="muted">Пробный доступ</span><b>${u.trial?day(u.trial.ends_at):'Не использован'}</b></div>`+
+ <div class="statrow"><span class="muted">Telegram ID</span><b>${u.id}</b></div><div class="statrow"><span class="muted">Username</span><b>${esc(u.username?'@'+u.username:'—')}</b></div><div class="statrow"><span class="muted">Статус</span>${stateTag(u.blocked?'Заблокирован':'Активен',!u.blocked)}</div><div class="statrow"><span class="muted">Пробный доступ</span><b>${u.trial?day(u.trial.ends_at)+' · '+new Date(u.trial.ends_at).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):'Не использован'}</b></div>`+
  (['owner','administrator'].includes(me.admin_role)?`<div class="admin-actions"><button class="button secondary compact" id="admin-block">${u.blocked?'Разблокировать':'Заблокировать'}</button><button class="button secondary compact" id="admin-grant">Выдать подписку</button><button class="button ghost compact" id="admin-revoke-all">Отозвать все устройства</button></div>`:'')+
+ (me.admin_role==='owner'&&u.trial&&new Date(u.trial.ends_at)>new Date()?`<section class="admin-trial-test"><span class="kicker">ТЕСТ ДОСТУПА</span><h3>Сократить пробный период</h3><p class="small muted">Только для выбранного пользователя. Записывается в Audit Log. Это не отменяет платную подписку.</p><div class="admin-actions"><button class="button secondary compact" id="admin-trial-five">До 5 минут</button><button class="button ghost compact" id="admin-trial-end">Завершить сейчас</button></div></section>`:'')+
  `<div class="section"><h2>Подписки</h2>${adminList(u.subscriptions,s=>`<div class="admin-item"><div><b>${esc(s.name)}</b><div class="small muted">${day(s.starts_at)} — ${day(s.ends_at)} · ${esc(s.source)}</div></div>${stateTag(s.revoked?'Отозвана':'Выдана',!s.revoked)}</div>`)}</div>`+
  `<div class="section"><h2>Устройства</h2>${adminList(u.devices,d=>`<div class="admin-item"><div><b>${esc(d.name)}</b><div class="small muted">${esc(d.ip)} · ${d.last_handshake?day(d.last_handshake):'Нет handshake'}</div></div>${['owner','administrator'].includes(me.admin_role)&&d.enabled?`<button class="button ghost compact" data-revoke="${esc(d.id)}">Отозвать</button>`:stateTag(d.enabled?'Активно':'Отозвано',d.enabled)}</div>`)}</div>`;
  $('#admin-back').onclick=()=>{adminSelectedUser=null;adminLoad()};
  if($('#admin-block'))$('#admin-block').onclick=async()=>{const r=adminReason();if(!r)return;try{await api('admin/users/'+uid+'/block',{method:'POST',body:JSON.stringify({reason:r,blocked:!u.blocked})});toast('Статус изменён');adminLoad()}catch(e){toast(e.message,true)}};
+ for(const [id,minutes] of [['admin-trial-five',5],['admin-trial-end',0]]){
+  const b=$('#'+id);if(!b)continue;
+  b.onclick=async()=>{
+    const question=minutes===0?'Завершить пробный период пользователя прямо сейчас?':'Сократить пробный период пользователя до 5 минут?';
+    if(!confirm(question))return;
+    const reason=adminReason();if(!reason)return;
+    try{const out=await api('admin/users/'+uid+'/trial/shorten',{method:'POST',body:JSON.stringify({remaining_minutes:minutes,reason})});
+        toast(minutes===0?'Пробный период завершён, отзыв Peer запрошен':'Пробный период сокращён до 5 минут');
+        adminLoad();
+    }catch(e){toast(e.message,true)}
+  };
+ }
  if($('#admin-grant'))$('#admin-grant').onclick=async()=>{const days=Number(prompt('На сколько дней?','30'));if(!Number.isInteger(days)||days<1||days>365)return;const devices=Number(prompt('Количество устройств (1–20)','2'));if(!Number.isInteger(devices)||devices<1||devices>20)return;const traffic_gb=Number(prompt('Лимит в ГБ (0 = безлимит)','0'));if(!Number.isInteger(traffic_gb)||traffic_gb<0||traffic_gb>10000)return;const reason=adminReason();if(!reason)return;try{await api('admin/users/'+uid+'/grant',{method:'POST',body:JSON.stringify({days,devices,traffic_gb,reason})});toast('Подписка выдана');adminLoad()}catch(e){toast(e.message,true)}};
  if($('#admin-revoke-all'))$('#admin-revoke-all').onclick=async()=>{if(!confirm('Отозвать VPN-доступ всех устройств пользователя?'))return;const reason=adminReason();if(!reason)return;try{await api('admin/users/'+uid+'/revoke',{method:'POST',body:JSON.stringify({reason})});toast('Отзыв отправлен');adminLoad()}catch(e){toast(e.message,true)}};
  box.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/devices/'+b.dataset.revoke+'/revoke',{method:'POST',body:JSON.stringify({reason})});toast('Peer отозван');adminLoad()}catch(e){toast(e.message,true)}});}
