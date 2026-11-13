@@ -1,4 +1,4 @@
-"""STILL VPN v5 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
+"""STILL VPN v6 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -60,6 +60,20 @@ BotHost использует Python-зависимости из интерфей
 Первый запуск: /start, /admin; создать тариф /adm_plan 30 100 2 0 Месяц.
 Дополнительные команды /admin -> «Команды управления».
 Сервис считает покупку подтверждённой ТОЛЬКО при successful_payment Telegram.
+
+STILL VPN WEB v6 (на BotHost, без Telegram):
+    Адрес: https://<домен-WEBAPP_URL>/web — один FastAPI процесс, одна SQLite.
+    WEB_REGISTRATION_ENABLED=1  # самостоятельная регистрация логин/пароль (по умолчанию).
+    BOT_USERNAME=<username без @>  # необязательно: бот попробует получить через Bot API.
+    WEB_TRIAL_ENABLED=0  # по умолчанию, чтобы нельзя было массово создавать пробники.
+    Для включения веб-пробника требуются SMTP_HOST, SMTP_PORT, SMTP_USER,
+    SMTP_PASSWORD, SMTP_FROM, WEB_TRIAL_ENABLED=1 и подтверждённый email.
+    Вход через HttpOnly+Secure cookie, CSRF-токен, scrypt-hash. Одноразовый код
+    восстановления показывается при регистрации. /linkweb в Telegram создаёт
+    код привязки к существующему Telegram-аккаунту (до первого использования VPN).
+    На сайте пока НЕТ оплаты: Telegram Stars остаются только в Telegram.
+    Без отдельного платёжного провайдера сайт не может принимать платные платежи.
+    Требуется тестирование российских сетей без VPN и юридические документы.
 
 MINI APP АДМИНКА v5: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
 из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
@@ -254,6 +268,12 @@ PORT=8000
 ENABLE_PAYMENTS=0
 SUPPORT_CONTACT=@support
 TERMS_URL=https://example.org/terms
+BOT_USERNAME=YOUR_BOT_USERNAME_WITHOUT_AT
+WEB_REGISTRATION_ENABLED=1
+WEB_TRIAL_ENABLED=0
+# To enable verified-email trials: SMTP_HOST, SMTP_PORT=587, SMTP_USER,
+# SMTP_PASSWORD, SMTP_FROM and WEB_TRIAL_ENABLED=1.
+# Never put SMTP credentials into code or public GitHub.
 # VPS agent ONLY: SHADE_MODE=agent WG_INTERFACE=wg0 PORT=8080 AGENT_BIND=127.0.0.1
 """,
         "Caddyfile.agent.example": """# Replace wg.example.org with your own agent domain and configure its A/AAAA DNS.
@@ -776,6 +796,42 @@ if MODE == "app":
         result: Mapped[str] = mapped_column(String(20), default="ok")
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
 
+    class WebAccount(Base):
+        """Independent site account bound to a User (negative ID unless explicitly linked)."""
+        __tablename__ = "web_accounts"
+        id: Mapped[int] = mapped_column(Integer, primary_key=True)
+        user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+        login: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+        password_salt: Mapped[str] = mapped_column(String(32))
+        password_hash: Mapped[str] = mapped_column(String(64))
+        recovery_hash: Mapped[str] = mapped_column(String(64))
+        email: Mapped[str | None] = mapped_column(String(254), unique=True, nullable=True)
+        email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+        failed_logins: Mapped[int] = mapped_column(Integer, default=0)
+        locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+        created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+    class WebSession(Base):
+        __tablename__ = "web_sessions"
+        token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+        account_id: Mapped[int] = mapped_column(ForeignKey("web_accounts.id"), index=True)
+        expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+        created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+    class WebEmailChallenge(Base):
+        __tablename__ = "web_email_challenges"
+        account_id: Mapped[int] = mapped_column(ForeignKey("web_accounts.id"), primary_key=True)
+        code_hash: Mapped[str] = mapped_column(String(64))
+        expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+        sent_at: Mapped[datetime] = mapped_column(UTCDateTime())
+        attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+    class WebLinkCode(Base):
+        __tablename__ = "web_link_codes"
+        code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+        telegram_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+        expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
     class Notice(Base):
         __tablename__ = "notices"
         __table_args__ = (UniqueConstraint("user_id", "kind", "ref"),)
@@ -912,6 +968,9 @@ if MODE == "app":
                 cursor = sub.ends_at
 
     async def queue_notice(s: AsyncSession, uid: int, kind: str, ref: str, text: str):
+        # Browser-only accounts have no Telegram chat. Do not schedule undeliverable bot messages.
+        if uid <= 0:
+            return
         # A unique constraint guarantees idempotent scheduling.
         if DATABASE_IS_SQLITE:
             from sqlalchemy.dialects.sqlite import insert
@@ -1044,6 +1103,10 @@ if MODE == "app":
                         health = NodeHealth(server_id=node.id)
                         s.add(health)
                     health.error = str(exc)[:160]
+            # Clear expired web sessions and one-time web codes.
+            await s.execute(delete(WebSession).where(WebSession.expires_at < now()))
+            await s.execute(delete(WebLinkCode).where(WebLinkCode.expires_at < now()))
+            await s.execute(delete(WebEmailChallenge).where(WebEmailChallenge.expires_at < now()))
             # Expire unpaid invoices and discount slot reservations after one hour.
             cutoff = now() - timedelta(hours=1)
             await s.execute(update(Payment).where(Payment.status == "pending", Payment.created_at < cutoff)
@@ -1258,6 +1321,7 @@ if MODE == "app":
             "/connect — устройства и VPN\n"
             "/support — написать в поддержку\n"
             "/terms — условия использования\n"
+            "/linkweb — привязка к веб-кабинету\n"
             "/paysupport — оплата и возвраты\n\n"
             "<i>Управление подпиской, QR-коды и VPN-конфигурации доступны в Mini App.</i>",
             parse_mode="HTML", reply_markup=user_menu(False))
@@ -2221,6 +2285,16 @@ if MODE == "app":
                 "base-uri 'none'; object-src 'none'; "
                 "frame-ancestors https://web.telegram.org https://*.telegram.org"
             )
+        elif req.url.path.rstrip("/") == "/web":
+            web_js = STILL_WEB_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
+            digest = base64.b64encode(hashlib.sha256(web_js.encode()).digest()).decode()
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; script-src 'sha256-" + digest + "'; "
+                "style-src 'unsafe-inline'; img-src 'self' data:; "
+                "connect-src 'self'; form-action 'self'; base-uri 'none'; "
+                "object-src 'none'; frame-ancestors 'none'"
+            )
+            response.headers["X-Frame-Options"] = "DENY"
         else:
             response.headers["X-Frame-Options"] = "DENY"
         return response
@@ -2780,18 +2854,20 @@ if MODE == "app":
             t=await s.get(Ticket,ticket_id)
             if not t or t.status!="open": bad(404,"Нет открытого обращения")
             target=t.user_id
-        # Send before persisting success, do not falsely mark undelivered replies as sent.
-        try:
-            await bot.send_message(target,"<b>Still VPN · Поддержка #"+str(ticket_id)+"</b>\n\n"+
-                                   html_escape(data.text),parse_mode="HTML")
-        except Exception:
-            LOG.exception("Support message delivery failed ticket=%s",ticket_id)
-            bad(502,"Сообщение Telegram не доставлено")
+        # Browser accounts have no Telegram chat; their replies are available in /web.
+        # Telegram accounts still require a successful Bot API send before recording delivery.
+        if target > 0:
+            try:
+                await bot.send_message(target,"<b>Still VPN · Поддержка #"+str(ticket_id)+"</b>\n\n"+
+                                       html_escape(data.text),parse_mode="HTML")
+            except Exception:
+                LOG.exception("Support message delivery failed ticket=%s",ticket_id)
+                bad(502,"Сообщение Telegram не доставлено")
         async with Session.begin() as s:
             t=await s.get(Ticket,ticket_id,with_for_update=True)
             if t:
                 s.add(TicketMessage(ticket_id=t.id,sender="admin",text=data.text))
-                audit(s,actor[0],"ticket_reply",ticket_id,"Ответ через Telegram")
+                audit(s,actor[0],"ticket_reply",ticket_id,"Ответ через веб-кабинет" if target < 0 else "Ответ через Telegram")
         return {"ok":True}
 
     @app.post("/api/admin/tickets/{ticket_id}/close")
@@ -2856,6 +2932,505 @@ if MODE == "app":
             await s.delete(st)
             audit(s,actor[0],"staff_remove",user_id,data.reason)
         return {"ok":True}
+
+    # ------------------------------------------------------------
+    # Standalone browser access. Telegram Mini App and /api/* remain unchanged.
+    # Separate credentials, same User / Subscription / Trial / Device tables.
+    # ------------------------------------------------------------
+    WEB_REGISTRATION_ENABLED = os.getenv("WEB_REGISTRATION_ENABLED", "1") == "1"
+    WEB_TRIAL_ENABLED = os.getenv("WEB_TRIAL_ENABLED", "0") == "1"
+    BOT_USERNAME = {"value": re.sub(r"[^A-Za-z0-9_]", "", os.getenv("BOT_USERNAME", ""))}
+    WEB_COOKIE = "still_web_session"
+    WEB_SESSION_DAYS = 7
+    LOGIN_RE = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
+    EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    web_rate: dict[str, tuple[float, int]] = {}
+
+    def site_rate(request: Request, action: str, subject: str = "", limit: int = 20, window: int = 60):
+        """Local fail-closed throttle for the single-process BotHost deployment."""
+        key = (action + ":" + (request.client.host if request.client else "unknown")
+               + ":" + subject.lower()[:64])
+        tick = time.monotonic()
+        if len(web_rate) > 20000:
+            for k, (started, _) in list(web_rate.items()):
+                if tick - started > 3600:
+                    web_rate.pop(k, None)
+        started, count = web_rate.get(key, (tick, 0))
+        if tick - started > window:
+            started, count = tick, 0
+        if count >= limit:
+            bad(429, "Слишком много попыток. Повторите позже.")
+        web_rate[key] = (started, count + 1)
+
+    def check_web_origin(req: Request):
+        """Require same-origin writes even without relying on SameSite cookies."""
+        origin = (req.headers.get("origin") or "").rstrip("/")
+        configured = urlparse(WEBAPP_URL)
+        base = f"{configured.scheme}://{configured.netloc}"
+        if origin and origin != base:
+            bad(403, "Неверный источник запроса")
+        if not origin:
+            ref = req.headers.get("referer") or ""
+            fetch_site = req.headers.get("sec-fetch-site") or ""
+            if (ref and not (ref == base or ref.startswith(base + "/"))) or fetch_site not in ("", "same-origin", "none"):
+                bad(403, "Неверный источник запроса")
+        if req.method not in ("GET", "HEAD") and "application/json" not in req.headers.get("content-type", ""):
+            bad(415, "Требуется application/json")
+
+    def web_password_hash(password: str, salt_hex: str) -> str:
+        return hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                              n=16384, r=8, p=1, dklen=32).hex()
+
+    def valid_web_password(password: str):
+        if not (12 <= len(password) <= 128 and re.search(r"[A-Za-zА-Яа-яЁё]", password)
+                and re.search(r"\d", password)):
+            bad(422, "Пароль: 12–128 символов, минимум одна буква и цифра")
+
+    def digest_web(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def web_csrf(raw_token: str) -> str:
+        return hmac.new(CODE_PEPPER.encode(), ("webcsrf:" + raw_token).encode(), hashlib.sha256).hexdigest()
+
+    def web_recovery_hash(code: str) -> str:
+        return hmac.new(CODE_PEPPER.encode(), ("web-recovery:" + code.strip().upper()).encode(), hashlib.sha256).hexdigest()
+
+    def web_email_hash(account_id: int, code: str) -> str:
+        return hmac.new(CODE_PEPPER.encode(), f"web-email:{account_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+    def web_link_hash(code: str) -> str:
+        return hmac.new(CODE_PEPPER.encode(), ("web-link:" + code.strip().upper()).encode(), hashlib.sha256).hexdigest()
+
+    def web_session_response(data: dict, token: str) -> JSONResponse:
+        response = JSONResponse(data)
+        response.set_cookie(WEB_COOKIE, token, max_age=WEB_SESSION_DAYS*86400,
+                            httponly=True, secure=True, samesite="lax", path="/web")
+        return response
+
+    async def make_web_session(s: AsyncSession, account: WebAccount) -> tuple[str, str]:
+        token = secrets.token_urlsafe(40)
+        s.add(WebSession(token_hash=digest_web(token), account_id=account.id,
+                         expires_at=now() + timedelta(days=WEB_SESSION_DAYS)))
+        return token, web_csrf(token)
+
+    async def web_authorized(request: Request, s: AsyncSession = Depends(db_session)):
+        cookie = request.cookies.get(WEB_COOKIE, "")
+        if len(cookie) < 40 or len(cookie) > 128:
+            bad(401, "Войдите в кабинет Still VPN")
+        websession = await s.get(WebSession, digest_web(cookie))
+        if not websession or websession.expires_at <= now():
+            bad(401, "Сессия завершилась. Войдите снова.")
+        account = await s.get(WebAccount, websession.account_id)
+        user = await s.get(User, account.user_id) if account else None
+        if not user or user.blocked:
+            bad(403, "Доступ к аккаунту заблокирован")
+        if request.method not in ("GET", "HEAD"):
+            check_web_origin(request)
+            provided = request.headers.get("x-csrf-token", "")
+            if not hmac.compare_digest(web_csrf(cookie), provided):
+                bad(403, "Неверный CSRF-токен")
+        site_rate(request, "account-api", subject=str(account.id), limit=120, window=60)
+        # Read-only identity was loaded; write endpoints may now begin a transaction.
+        await s.commit()
+        return user, account, web_csrf(cookie)
+
+    class WebCredentials(BaseModel):
+        login: str = Field(min_length=3, max_length=32)
+        password: str = Field(min_length=1, max_length=128)
+
+    class WebRegistration(WebCredentials):
+        email: str | None = Field(default=None, max_length=254)
+        agreed: bool
+
+    @app.get("/web/api/config")
+    async def web_public_config():
+        username = BOT_USERNAME["value"]
+        return {"bot_url": "https://t.me/" + username if username else None,
+                "registration_enabled": WEB_REGISTRATION_ENABLED,
+                "trial_enabled": WEB_TRIAL_ENABLED,
+                "email_enabled": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")),
+                "terms_url": TERMS_URL if TERMS_URL.startswith("https://") else "/web/terms"}
+
+    @app.post("/web/api/register")
+    async def web_register(data: WebRegistration, req: Request):
+        check_web_origin(req)
+        site_rate(req, "registration", limit=8, window=3600)
+        if not WEB_REGISTRATION_ENABLED: bad(503, "Регистрация на сайте временно закрыта")
+        login = data.login.strip().lower()
+        if not LOGIN_RE.fullmatch(login): bad(422, "Логин: латинские буквы, цифры и _, от 3 до 32")
+        valid_web_password(data.password)
+        if not data.agreed: bad(422, "Необходимо принять условия тестирования")
+        email = data.email.strip().lower() if data.email else None
+        if email and (not EMAIL_RE.fullmatch(email) or len(email)>254):
+            bad(422, "Неверный email")
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with Session.begin() as s:
+                if await s.scalar(select(WebAccount.id).where(WebAccount.login == login)):
+                    bad(409, "Логин уже занят")
+                if email and await s.scalar(select(WebAccount.id).where(WebAccount.email == email)):
+                    bad(409, "Этот email уже используется")
+                uid = - (secrets.randbelow(2**60) + 1)
+                while await s.get(User, uid):
+                    uid = - (secrets.randbelow(2**60) + 1)
+                s.add(User(id=uid, username="web:" + login, first_name=login))
+                salt = secrets.token_hex(16)
+                recovery = "STILL-" + secrets.token_urlsafe(24)
+                account = WebAccount(user_id=uid, login=login, password_salt=salt,
+                                     password_hash=web_password_hash(data.password, salt),
+                                     recovery_hash=web_recovery_hash(recovery), email=email)
+                s.add(account)
+                await s.flush()
+                token, csrf = await make_web_session(s, account)
+        except IntegrityError:
+            bad(409, "Имя или email уже заняты")
+        return web_session_response({"ok": True, "csrf": csrf,
+                                     "recovery_code": recovery,
+                                     "message": "Сохраните код восстановления — он показывается только один раз"}, token)
+
+    @app.post("/web/api/login")
+    async def web_login(data: WebCredentials, req: Request):
+        check_web_origin(req)
+        login = data.login.strip().lower()
+        site_rate(req, "login:ip", limit=35, window=600)
+        site_rate(req, "login:user", subject=login, limit=8, window=600)
+        async with Session.begin() as s:
+            account = await s.scalar(select(WebAccount).where(WebAccount.login == login))
+            # Equal-cost check even for an unknown username.
+            salt = account.password_salt if account else "0"*32
+            expected = account.password_hash if account else "0"*64
+            correct = hmac.compare_digest(web_password_hash(data.password, salt), expected)
+            if not account or not correct or (account.locked_until and account.locked_until > now()):
+                if account:
+                    account.failed_logins += 1
+                    if account.failed_logins >= 10:
+                        account.locked_until = now() + timedelta(minutes=15)
+                        account.failed_logins = 0
+                # Avoid raising inside transaction so lockouts commit.
+                denied = True
+            else:
+                denied = False
+                account.failed_logins = 0
+                account.locked_until = None
+                user = await s.get(User, account.user_id)
+                if not user or user.blocked:
+                    denied = True
+                else:
+                    token, csrf = await make_web_session(s, account)
+        if denied: bad(401, "Неверный логин или пароль, либо вход временно ограничен")
+        return web_session_response({"ok": True, "csrf": csrf}, token)
+
+    @app.post("/web/api/logout")
+    async def web_logout(req: Request, identity=Depends(web_authorized)):
+        cookie = req.cookies.get(WEB_COOKIE, "")
+        async with Session.begin() as s:
+            await s.execute(delete(WebSession).where(WebSession.token_hash == digest_web(cookie)))
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(WEB_COOKIE, path="/web", secure=True, httponly=True, samesite="lax")
+        return response
+
+    @app.get("/web/api/me")
+    async def web_me(identity=Depends(web_authorized), s: AsyncSession=Depends(db_session)):
+        user, account, csrf = identity
+        shared = await api_me(user, s)
+        shared["admin_role"] = None  # Telegram-based admin privileges are never inherited by browser sessions.
+        shared["username"] = account.login
+        shared["auth_type"] = "web"
+        shared["email"] = account.email
+        shared["email_verified"] = account.email_verified
+        shared["can_trial"] = WEB_TRIAL_ENABLED and account.email_verified and bool(os.getenv("SMTP_HOST"))
+        shared["csrf"] = csrf
+        return shared
+
+    @app.get("/web/api/plans")
+    async def web_plans(identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        return await api_plans(identity[0], s)
+
+    @app.get("/web/api/devices")
+    async def web_devices(identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        return await api_devices(identity[0], s)
+
+    @app.post("/web/api/devices")
+    async def web_create_device(data:DeviceIn, req:Request, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        site_rate(req,"device-create",subject=str(identity[1].id),limit=12,window=3600)
+        return await api_add_device(data, identity[0], s)
+
+    @app.patch("/web/api/devices/{device_id}")
+    async def web_rename_device(device_id:str, data:RenameIn, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        return await api_rename(device_id, data, identity[0], s)
+
+    @app.delete("/web/api/devices/{device_id}")
+    async def web_revoke_device(device_id:str, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        return await api_delete_device(device_id, identity[0], s)
+
+    @app.post("/web/api/redeem")
+    async def web_redeem(data:RedeemIn, req:Request, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        site_rate(req,"redeem",subject=str(identity[1].id),limit=12,window=3600)
+        return await api_redeem(data, identity[0], s)
+
+    @app.post("/web/api/trial")
+    async def web_trial(identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        user, account, _ = identity
+        if not WEB_TRIAL_ENABLED or not account.email_verified or not os.getenv("SMTP_HOST"):
+            bad(403, "На сайте пробный доступ доступен только с подтверждённым email при включении администратором")
+        return await api_trial(user, s)
+
+    class WebEmailUpdate(BaseModel):
+        email: str = Field(min_length=5,max_length=254)
+        password: str = Field(min_length=1,max_length=128)
+
+    @app.post("/web/api/email/update")
+    async def web_email_update(data:WebEmailUpdate,req:Request,identity=Depends(web_authorized)):
+        _, account, _ = identity
+        site_rate(req,"email-update",subject=str(account.id),limit=4,window=3600)
+        email=data.email.strip().lower()
+        if not EMAIL_RE.fullmatch(email): bad(422,"Неверный email")
+        if not hmac.compare_digest(web_password_hash(data.password,account.password_salt),account.password_hash):
+            bad(403,"Неверный пароль")
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with Session.begin() as s:
+                stored=await s.get(WebAccount,account.id)
+                stored.email=email
+                stored.email_verified=False
+                challenge=await s.get(WebEmailChallenge,account.id)
+                if challenge: await s.delete(challenge)
+        except IntegrityError:
+            bad(409,"Этот email уже используется")
+        return {"ok":True}
+
+    class WebEmailCode(BaseModel):
+        code: str = Field(min_length=6, max_length=6)
+
+    def send_web_mail(recipient: str, code: str):
+        import smtplib, ssl
+        from email.message import EmailMessage
+        host = os.getenv("SMTP_HOST", "").strip()
+        sender = os.getenv("SMTP_FROM", "").strip()
+        port = int(os.getenv("SMTP_PORT", "587"))
+        if not host or not sender or port not in (465, 587):
+            raise RuntimeError("SMTP не настроен")
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["To"] = recipient
+        msg["Subject"] = "Still VPN — подтверждение email"
+        msg.set_content(f"Код подтверждения Still VPN: {code}\nКод действует 10 минут. Если вы не запрашивали его, игнорируйте письмо.")
+        context = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=12, context=context) as smtp:
+                if os.getenv("SMTP_USER"): smtp.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD", ""))
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=12) as smtp:
+                smtp.starttls(context=context)
+                if os.getenv("SMTP_USER"): smtp.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD", ""))
+                smtp.send_message(msg)
+
+    @app.post("/web/api/email/send")
+    async def web_email_send(req:Request, identity=Depends(web_authorized)):
+        _, account, _ = identity
+        site_rate(req,"email-send",subject=str(account.id),limit=5,window=3600)
+        if account.email_verified: bad(409,"Email уже подтверждён")
+        if not account.email: bad(409,"Email не указан при регистрации")
+        if not (os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")):
+            bad(503,"Почта не настроена администратором")
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        async with Session.begin() as s:
+            challenge = await s.get(WebEmailChallenge, account.id)
+            if challenge and (now()-challenge.sent_at).total_seconds() < 120:
+                bad(429,"Новое письмо можно запросить через 2 минуты")
+            if challenge:
+                challenge.code_hash=web_email_hash(account.id,code)
+                challenge.expires_at=now()+timedelta(minutes=10)
+                challenge.sent_at=now()
+                challenge.attempts=0
+            else:
+                s.add(WebEmailChallenge(account_id=account.id,code_hash=web_email_hash(account.id,code),
+                                        expires_at=now()+timedelta(minutes=10), sent_at=now()))
+        try:
+            await asyncio.to_thread(send_web_mail,account.email,code)
+        except Exception:
+            LOG.exception("Email verification delivery failed")
+            bad(502,"Письмо не отправлено. Проверьте SMTP")
+        return {"ok":True,"message":"Код отправлен на указанный email"}
+
+    @app.post("/web/api/email/verify")
+    async def web_email_verify(data:WebEmailCode, req:Request, identity=Depends(web_authorized)):
+        _, account, _ = identity
+        site_rate(req,"email-verify",subject=str(account.id),limit=10,window=600)
+        denied = False
+        async with Session.begin() as s:
+            c = await s.get(WebEmailChallenge, account.id)
+            if not c or c.expires_at <= now() or c.attempts >= 5:
+                denied = True
+            else:
+                c.attempts += 1
+                if not hmac.compare_digest(c.code_hash, web_email_hash(account.id, data.code)):
+                    denied = True
+                else:
+                    a=await s.get(WebAccount,account.id)
+                    a.email_verified=True
+                    await s.delete(c)
+        if denied: bad(422,"Код неверен или устарел")
+        return {"ok":True}
+
+    class WebPasswordChange(BaseModel):
+        old_password: str = Field(min_length=1, max_length=128)
+        new_password: str = Field(min_length=1, max_length=128)
+
+    @app.post("/web/api/password/change")
+    async def web_password_change(data:WebPasswordChange, req:Request, identity=Depends(web_authorized)):
+        _,account,_=identity
+        site_rate(req,"change-password",subject=str(account.id),limit=5,window=600)
+        valid_web_password(data.new_password)
+        if not hmac.compare_digest(web_password_hash(data.old_password,account.password_salt),account.password_hash):
+            bad(403,"Старый пароль неверен")
+        salt=secrets.token_hex(16)
+        recovery="STILL-"+secrets.token_urlsafe(24)
+        async with Session.begin() as s:
+            stored=await s.get(WebAccount,account.id)
+            stored.password_salt=salt
+            stored.password_hash=web_password_hash(data.new_password,salt)
+            stored.recovery_hash=web_recovery_hash(recovery)
+            # Revoke ALL sessions on password change.
+            await s.execute(delete(WebSession).where(WebSession.account_id==account.id))
+        response=JSONResponse({"ok":True,"recovery_code":recovery})
+        response.delete_cookie(WEB_COOKIE,path="/web",secure=True,httponly=True,samesite="lax")
+        return response
+
+    class WebRecoverIn(BaseModel):
+        login: str = Field(min_length=3, max_length=32)
+        recovery_code: str = Field(min_length=20,max_length=120)
+        new_password: str = Field(min_length=1,max_length=128)
+
+    @app.post("/web/api/password/recover")
+    async def web_password_recover(data:WebRecoverIn,req:Request):
+        check_web_origin(req)
+        site_rate(req,"recovery",subject=data.login,limit=6,window=3600)
+        valid_web_password(data.new_password)
+        denied=False
+        async with Session.begin() as s:
+            account=await s.scalar(select(WebAccount).where(WebAccount.login==data.login.strip().lower()))
+            if not account or not hmac.compare_digest(account.recovery_hash,web_recovery_hash(data.recovery_code)):
+                denied=True
+            else:
+                new_salt=secrets.token_hex(16)
+                next_code="STILL-"+secrets.token_urlsafe(24)
+                account.password_salt=new_salt
+                account.password_hash=web_password_hash(data.new_password,new_salt)
+                account.recovery_hash=web_recovery_hash(next_code)
+                account.failed_logins=0
+                account.locked_until=None
+                await s.execute(delete(WebSession).where(WebSession.account_id==account.id))
+        if denied: bad(403,"Неверный логин или код восстановления")
+        return {"ok":True,"recovery_code":next_code}
+
+    class WebLinkIn(BaseModel):
+        code: str = Field(min_length=12,max_length=80)
+
+    @app.post("/web/api/link-telegram")
+    async def web_link_telegram(data:WebLinkIn,req:Request,identity=Depends(web_authorized)):
+        user,account,_=identity
+        site_rate(req,"link",subject=str(account.id),limit=8,window=600)
+        if user.id>0: bad(409,"Telegram уже привязан к этому аккаунту")
+        h=web_link_hash(data.code)
+        async with Session.begin() as s:
+            link=await s.get(WebLinkCode,h)
+            if not link or link.expires_at <= now():
+                bad(403,"Код привязки недействителен или истёк")
+            other=await s.scalar(select(WebAccount.id).where(WebAccount.user_id==link.telegram_id))
+            if other: bad(409,"Этот Telegram-аккаунт уже связан с другим веб-кабинетом")
+            # No automatic merging of existing entitlements / devices: that could lose access.
+            existing=await s.scalar(select(Subscription.id).where(Subscription.user_id==user.id).limit(1))
+            dev=await s.scalar(select(Device.id).where(Device.user_id==user.id).limit(1))
+            tr=await s.get(Trial,user.id)
+            gift=await s.scalar(select(Payment.id).where(Payment.user_id==user.id).limit(1))
+            if existing or dev or tr or gift:
+                bad(409,"Аккаунт уже использовал VPN. Для безопасной привязки обратитесь в поддержку")
+            stored=await s.get(WebAccount,account.id)
+            stored.user_id=link.telegram_id
+            await s.flush()
+            old=await s.get(User,user.id)
+            await s.delete(old)
+            await s.delete(link)
+        return {"ok":True,"message":"Telegram привязан. Подписки и устройства теперь общие."}
+
+    @router.message(Command("linkweb"))
+    async def linkweb_command(message: Message):
+        if message.chat.type != "private" or not message.from_user: return
+        site_rate_key = "link-bot:"+str(message.from_user.id)
+        tick=time.monotonic()
+        stamp,count=web_rate.get(site_rate_key,(tick,0))
+        if tick-stamp>600: stamp,count=tick,0
+        if count>=4:
+            await message.answer("Слишком много кодов. Повторите через 10 минут.")
+            return
+        web_rate[site_rate_key]=(stamp,count+1)
+        code="STILL-"+secrets.token_urlsafe(20)
+        async with Session.begin() as s:
+            await upsert_user(s,message.from_user)
+            s.add(WebLinkCode(code_hash=web_link_hash(code), telegram_id=message.from_user.id,
+                              expires_at=now()+timedelta(minutes=10)))
+        await message.answer("<b>Привязка Still VPN Web</b>\n\nОткройте сайт и в профиле введите код:\n"
+                             f"<code>{html_escape(code)}</code>\n\nКод действует 10 минут и одноразовый. "
+                             "Никому не передавайте код.",parse_mode="HTML")
+
+    class WebTicketText(BaseModel):
+        text: str = Field(min_length=5,max_length=3500)
+
+    @app.get("/web/api/tickets")
+    async def web_tickets(identity=Depends(web_authorized),s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Ticket).where(Ticket.user_id==identity[0].id)
+                              .order_by(Ticket.id.desc()).limit(30))).all()
+        return [{"id":t.id,"status":t.status,"date":t.created_at} for t in rows]
+
+    @app.post("/web/api/tickets")
+    async def web_ticket_create(data:WebTicketText,req:Request,identity=Depends(web_authorized)):
+        site_rate(req,"web-support",subject=str(identity[1].id),limit=8,window=3600)
+        async with Session.begin() as s:
+            open_count=await s.scalar(select(func.count()).select_from(Ticket).where(
+                Ticket.user_id==identity[0].id,Ticket.status=="open"))
+            if open_count >= 3: bad(429,"У вас уже три открытых обращения")
+            t=Ticket(user_id=identity[0].id)
+            s.add(t);await s.flush()
+            s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
+            ticket_id=t.id
+        return {"ok":True,"id":ticket_id}
+
+    @app.get("/web/api/tickets/{ticket_id}")
+    async def web_ticket_detail(ticket_id:int,identity=Depends(web_authorized),s:AsyncSession=Depends(db_session)):
+        t=await s.get(Ticket,ticket_id)
+        if not t or t.user_id!=identity[0].id: bad(404,"Обращение не найдено")
+        messages=(await s.scalars(select(TicketMessage).where(TicketMessage.ticket_id==ticket_id)
+                                  .order_by(TicketMessage.id).limit(150))).all()
+        return {"id":t.id,"status":t.status,"messages":[{"sender":x.sender,"text":x.text,"date":x.created_at} for x in messages]}
+
+    @app.post("/web/api/tickets/{ticket_id}/reply")
+    async def web_ticket_reply(ticket_id:int,data:WebTicketText,req:Request,identity=Depends(web_authorized)):
+        site_rate(req,"web-support-reply",subject=str(identity[1].id),limit=25,window=3600)
+        async with Session.begin() as s:
+            t=await s.get(Ticket,ticket_id)
+            if not t or t.user_id!=identity[0].id or t.status!="open":
+                bad(404,"Нет открытого обращения")
+            s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
+        return {"ok":True}
+
+    @app.get("/web",response_class=HTMLResponse)
+    @app.get("/web/",response_class=HTMLResponse)
+    async def standalone_site():
+        return HTMLResponse(STILL_WEB_HTML)
+
+    @app.get("/web/terms",response_class=HTMLResponse)
+    async def standalone_terms():
+        return HTMLResponse("""<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<body style='font:16px/1.7 system-ui;background:#100D11;color:#F3EEF0;max-width:680px;margin:32px auto;padding:0 20px'>
+<h1>Still VPN — условия тестирования</h1>
+<p>Сервис находится на этапе тестирования. VPN не гарантирует абсолютную анонимность, доступность всех сайтов или непрерывность соединения.</p>
+<p>Для работы сайта хранятся логин, хеш пароля, случайный идентификатор сессии, параметры подписки, устройства и счётчики трафика WireGuard. Содержание пользовательского трафика этим приложением не сохраняется.</p>
+<p>Пользователь обязан соблюдать применимое законодательство. Пробный доступ может быть ограничен и отозван при злоупотреблении.</p>
+<p>Покупка подписок на этом веб-сайте не реализована. Для платного коммерческого запуска требуются отдельные юридические документы с данными владельца сервиса, условиями возврата и контактами.</p>
+<a style='color:#c3a1d5' href='/web'>Вернуться в Still VPN</a></body></html>""")
+
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -2954,6 +3529,13 @@ if MODE == "app":
             LOG.error("Telegram Stars выключены: проверьте TERMS_URL (HTTPS), GIFT_FERNET_KEY и WG_AGENT_SECRET >=32; "
                       "бот и VPN продолжат работать, новые счета запрещены")
         await initialize_db()
+        # The website's Telegram button is resolved from Bot API or BOT_USERNAME.
+        if not BOT_USERNAME["value"]:
+            try:
+                bot_profile = await bot.get_me()
+                BOT_USERNAME["value"] = bot_profile.username or ""
+            except Exception as exc:
+                LOG.warning("Cannot resolve bot username for site: %s", exc)
         # Update the Telegram display name as well as the messages and Mini App.
         # Bot API cannot change @username; that is managed separately in BotFather.
         try:
@@ -2974,6 +3556,7 @@ if MODE == "app":
             BotCommand(command="support", description="Поддержка"),
             BotCommand(command="help", description="Помощь"),
             BotCommand(command="terms", description="Условия"),
+            BotCommand(command="linkweb", description="Связать аккаунт с сайтом"),
         ])
         tasks = [asyncio.create_task(dp.start_polling(bot)), asyncio.create_task(periodic_worker())]
         try:
@@ -3180,6 +3763,108 @@ else:
 
 # Telegram Web App UI is intentionally embedded here to honor the one-file request.
 # All data comes from the authenticated API; no fake subscriptions or statistics.
+STILL_WEB_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#100D11">
+<title>Still VPN — личный кабинет</title>
+<style>
+:root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
+*{box-sizing:border-box}html{scroll-behavior:smooth}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink)}
+body{font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;letter-spacing:-.012em}button,input,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}a{color:inherit;text-decoration:none}a:hover{color:#ded0e6}
+::selection{background:#76558D;color:#fff}:focus-visible{outline:2px solid #a77cbf;outline-offset:3px}
+header{height:81px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;max-width:1160px;margin:auto;padding:0 32px;gap:20px}
+.logotype{display:flex;align-items:center;gap:13px;font-weight:750;font-size:19px;letter-spacing:.19em;white-space:nowrap}.iconmark{height:28px;width:28px;display:inline-block;border-radius:8px 8px 3px 8px;background:#681A29;transform:rotate(-28deg);position:relative;overflow:hidden}.iconmark:after{content:"";position:absolute;background:#100D11;width:19px;height:23px;top:-7px;left:14px;border-radius:50%}
+.micro{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.17em;font-weight:650}
+.topnav{display:flex;align-items:center;gap:30px;font-size:13px;color:var(--muted)}.topnav a:hover{color:white}.pill-link{border:1px solid var(--line);padding:10px 15px;border-radius:9px;color:var(--ink);font-size:12px;white-space:nowrap}
+.shell{max-width:1150px;margin:0 auto;padding:62px 32px 120px}.kicker{font-size:11px;letter-spacing:.19em;text-transform:uppercase;color:#ae90bd;font-weight:720;margin:0 0 15px}
+h1{font-size:clamp(36px,5.7vw,70px);line-height:1.04;letter-spacing:-.059em;font-weight:640;margin:0 0 20px;max-width:860px}h2{font-size:clamp(26px,3.2vw,38px);line-height:1.15;letter-spacing:-.045em;margin:0 0 12px;font-weight:630}h3{font-size:17px;letter-spacing:-.02em;margin:0 0 8px;font-weight:660}p{margin:0 0 14px}.muted{color:var(--muted)}.lead{font-size:clamp(15px,1.65vw,19px);line-height:1.6;color:#c2b6bd;max-width:580px}
+.status-dot{width:7px;height:7px;display:inline-block;border-radius:50%;background:#a9cab5;margin-right:9px;box-shadow:0 0 0 3px #a9cab522}.eyebrow{display:inline-flex;align-items:center;padding:7px 12px;border:1px solid var(--line);color:#c2b6bd;border-radius:100px;font-size:12px;gap:7px}
+.cta{border:1px solid #873449;background:#681A29;border-radius:10px;padding:12px 19px;color:#fff;font-weight:660;font-size:14px;display:inline-flex;justify-content:center;align-items:center;gap:8px;min-height:46px}.cta:hover{background:#7b2536;color:white}.cta.outline{background:transparent;border:1px solid #56404a;color:var(--ink)}.cta.outline:hover{background:#251b23}.cta.tiny{font-size:12px;padding:9px 13px;min-height:36px}.cta.danger{background:transparent;border-color:#8a3a4d;color:#f2afb8}.cta.plain{background:transparent;border-color:transparent;color:#baa0ca;padding-left:0}.buttons{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}
+.intro{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:50px;align-items:center;min-height:440px;border-bottom:1px solid var(--line);padding-bottom:60px}.intro-art{height:295px;border-radius:18px;background:#171116;display:grid;place-items:center;position:relative;overflow:hidden;border:1px solid var(--line)}.intro-art:before{content:"";position:absolute;width:230px;height:230px;border:1px solid #5d3040;border-radius:50%;transform:translate(12px,8px)}.intro-art:after{content:"";position:absolute;width:150px;height:150px;border:1px solid #533044;border-radius:50%;transform:translate(12px,8px)}.intro-art .symbol{width:88px;height:88px;background:#681A29;border-radius:25px 25px 7px 25px;transform:rotate(-30deg);position:relative;overflow:hidden;z-index:1}.intro-art .symbol:after{content:"";position:absolute;background:#171116;width:65px;height:72px;top:-22px;left:48px;border-radius:50%}.intro-art .sidenote{position:absolute;left:22px;bottom:20px;letter-spacing:.13em;font-size:10px;color:#a99da4}
+.intro-list{display:grid;grid-template-columns:repeat(3,1fr);gap:27px;padding:26px 0 0}.intro-list div{padding-right:15px}.intro-list strong{font-size:13px;display:block;margin-bottom:5px;font-weight:660}.intro-list p{font-size:12px;color:var(--muted)}
+.auth-shell{max-width:510px;margin:auto;border-top:1px solid #694052;padding:32px 0 0}.auth-head{margin-bottom:25px}.auth-tabs{display:flex;gap:24px;border-bottom:1px solid var(--line);margin:0 0 25px}.auth-tabs button{background:none;border:0;color:var(--muted);padding:0 0 13px;border-bottom:2px solid transparent;font-weight:590;font-size:14px}.auth-tabs button.active{border-bottom-color:#a15d74;color:#fff}
+.field{display:block;margin:15px 0}.field span{display:block;color:#c8bbc4;font-size:12px;margin-bottom:6px}.field input,.field select{width:100%;background:#1b151a;border:1px solid #43343e;color:var(--ink);padding:12px 13px;min-height:47px;border-radius:9px;outline:none}.field input:focus,.field select:focus{border-color:#916d9b}.field input::placeholder{color:#7c717b}input[type=checkbox]{accent-color:#86536d}.small{font-size:12px;line-height:1.55}.hint{color:var(--muted);font-size:12px}.notice{background:#241921;border:1px solid #503348;color:#dbbccc;border-radius:11px;padding:13px 15px;margin:16px 0;font-size:13px;line-height:1.5}.notice.bad{border-color:#86324a;background:#2d1720;color:#f6bccb}.notice.good{border-color:#426453;background:#17241d;color:#b8e1c7}
+.hidden{display:none!important}.subnav{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:42px;padding-bottom:20px;border-bottom:1px solid var(--line)}.subnav button{font-size:13px;color:var(--muted);background:transparent;border:1px solid transparent;border-radius:9px;padding:10px 16px}.subnav button.active{background:#21181f;border-color:#44303b;color:#fff}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:48px}.side{border-top:1px solid var(--line);padding-top:21px}.side .note{padding:0 0 20px;margin:0 0 21px;border-bottom:1px solid var(--line)}.side b{font-size:13px;display:block;margin-bottom:7px}.side p{font-size:12px;color:var(--muted)}
+.overview{background:#1a1318;border:1px solid #442733;border-radius:16px;padding:27px 28px;margin:28px 0 22px;position:relative;overflow:hidden}.overview::after{content:"";position:absolute;right:-80px;top:-110px;width:290px;height:260px;border:1px solid #663142;border-radius:50%;opacity:.5;pointer-events:none}.overview .eyebrow{border-color:#4d3040}.big-info{font-size:clamp(24px,3.7vw,43px);letter-spacing:-.05em;font-weight:690;margin:10px 0 2px}.listrow{border-bottom:1px solid var(--line);padding:18px 0;display:flex;justify-content:space-between;align-items:center;gap:15px;font-size:14px}.listrow:last-child{border-bottom:0}.listrow strong{text-align:right;max-width:66%;overflow-wrap:anywhere;font-weight:600}.section{margin:34px 0}.splithead{display:flex;gap:12px;align-items:center;justify-content:space-between}.planline{padding:25px 0;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px;justify-content:space-between}.planline strong{font-size:18px;letter-spacing:-.035em}.planline .price{font-size:24px;letter-spacing:-.03em;font-weight:670;white-space:nowrap}.planline .price small{font-size:12px;font-weight:400;color:var(--muted)}.line{height:1px;background:var(--line);margin:20px 0}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.center{display:flex;align-items:center;gap:9px}.indicator{font-size:12px;color:#c9a7c2;border:1px solid #4d334a;border-radius:100px;padding:5px 9px}.codebox{border:1px solid #41313b;background:#0c090c;border-radius:11px;padding:16px;white-space:pre-wrap;word-break:break-all;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;max-height:330px;overflow:auto;color:#e1dce0}.progress{height:4px;border-radius:20px;background:#3f2c37;overflow:hidden;margin:13px 0 0}.progress i{height:100%;background:#9a6075;display:block;border-radius:20px}
+.device{padding:22px 0;border-bottom:1px solid var(--line)}.device:first-child{border-top:1px solid var(--line)}.devicehead{display:flex;justify-content:space-between;gap:12px}.device .buttons{margin-top:12px}.chip{color:#c3b6bd;font-size:11px;border:1px solid var(--line);border-radius:18px;padding:4px 9px;height:fit-content;white-space:nowrap}.config-output{margin:20px 0;padding:24px;border:1px solid #614050;background:#1a131a;border-radius:12px}.panel{border:1px solid var(--line);background:#191217;padding:23px;border-radius:13px;margin:20px 0}.empty{font-size:13px;color:var(--muted);padding:26px 0;border-bottom:1px solid var(--line)}
+#toast{position:fixed;top:24px;right:24px;background:#321e2b;border:1px solid #624055;color:white;padding:13px 17px;border-radius:10px;font-size:13px;z-index:999;display:none;max-width:calc(100% - 40px)}
+footer{border-top:1px solid var(--line);margin-top:80px;padding:29px 0;display:flex;justify-content:space-between;gap:20px;color:var(--muted);font-size:12px;flex-wrap:wrap}
+@media(max-width:820px){.intro{grid-template-columns:1fr;gap:24px;min-height:0}.intro-art{height:180px;max-width:100%}.intro-art:before{width:170px;height:170px}.intro-art:after{width:100px;height:100px}.intro-art .symbol{width:65px;height:65px}.layout{grid-template-columns:1fr}.side{display:none}.intro-list{gap:16px}.shell{padding:39px 22px 110px}header{height:72px;padding:0 22px}.topnav{gap:13px}.topnav .hide-mobile{display:none}}
+@media(max-width:520px){.micro.desktop{display:none}.logotype{font-size:17px}.pill-link{padding:8px 10px;font-size:11px}.intro-list{grid-template-columns:1fr;gap:3px}.intro-list div{padding:9px 0;border-bottom:1px solid var(--line)}.intro-art{height:145px}.intro{padding-bottom:35px}.shell{padding-top:30px}.subnav{display:grid;grid-template-columns:repeat(4,1fr);gap:0}.subnav button{font-size:11px;padding:10px 3px}.overview{padding:22px 18px}.grid2{grid-template-columns:1fr}.planline{align-items:flex-start}.listrow strong{font-size:13px}.buttons .cta{width:100%}h1{font-size:36px}}
+@media(prefers-reduced-motion:no-preference){.cta,.subnav button{transition:background .14s,border-color .14s}}
+</style></head>
+<body>
+<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#ab9ba7">VPN</span></a><span class="micro desktop">Quietly connected.</span><nav class="topnav"><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram-бот ↗</a></nav></header>
+<div id="toast" role="status" aria-live="polite"></div>
+<main class="shell"><div id="guest">
+<section class="intro"><div><p class="kicker">STILL VPN / WEB ACCESS</p><h1>Свобода подключения.<br>Без лишнего шума.</h1><p class="lead">Личный VPN-кабинет в браузере. Управляйте подключениями и подпиской, даже когда Telegram недоступен.</p><div class="buttons"><button class="cta" id="intro-create">Создать аккаунт <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти</button></div></div><div class="intro-art" aria-hidden="true"><i class="symbol"></i><span class="sidenote">PRIVATE BY DESIGN / WIREGUARD</span></div></section>
+<div class="intro-list"><div><strong>Отдельные ключи</strong><p>Уникальная конфигурация для каждого устройства.</p></div><div><strong>Точный контроль</strong><p>Управляйте доступом и наблюдайте расход трафика.</p></div><div><strong>Без Telegram</strong><p>Независимый вход в веб-кабинет по логину и паролю.</p></div></div>
+<section class="auth-shell" id="authorization" style="margin-top:80px"><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
+</div>
+<div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
+<footer><span>© Still VPN · Ваше подключение, ваши правила.</span><span><a href="/web/terms">Условия тестирования и данные</a> · <span id="footer-bot"></span></span></footer>
+</main>
+<script>
+(()=>{'use strict';
+const $=q=>document.querySelector(q), $$=q=>Array.from(document.querySelectorAll(q));
+let me=null,config=null,page='home',authMode='login',csrf='',devices=[],plans=[],lastConfig=null;
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const date=v=>v?new Date(v).toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'}):'—';
+const bytes=v=>v===null||v===undefined?'Без лимита':(v/1073741824).toFixed(2)+' ГБ';
+function toast(t,bad=false){const el=$('#toast');el.textContent=t;el.style.background=bad?'#681A29':'#321e2b';el.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.style.display='none',4600)}
+async function api(path,options={}){const method=options.method||'GET';const r=await fetch('/web/api/'+path,{credentials:'same-origin',...options,headers:{'Content-Type':'application/json',...(method==='GET'?{}:{'X-CSRF-Token':csrf}),...(options.headers||{})}});let data;try{data=await r.json()}catch{throw Error('Сервер вернул непонятный ответ')};if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Ошибка '+r.status);return data}
+async function guestApi(path,body){const r=await fetch('/web/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let d;try{d=await r.json()}catch{throw Error('Не удалось прочитать ответ сервера')};if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Ошибка '+r.status);return d}
+function showAuth(mode='login'){authMode=mode;$('#authorization').scrollIntoView({behavior:'smooth'});$$('[data-auth]').forEach(b=>b.classList.toggle('active',b.dataset.auth===mode));$('#auth-title').textContent=({login:'Вход в Still VPN',register:'Создать аккаунт',recover:'Восстановление доступа'})[mode];$('#email-field').classList.toggle('hidden',mode!=='register');$('#recovery-field').classList.toggle('hidden',mode!=='recover');$('#agree-field').classList.toggle('hidden',mode!=='register');$('#password-label').textContent=mode==='login'?'Пароль':mode==='recover'?'Новый пароль':'Придумайте пароль';$('#password').minLength=mode==='login'?1:12;$('#password').autocomplete=mode==='login'?'current-password':'new-password';$('#auth-submit').textContent=({login:'Войти в аккаунт',register:'Зарегистрироваться',recover:'Восстановить пароль'})[mode];$('#auth-error').innerHTML='';$('#auth-hint').textContent=mode==='register'?'Используйте уникальный пароль от 12 символов. Email нужен для подтверждения пробного доступа.':'Никаких обязательных входов через Telegram.'}
+$$('[data-auth]').forEach(b=>b.onclick=()=>showAuth(b.dataset.auth));$('#intro-create').onclick=()=>showAuth('register');$('#intro-login').onclick=()=>showAuth('login');
+function showMemberRecovery(code){
+const modal=document.createElement('div');modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);display:grid;place-items:center;z-index:1000;padding:22px';
+modal.innerHTML='<div style="width:min(100%,510px);padding:28px;background:#191217;border:1px solid #694052;border-radius:16px"><p class="kicker">БЕЗОПАСНОСТЬ</p><h2>Сохраните код восстановления</h2><p class="small muted">Код показывается только сейчас. Без него восстановить доступ при потере пароля невозможно.</p><div class="codebox" id="new-recovery-code"></div><div class="buttons"><button class="cta outline" id="recovery-copy">Скопировать</button><button class="cta" id="recovery-close">Я сохранил код</button></div></div>';
+document.body.appendChild(modal);modal.querySelector('#new-recovery-code').textContent=code;modal.querySelector('#recovery-copy').onclick=()=>navigator.clipboard.writeText(code).then(()=>toast('Скопировано'),()=>toast('Ошибка буфера обмена',true));modal.querySelector('#recovery-close').onclick=()=>modal.remove();
+}
+function showRecovery(code){$('#auth-error').innerHTML=`<div class="notice good"><strong>Сохраните код восстановления.</strong><br>Он показывается один раз и нужен, если вы забудете пароль. Храните его вне сайта и не отправляйте никому.</div><div id="recovery-secret" class="codebox"></div><button type="button" id="recover-copy" class="cta outline tiny">Скопировать код</button>`;$('#recovery-secret').textContent=code;$('#recover-copy').onclick=()=>navigator.clipboard.writeText(code).then(()=>toast('Код скопирован'),()=>toast('Не удалось скопировать',true))}
+$('#auth-form').onsubmit=async e=>{e.preventDefault();const btn=$('#auth-submit');btn.disabled=true;$('#auth-error').innerHTML='';try{const login=$('#login').value.trim().toLowerCase(),password=$('#password').value;let d;
+if(authMode==='register'){d=await guestApi('register',{login,password,email:$('#email').value.trim()||null,agreed:$('#agree').checked});csrf=d.csrf;await loadMe(true);showMemberRecovery(d.recovery_code);return}
+if(authMode==='login'){d=await guestApi('login',{login,password});csrf=d.csrf;await loadMe(true);return}
+d=await guestApi('password/recover',{login,recovery_code:$('#recovery').value.trim(),new_password:password});showRecovery(d.recovery_code);toast('Пароль заменён. Войдите с новым паролем.');return;
+}catch(err){$('#auth-error').innerHTML=`<div class="notice bad">${esc(err.message)}</div>`}finally{btn.disabled=false}};
+async function loadMe(activate=false){try{me=await api('me');csrf=me.csrf;$('#guest').classList.add('hidden');$('#member').classList.remove('hidden');if(activate)page='home';render();}catch(e){if(e.message.includes('Войдите')||e.message.includes('Сессия')){me=null;$('#member').classList.add('hidden');$('#guest').classList.remove('hidden')}else toast(e.message,true)}}
+$$('[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));function nav(p){page=p;$$('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===p));render();window.scrollTo({top:0,behavior:'smooth'})}
+function subhead(k,title,desc=''){return `<p class="kicker">${esc(k)}</p><h1 style="font-size:clamp(30px,4.5vw,53px)">${esc(title)}</h1><p class="lead">${esc(desc)}</p>`}
+function render(){if(!me)return;const c=$('#content');if(page==='home')home(c);else if(page==='plans')plansPage(c);else if(page==='devices')devicesPage(c);else profilePage(c)}
+function home(c){const s=me.subscription;c.innerHTML=subhead('ЛИЧНЫЙ КАБИНЕТ',`Привет, ${me.username}.`,'Управляйте VPN без лишних действий и зависимостей.')+`<div class="overview"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><div class="big-info">${s?esc(s.name):'Оставайтесь на связи'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Активируйте доступ, чтобы создать VPN-подключение.'}</p>${s&&s.limit!==null?`<div class="progress"><i style="width:${Math.min(100,Math.max(0,s.used/s.limit*100))}%"></i></div>`:''}</div>
+<div class="listrow"><span class="muted">Трафик за период</span><strong>${s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?s.devices:'—'}</strong></div><div class="listrow"><span class="muted">VPN-серверы</span><strong>${me.service.responsive_nodes} из ${me.service.enabled_nodes} доступны</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Управлять устройствами':'Посмотреть подписки'}</button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Включить пробный доступ</button>':''}</div>`;$('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}}
+async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
+try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} устройств · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
+async function devicesPage(c){c.innerHTML=subhead('WIREGUARD','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
+$('#device-create').onsubmit=createDevice;$('#reload-devices').onclick=loadDevices;loadDevices()}
+async function loadDevices(){try{devices=await api('devices');if(page!=='devices')return;const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="devicehead"><div><h3>${esc(d.name)}</h3><p class="muted small">${esc(d.platform)} · добавлено ${date(d.created_at)}<br>${d.last_handshake?'Последний handshake: '+date(d.last_handshake):'Нет данных о подключении'}</p></div><span class="chip">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div>${d.enabled?`<div class="buttons"><button class="cta outline tiny" data-rename="${esc(d.id)}">Переименовать</button><button class="cta danger tiny" data-revoke="${esc(d.id)}">Отозвать</button></div>`:''}</div>`).join(''):'<div class="empty">Подключений пока нет.</div>';
+$$('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id===b.dataset.rename),name=prompt('Новое имя',d.name);if(!name)return;try{await api('devices/'+d.id,{method:'PATCH',body:JSON.stringify({name:name.trim()})});toast('Переименовано');await loadDevices()}catch(e){toast(e.message,true)}});
+$$('[data-revoke]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать доступ устройства? Старая конфигурация перестанет работать.'))return;try{await api('devices/'+b.dataset.revoke,{method:'DELETE',body:'{}'});toast('Отзыв доступа запрошен');await loadDevices();await loadMe()}catch(e){toast(e.message,true)}})}catch(e){toast(e.message,true)}}
+function b64(a){return btoa(String.fromCharCode(...new Uint8Array(a)))}
+async function keypair(){if(!isSecureContext||!crypto.subtle)throw Error('Для создания ключей требуется HTTPS и современный браузер');try{const kp=await crypto.subtle.generateKey({name:'X25519'},true,['deriveBits']);const pub=b64(await crypto.subtle.exportKey('raw',kp.publicKey)),der=new Uint8Array(await crypto.subtle.exportKey('pkcs8',kp.privateKey));if(der.length<32)throw Error('Invalid X25519 private key');return {pub,priv:b64(der.slice(-32))}}catch{throw Error('Этот браузер не поддерживает X25519. Используйте современный Chrome, Firefox или Safari.')}}
+async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
+lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Приватный ключ хранится только на этой странице, не отправляется серверу. Сохраните файл сейчас. Если потеряете его, отзовите устройство и создайте новое.</p><div class="codebox" id="conf-display"></div><div class="buttons"><button class="cta tiny" id="conf-download">Скачать .conf</button><button class="cta outline tiny" id="conf-copy">Копировать</button></div></div>`;$('#conf-display').textContent=configText;
+$('#conf-download').onclick=()=>{const blob=new Blob([configText],{type:'application/octet-stream'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='still-vpn-'+r.id.slice(0,8)+'.conf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)};
+$('#conf-copy').onclick=()=>navigator.clipboard.writeText(configText).then(()=>toast('Конфигурация скопирована'),()=>toast('Не удалось скопировать',true));await loadDevices();me.device_count+=1;box.scrollIntoView({behavior:'smooth'});
+}catch(e){toast(e.message,true)}finally{button.disabled=false;button.textContent='Создать конфигурацию'}}
+function profilePage(c){c.innerHTML=subhead('АККАУНТ','Ваш профиль.','Простые настройки и понятный контроль доступа.')+`<div class="listrow"><span class="muted">Логин</span><strong>${esc(me.username)}</strong></div><div class="listrow"><span class="muted">Дата регистрации</span><strong>${date(me.created_at)}</strong></div><div class="listrow"><span class="muted">Email</span><strong>${esc(me.email||'Не указан')}</strong></div><div class="listrow"><span class="muted">Подтверждение email</span><strong>${me.email_verified?'Подтверждён':'Нет'}</strong></div><div class="listrow"><span class="muted">Telegram</span><strong>${me.id>0?'Связан':'Не привязан'}</strong></div><section class="section" id="email-options"></section><section class="section"><h3>Поддержка Still VPN</h3><p class="muted small">Обращения доступны здесь, даже если Telegram недоступен. Не отправляйте приватные ключи или пароли.</p><form id="ticket-form"><label class="field"><span>Опишите проблему</span><textarea id="ticket-text" maxlength="3500" minlength="5" required placeholder="Что не работает?" style="width:100%;min-height:95px;background:#1b151a;border:1px solid #43343e;border-radius:9px;color:#F3EEF0;padding:12px;font:inherit"></textarea></label><button class="cta tiny">Создать обращение</button></form><div id="my-tickets" class="section">Загрузка обращений…</div></section><section class="section"><h3>Привязка Telegram</h3><p class="muted small">Если Telegram доступен, отправьте боту /linkweb и вставьте одноразовый код. Привязка доступна только для нового веб-аккаунта без использованных подписок и VPN-профилей.</p><form id="link-form"><label class="field"><span>Код привязки</span><input id="link-code" placeholder="STILL-..." maxlength="80" required></label><button type="submit" class="cta outline tiny">Привязать Telegram</button></form></section><section class="section"><h3>Сменить пароль</h3><p class="muted small">После смены пароля все сессии будут завершены. Сохраните новый код восстановления.</p><form id="change-form"><label class="field"><span>Текущий пароль</span><input id="old-pass" type="password" required></label><label class="field"><span>Новый пароль (от 12 символов)</span><input id="new-pass" type="password" minlength="12" required></label><button class="cta outline tiny">Сменить пароль</button></form></section><div class="line"></div><button class="cta danger tiny" id="logout">Выйти из аккаунта</button>`;
+if(!me.email){$('#email-options').innerHTML=`<h3>Добавить email</h3><p class="muted small">Для подтверждения пробного доступа можно привязать email. Потребуется текущий пароль.</p><form id="email-add-form"><label class="field"><span>Email</span><input id="email-new" type="email" required></label><label class="field"><span>Текущий пароль</span><input id="email-pass" type="password" required></label><button class="cta tiny">Добавить email</button></form>`;$('#email-add-form').onsubmit=async e=>{e.preventDefault();try{await api('email/update',{method:'POST',body:JSON.stringify({email:$('#email-new').value,password:$('#email-pass').value})});toast('Email добавлен. Подтвердите его.');await loadMe()}catch(e){toast(e.message,true)}}}
+if(me.email&&!me.email_verified){$('#email-options').innerHTML=`<h3>Подтвердить email</h3><p class="muted small">Для бесплатного пробного доступа на сайте потребуется подтверждение почты, если эта функция включена администратором.</p><div class="buttons"><button class="cta outline tiny" id="email-send">Отправить код</button></div><form id="email-form"><label class="field"><span>Шестизначный код из письма</span><input id="email-code" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"></label><button class="cta tiny">Подтвердить</button></form>`;$('#email-send').onclick=async()=>{try{await api('email/send',{method:'POST',body:'{}'});toast('Письмо отправлено')}catch(e){toast(e.message,true)}};$('#email-form').onsubmit=async e=>{e.preventDefault();try{await api('email/verify',{method:'POST',body:JSON.stringify({code:$('#email-code').value.trim()})});toast('Email подтверждён');await loadMe()}catch(e){toast(e.message,true)}}}
+$('#ticket-form').onsubmit=async e=>{e.preventDefault();try{await api('tickets',{method:'POST',body:JSON.stringify({text:$('#ticket-text').value.trim()})});$('#ticket-text').value='';toast('Обращение создано');await loadWebTickets()}catch(e){toast(e.message,true)}};
+loadWebTickets();
+$('#logout').onclick=async()=>{try{await api('logout',{method:'POST',body:'{}'});me=null;csrf='';lastConfig=null;$('#member').classList.add('hidden');$('#guest').classList.remove('hidden');showAuth('login')}catch(e){toast(e.message,true)}};
+$('#change-form').onsubmit=async e=>{e.preventDefault();if(!confirm('Сменить пароль и завершить все сессии?'))return;try{const d=await api('password/change',{method:'POST',body:JSON.stringify({old_password:$('#old-pass').value,new_password:$('#new-pass').value})});me=null;csrf='';$('#member').classList.add('hidden');$('#guest').classList.remove('hidden');showAuth('login');showRecovery(d.recovery_code);toast('Пароль обновлён, сохраните новый код')}catch(e){toast(e.message,true)}};
+$('#link-form').onsubmit=async e=>{e.preventDefault();try{await api('link-telegram',{method:'POST',body:JSON.stringify({code:$('#link-code').value.trim()})});toast('Telegram привязан');await loadMe()}catch(e){toast(e.message,true)}}}
+async function loadWebTickets(){if(page!=='profile')return;const box=$('#my-tickets');if(!box)return;try{const rows=await api('tickets');box.innerHTML=rows.length?rows.map(t=>`<div class="listrow"><span>Обращение #${t.id} <small class="muted">${esc(t.status)}</small></span><button class="cta outline tiny" data-webticket="${t.id}">Открыть</button></div>`).join(''):'<p class="small muted">Обращений пока нет.</p>';
+$$('[data-webticket]').forEach(b=>b.onclick=()=>openWebTicket(Number(b.dataset.webticket)));}catch(e){box.textContent=e.message}}
+async function openWebTicket(id){const box=$('#my-tickets');try{const t=await api('tickets/'+id);box.innerHTML=`<button class="cta plain tiny" id="ticket-back">← К обращениям</button><h3>Обращение #${t.id} (${esc(t.status)})</h3>`+t.messages.map(m=>`<div class="panel"><span class="small muted">${m.sender==='admin'?'Поддержка':'Вы'} · ${date(m.date)}</span><p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</p></div>`).join('')+(t.status==='open'?`<form id="ticket-reply"><label class="field"><span>Ваш ответ</span><textarea id="reply-text" maxlength="3500" required style="width:100%;min-height:80px;background:#1b151a;color:#fff;padding:12px;border:1px solid #43343e;border-radius:9px"></textarea></label><button class="cta tiny">Отправить</button></form>`:'');$('#ticket-back').onclick=loadWebTickets;
+if($('#ticket-reply'))$('#ticket-reply').onsubmit=async ev=>{ev.preventDefault();try{await api('tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text:$('#reply-text').value.trim()})});await openWebTicket(id)}catch(e){toast(e.message,true)}};
+}catch(e){toast(e.message,true)}}
+async function init(){try{config=await api('config');if(config.bot_url){const b=$('#bot-link');b.href=config.bot_url;b.classList.remove('hidden');$('#footer-bot').innerHTML=`<a target="_blank" rel="noopener noreferrer" href="${esc(config.bot_url)}">Открыть Telegram-бота ↗</a>`}if(!config.registration_enabled){$$('[data-auth="register"]').forEach(x=>x.disabled=true);$('#intro-create').disabled=true}await loadMe()}catch(e){toast(e.message,true)}}
+init();
+})();
+</script></body></html>"""
+
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
