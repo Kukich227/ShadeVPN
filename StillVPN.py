@@ -199,7 +199,7 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "10.0.0"
+RELEASE = "10.0.1"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -3940,6 +3940,15 @@ if MODE == "app":
     def seo_public_html() -> str:
         # Static server response exposes real headings/links even when JS is not executed.
         return STILL_WEB_HTML.replace("__STILL_CANONICAL__", html_escape(seo_site_url(), quote=True))
+
+    # Public Google Search Console verification endpoint, from the original HTML file.
+    # Keep the contents exact (including no trailing newline).
+    @app.get("/googledbf78c04b92f601b.html", include_in_schema=False)
+    async def google_site_verification():
+        return Response(
+            content="google-site-verification: googledbf78c04b92f601b.html",
+            media_type="text/html",
+        )
 
     @app.get("/robots.txt", include_in_schema=False)
     async def robots_txt():
