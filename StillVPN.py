@@ -1,4 +1,4 @@
-"""STILL VPN v8 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
+"""STILL VPN v10 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -78,10 +78,14 @@ STILL VPN WEB v8 (на BotHost, без Telegram):
 v8 (сохранена функция v7): /api/admin/users/{id}/trial/shorten доступен только Owner, требует причину,
     не продлевает срок, записывает Audit Log и синхронизирует доступ с агентом.
     В админке пользователя действия «До 5 минут» и «Завершить сейчас».
+    Экспорт .conf: файл можно получить в личном Telegram-чате по явному согласию
+    или сохранить локально. При отправке в Telegram ключ кратковременно передаётся
+    через HTTPS на BotHost и далее в Telegram, но в SQLite и журналах не хранится.
     Экспорт .conf: сначала локальное системное сохранение/передача файла,
     затем обычная загрузка/копирование. Telegram WebView может запрещать
     загрузку blob:-URL: полноценная гарантия скачивания невозможна без
-    платформенной поддержки. Приватные клиентские ключи на сервер не отправляются.
+    платформенной поддержки. При локальном экспорте ключ остаётся в браузере;
+    при явной отправке в Telegram он передаётся транзитом по HTTPS и не пишется в БД.
 
 v8 — дизайн: новый редакционный сайт и Mini App, экраны «Наш сервер», «Поделиться», канал
 https://t.me/StillVPN_official (подписка не обязательна). /adm_start_photo — ответом
@@ -90,12 +94,12 @@ https://t.me/StillVPN_official (подписка не обязательна). /
 в LOG_CHAT_ID=-1004452182801: добавить бота в закрытую группу с разрешением писать.
 Telegram ID, имя, фамилия и @username сохраняются, ключи/пароли в логи не попадают.
 /api/servers/public — публичная информация о сервере. PUBLIC_SERVER_COUNTRY=Нидерланды,
-PUBLIC_SERVER_PROVIDER=SKRIME. /build отдаёт релиз 8.0.0.
+PUBLIC_SERVER_PROVIDER=SKRIME. /build отдаёт релиз 10.0.0.
 Рефералы: только учёт приглашений, без автоматических бонусов за регистрацию.
 
 MINI APP АДМИНКА v8: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
 из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
-базу не удалять. Обновлять до v8 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
+базу не удалять. Обновлять до v10 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
     python shade.py selftest                  — автономные тесты криптографических проверок
@@ -195,7 +199,7 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "8.0.0"
+RELEASE = "10.0.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -605,13 +609,15 @@ if MODE == "app":
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from aiogram import Bot, Dispatcher, Router, F
     from aiogram.filters import Command, CommandStart
-    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
     from aiogram.types import (
         Message, CallbackQuery, PreCheckoutQuery, WebAppInfo,
         InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
-        BotCommand
+        BotCommand, BufferedInputFile
     )
     from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     from html import escape as html_escape
     import httpx
 
@@ -2598,6 +2604,8 @@ if MODE == "app":
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Strict-Transport-Security"] = "max-age=31536000"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
+        if req.url.path == "/" or req.url.path.startswith("/api/") or req.url.path.startswith("/web/api/"):
+            response.headers["X-Robots-Tag"] = "noindex, nofollow"
         if req.url.path == "/":
             # Telegram Web renders Mini Apps in an iframe; X-Frame-Options SAMEORIGIN would break it.
             inline_js = MINI_APP_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
@@ -2612,8 +2620,11 @@ if MODE == "app":
         elif req.url.path.rstrip("/") == "/web":
             web_js = STILL_WEB_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
             digest = base64.b64encode(hashlib.sha256(web_js.encode()).digest()).decode()
+            # JSON-LD must be included in CSP hashes as well as the main inline script.
+            schema_json = seo_public_html().split('<script type="application/ld+json">', 1)[1].split('</script>', 1)[0]
+            schema_digest = base64.b64encode(hashlib.sha256(schema_json.encode()).digest()).decode()
             response.headers["Content-Security-Policy"] = (
-                "default-src 'none'; script-src 'sha256-" + digest + "'; "
+                "default-src 'none'; script-src 'sha256-" + digest + "' 'sha256-" + schema_digest + "'; "
                 "style-src 'unsafe-inline'; img-src 'self' data:; "
                 "connect-src 'self'; form-action 'self'; base-uri 'none'; "
                 "object-src 'none'; frame-ancestors 'none'"
@@ -2894,6 +2905,92 @@ if MODE == "app":
         except Exception:
             LOG.exception("Provisioning failed for device %s; background task will retry", d.id)
         return response
+
+    class ConfToTelegramIn(BaseModel):
+        # Only the WireGuard private key is accepted: server rebuilds the rest from trusted DB values.
+        private_key: str = Field(min_length=44, max_length=44, pattern=r"^[A-Za-z0-9+/]{43}=$")
+
+    conf_send_rate: dict[int, list[float]] = {}
+
+    async def deliver_conf_to_telegram(
+        device_id: str, data: ConfToTelegramIn, user: User, session: AsyncSession
+    ) -> dict[str, bool]:
+        """Secure one-time user-requested delivery; never persist or log a private key."""
+        if user.id <= 0:
+            bad(403, "Сначала привяжите Telegram к веб-аккаунту через /linkweb")
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", device_id):
+            bad(404, "Устройство не найдено")
+        dev = await session.get(Device, device_id)
+        if not dev or dev.user_id != user.id or not dev.enabled:
+            bad(404, "Активное устройство не найдено")
+        if not dev.provisioned:
+            bad(409, "Устройство ещё не подтверждено VPN-сервером")
+        if not await entitlement(session, user):
+            bad(403, "Для отправки профиля нужен активный VPN-доступ")
+        node = await session.get(ServerNode, dev.server_id)
+        if not node or not node.enabled:
+            bad(503, "VPN-сервер сейчас недоступен")
+        try:
+            secret_bytes = base64.b64decode(data.private_key, validate=True)
+            if len(secret_bytes) != 32:
+                raise ValueError("invalid key length")
+            derived = base64.b64encode(X25519PrivateKey.from_private_bytes(
+                secret_bytes).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            ).decode("ascii")
+        except Exception:
+            bad(422, "Некорректный приватный ключ WireGuard")
+        if not hmac.compare_digest(derived, dev.public_key):
+            bad(422, "Ключ не соответствует выбранному устройству")
+        # Enforce strict rate limit for sending secret-bearing documents to Telegram.
+        tick = time.monotonic()
+        if len(conf_send_rate) > 10000:
+            for uid, events in list(conf_send_rate.items()):
+                if not events or events[-1] < tick - 3600:
+                    conf_send_rate.pop(uid, None)
+        recent = [x for x in conf_send_rate.get(user.id, []) if x > tick - 3600]
+        if len(recent) >= 6:
+            bad(429, "Лимит отправок: максимум 6 профилей в час")
+        conf_send_rate[user.id] = recent + [tick]
+        config = (
+            "[Interface]\n"
+            f"PrivateKey = {data.private_key}\n"
+            f"Address = {dev.peer_ip}/32\n"
+            "DNS = 1.1.1.1\n"
+            "MTU = 1280\n\n"
+            "[Peer]\n"
+            f"PublicKey = {node.public_key}\n"
+            f"Endpoint = {node.endpoint}\n"
+            "AllowedIPs = 0.0.0.0/0\n"
+            "PersistentKeepalive = 25\n"
+        )
+        filename = "still-" + dev.id[:8] + ".conf"
+        try:
+            await bot.send_document(
+                chat_id=user.id,
+                document=BufferedInputFile(config.encode("utf-8"), filename=filename),
+                caption=("🔐 <b>Still VPN · конфигурация</b>\n"
+                         "Откройте файл в WireGuard и включите туннель.\n"
+                         "⚠️ Файл содержит приватный ключ: не пересылайте его другим."),
+                parse_mode="HTML",
+                # Keep downloading enabled: protected Telegram messages can prevent file saving.
+                protect_content=False,
+            )
+        except TelegramAPIError:
+            bad(409, "Не удалось отправить файл. Откройте личный чат с ботом, нажмите /start и повторите. Если бот заблокирован, разблокируйте его.")
+        # Event contains only public metadata; never include private key or full config.
+        try:
+            async with Session.begin() as audit_session:
+                record_event(audit_session, "config_sent_to_owner", user.id,
+                             f"Личный чат · устройство {dev.id[:8]} · {dev.platform}")
+        except Exception:
+            LOG.warning("Failed to audit configuration delivery, id=%s", dev.id[:8])
+        return {"ok": True, "sent": True}
+
+    @app.post("/api/devices/{device_id}/send-conf")
+    async def api_send_conf(device_id: str, data: ConfToTelegramIn,
+                            user: User = Depends(current_user),
+                            session: AsyncSession = Depends(db_session)):
+        return await deliver_conf_to_telegram(device_id, data, user, session)
 
     @app.delete("/api/devices/{device_id}")
     async def api_delete_device(device_id: str, user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
@@ -3566,6 +3663,13 @@ if MODE == "app":
         site_rate(req,"device-create",subject=str(identity[1].id),limit=12,window=3600)
         return await api_add_device(data, identity[0], s)
 
+    @app.post("/web/api/devices/{device_id}/send-conf")
+    async def web_send_conf(device_id: str, data: ConfToTelegramIn, req: Request,
+                            identity=Depends(web_authorized),
+                            session: AsyncSession=Depends(db_session)):
+        site_rate(req, "config-to-tg", subject=str(identity[1].id), limit=6, window=3600)
+        return await deliver_conf_to_telegram(device_id, data, identity[0], session)
+
     @app.patch("/web/api/devices/{device_id}")
     async def web_rename_device(device_id:str, data:RenameIn, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
         return await api_rename(device_id, data, identity[0], s)
@@ -3827,10 +3931,42 @@ if MODE == "app":
             s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
         return {"ok":True}
 
+    def seo_site_url() -> str:
+        u = urlparse(WEBAPP_URL)
+        if u.scheme != "https" or not u.netloc:
+            return "https://stillvpn.bothost.tech/web"
+        return f"{u.scheme}://{u.netloc}/web"
+
+    def seo_public_html() -> str:
+        # Static server response exposes real headings/links even when JS is not executed.
+        return STILL_WEB_HTML.replace("__STILL_CANONICAL__", html_escape(seo_site_url(), quote=True))
+
+    @app.get("/robots.txt", include_in_schema=False)
+    async def robots_txt():
+        return Response(
+            "User-agent: *\n"
+            "Allow: /web\n"
+            "Disallow: /api/\n"
+            "Disallow: /web/api/\n"
+            "Disallow: /health\n"
+            "Disallow: /build\n"
+            "Sitemap: " + seo_site_url().removesuffix("/web") + "/sitemap.xml\n",
+            media_type="text/plain; charset=utf-8",
+        )
+
+    @app.get("/sitemap.xml", include_in_schema=False)
+    async def sitemap_xml():
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            '<url><loc>' + seo_site_url() + '</loc></url></urlset>',
+            media_type="application/xml; charset=utf-8",
+        )
+
     @app.get("/web",response_class=HTMLResponse)
     @app.get("/web/",response_class=HTMLResponse)
     async def standalone_site():
-        return HTMLResponse(STILL_WEB_HTML)
+        return HTMLResponse(seo_public_html())
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
@@ -3838,7 +3974,7 @@ if MODE == "app":
 
     @app.get("/site", response_class=HTMLResponse, include_in_schema=False)
     async def standalone_site_alias():
-        return HTMLResponse(STILL_WEB_HTML)
+        return HTMLResponse(seo_public_html())
 
     @app.get("/web/terms",response_class=HTMLResponse)
     async def standalone_terms():
@@ -3847,6 +3983,7 @@ if MODE == "app":
 <h1>Still VPN — условия тестирования</h1>
 <p>Сервис находится на этапе тестирования. VPN не гарантирует абсолютную анонимность, доступность всех сайтов или непрерывность соединения.</p>
 <p>Для работы сайта хранятся логин, хеш пароля, случайный идентификатор сессии, параметры подписки, устройства и счётчики трафика WireGuard. Содержание пользовательского трафика этим приложением не сохраняется.</p>
+<p>При выборе функции «Получить .conf в личный Telegram-чат» приватный ключ однократно передаётся на сервер Still VPN по HTTPS и в Telegram. Still VPN не сохраняет приватный ключ в своей базе или логах, однако копия остаётся в личной переписке Telegram до её удаления.</p>
 <p>Для технического учёта владельцам в закрытой служебной группе Telegram могут отправляться уведомления о регистрации, подключениях устройств, оплатах и действиях администраторов с именем, @username и Telegram ID пользователя. Приватные VPN-ключи, пароли и тексты пользовательского трафика в группу не передаются.</p>
 <p>Подписка на информационный канал Still VPN добровольная.</p>
 <p>Пользователь обязан соблюдать применимое законодательство. Пробный доступ может быть ограничен и отозван при злоупотреблении.</p>
@@ -4179,7 +4316,16 @@ else:
 # All data comes from the authenticated API; no fake subscriptions or statistics.
 STILL_WEB_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#100D11">
-<title>Still VPN — тишина в интерфейсе, свобода в сети</title><meta name="still-release" content="8.0.0">
+<title>Still VPN — VPN для Android, iPhone и компьютера | WireGuard</title>
+<meta name="description" content="Still VPN — VPN на WireGuard с сервером в Нидерландах. Подключение через Telegram, тарифы и личный кабинет для Android, iPhone, Windows и macOS.">
+<meta name="robots" content="index,follow,max-image-preview:large">
+<link rel="canonical" href="__STILL_CANONICAL__">
+<meta property="og:type" content="website"><meta property="og:site_name" content="Still VPN">
+<meta property="og:title" content="Still VPN — защищённое VPN-подключение на WireGuard">
+<meta property="og:description" content="VPN через Telegram и личный кабинет. Нидерланды, Android, iPhone и компьютер.">
+<meta property="og:url" content="__STILL_CANONICAL__">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"Still VPN","url":"__STILL_CANONICAL__","inLanguage":"ru"}</script>
+<meta name="still-release" content="10.0.0">
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
 *{box-sizing:border-box}html{scroll-behavior:smooth}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink)}
@@ -4207,7 +4353,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding:29px 0;display:f
 @media(max-width:520px){.micro.desktop{display:none}.logotype{font-size:17px}.pill-link{padding:8px 10px;font-size:11px}.intro-list{grid-template-columns:1fr;gap:3px}.intro-list div{padding:9px 0;border-bottom:1px solid var(--line)}.intro-art{height:145px}.intro{padding-bottom:35px}.shell{padding-top:30px}.subnav{display:grid;grid-template-columns:repeat(4,1fr);gap:0}.subnav button{font-size:11px;padding:10px 3px}.overview{padding:22px 18px}.grid2{grid-template-columns:1fr}.planline{align-items:flex-start}.listrow strong{font-size:13px}.buttons .cta{width:100%}h1{font-size:36px}}
 @media(prefers-reduced-motion:no-preference){.cta,.subnav button{transition:background .14s,border-color .14s}}
 
-/* STILL / EDITION 07 — asymmetric editorial layout, measured type, data-first member pages. */
+/* STILL / EDITION 10 — asymmetric editorial layout, measured type, data-first member pages. */
 :root{--trim:#a96a7e}
 body{font-feature-settings:"tnum" 1}
 header{max-width:1260px}.shell{max-width:1210px;padding-top:48px}
@@ -4249,7 +4395,7 @@ h1{font-weight:570;letter-spacing:-.065em;line-height:1.03}
 @media(max-width:520px){.shell{padding-top:24px}.intro h1{font-size:clamp(39px,11.8vw,56px)}.intro .lead{font-size:14px;line-height:1.7}.workflow{grid-template-columns:1fr}.workflow li{display:grid;grid-template-columns:29px 1fr;border-bottom:1px solid #382b35}.intro-art{padding:17px}.intro-list{gap:0}.intro-footnote{font-size:10px}.auth-shell{margin-top:52px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 
-/* STILL / EDITION 08: high-contrast editorial cover, diagrammatic connection board. */
+/* STILL / EDITION 10: high-contrast editorial cover, diagrammatic connection board. */
 :root{--bg:#121217;--panel:#1c171e;--red:#792c43;--ink:#f4f0e8;--muted:#aa9caa;--line:rgba(242,233,231,.17)}
 body{background:var(--bg)}header{height:77px}a.subtle-link{color:#ce9bb0;text-decoration:underline;text-underline-offset:4px}
 .intro{align-items:stretch;grid-template-columns:minmax(0,1.12fr) minmax(270px,.78fr);min-height:570px;gap:0;padding:0;border:1px solid #4e3941;background:#eae3d7;color:#18171a;overflow:hidden;border-radius:0}
@@ -4263,17 +4409,21 @@ body{background:var(--bg)}header{height:77px}a.subtle-link{color:#ce9bb0;text-de
 @media(max-width:900px){.intro{grid-template-columns:minmax(0,1fr) minmax(240px,.7fr)}.intro-copy{padding:43px 25px}.intro-art{min-height:450px;padding:24px}.route-visual{margin:28px 0}.route-line{height:80px}}
 @media(max-width:740px){.intro{display:block}.intro h1{font-size:clamp(43px,10vw,70px)}.intro-art{display:block;min-height:auto}.route-visual{display:grid;grid-template-columns:1fr 40px 1fr;align-items:center;gap:15px;margin:24px 0}.route-start{font-size:10px}.route-line{height:1px;border:0;border-top:1px solid #986879;margin:0;position:relative}.route-line:before,.route-line:after{display:none}.route-end{font-size:41px}.route-end small{font-size:9px}.route-data{margin-top:18px}.route-data div{padding:10px 0}.intro-copy{padding:35px 21px}.hero-small-meta{margin-top:26px}}
 @media(max-width:520px){.topnav{gap:8px}.topnav a{font-size:12px}.intro-copy{padding:28px 21px}.intro h1{font-size:clamp(40px,10.6vw,53px)}.intro .lead{font-size:14px}.intro .buttons .cta{width:100%}.hero-small-meta{gap:8px;font-size:9px}.hero-small-meta span:not(:last-child){padding-right:8px}.route-visual{grid-template-columns:1fr 28px 1fr}.route-end{font-size:42px}.community-strip{align-items:flex-start}.community-strip span{min-width:100%;flex:auto}}
+
+.seo-landing{border-top:1px solid var(--line);padding-top:36px;padding-bottom:40px}.seo-landing h2{max-width:830px}.seo-landing p{max-width:800px;color:var(--muted);font-size:14px}.seo-landing a{text-decoration:underline;text-underline-offset:4px;color:#d9b7cb}
 </style></head>
 <body>
 <header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#d7c6ce">VPN</span></a><span class="micro desktop">EUROPE / PRIVATE NETWORK</span><nav class="topnav"><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал ↗</a><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram ↗</a></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
-<section class="intro"><div class="intro-copy"><p class="kicker">STILL / VPN WITH INTENTION — 08</p><h1>Тише снаружи.<br><em>Свободнее внутри.</em></h1><p class="lead">Интернет для твоих привычных дел. Смотри, общайся, работай — VPN на WireGuard без сложных настроек и скрытых лимитов.</p><div class="buttons"><button class="cta" id="intro-create">Начать со Still VPN <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти в кабинет</button></div><div class="hero-small-meta"><span>01 / WireGuard</span><span>02 / Нидерланды</span><span>03 / Android · iOS · PC</span></div></div><div class="intro-art"><div class="workflow-title"><span class="micro">ВАШ МАРШРУТ</span><span class="workflow-tag">STILL / CONNECTION</span></div><div class="route-visual"><span class="route-start">УСТРОЙСТВО</span><span class="route-line"><i></i></span><span class="route-end">NL <small>НИДЕРЛАНДЫ</small></span></div><div class="route-data"><div><span>ПРОТОКОЛ</span><strong>WireGuard®</strong></div><div><span>УЗЕЛ</span><strong>Europe / NL</strong></div><div><span>НАСТРОЙКА</span><strong>Свой .conf для каждого устройства</strong></div></div><div class="route-footer"><span>Подключение на твоих условиях.</span><b>→ STILL</b></div></div></section>
-<div class="intro-list"><div><strong>01 / Приватное подключение</strong><p>Уникальный WireGuard-профиль для каждого устройства, без передачи приватного ключа серверу.</p></div><div><strong>02 / Всё под контролем</strong><p>Срок подписки, трафик и список подключений всегда в кабинете.</p></div><div><strong>03 / Свой путь</strong><p>Вход через Telegram или отдельно на сайте. <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer" class="subtle-link">Следить за обновлениями ↗</a></p></div></div><div class="community-strip"><span><b>НЕ ТОЛЬКО VPN</b><small>Новости, обновления и советы — в нашем Telegram-канале.</small></span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Читать канал ↗</a><button id="share-site" type="button">Поделиться Still VPN ↗</button></div>
+<section class="intro"><div class="intro-copy"><p class="kicker">STILL / VPN WITH INTENTION — 10</p><h1>Тише снаружи.<br><em>Свободнее внутри.</em></h1><p class="lead">Интернет для твоих привычных дел. Смотри, общайся, работай — VPN на WireGuard без сложных настроек и скрытых лимитов.</p><div class="buttons"><button class="cta" id="intro-create">Начать со Still VPN <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти в кабинет</button></div><div class="hero-small-meta"><span>01 / WireGuard</span><span>02 / Нидерланды</span><span>03 / Android · iOS · PC</span></div></div><div class="intro-art"><div class="workflow-title"><span class="micro">ВАШ МАРШРУТ</span><span class="workflow-tag">STILL / CONNECTION</span></div><div class="route-visual"><span class="route-start">УСТРОЙСТВО</span><span class="route-line"><i></i></span><span class="route-end">NL <small>НИДЕРЛАНДЫ</small></span></div><div class="route-data"><div><span>ПРОТОКОЛ</span><strong>WireGuard®</strong></div><div><span>УЗЕЛ</span><strong>Europe / NL</strong></div><div><span>НАСТРОЙКА</span><strong>Свой .conf для каждого устройства</strong></div></div><div class="route-footer"><span>Подключение на твоих условиях.</span><b>→ STILL</b></div></div></section>
+<div class="intro-list"><div><strong>01 / Приватное подключение</strong><p>Уникальный WireGuard-профиль для каждого устройства. Приватный ключ отправляется только по вашему запросу в личный Telegram-чат.</p></div><div><strong>02 / Всё под контролем</strong><p>Срок подписки, трафик и список подключений всегда в кабинете.</p></div><div><strong>03 / Свой путь</strong><p>Вход через Telegram или отдельно на сайте. <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer" class="subtle-link">Следить за обновлениями ↗</a></p></div></div><div class="community-strip"><span><b>НЕ ТОЛЬКО VPN</b><small>Новости, обновления и советы — в нашем Telegram-канале.</small></span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Читать канал ↗</a><button id="share-site" type="button">Поделиться Still VPN ↗</button></div>
 <section class="auth-shell" id="authorization" style="margin-top:80px"><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
+<section class="seo-landing" aria-label="Информация о Still VPN"><h2>VPN на WireGuard для телефона и компьютера</h2><p>Still VPN помогает настроить защищённое соединение на Android, iPhone, Windows и macOS. Управляйте подпиской, пробным доступом и устройствами в Telegram Mini App или через личный кабинет сайта. Основной VPN-сервер расположен в Нидерландах.</p><p>После создания устройства скачайте файл WireGuard (.conf) или запросите его в личном чате Telegram. Для включения VPN импортируйте файл в приложение WireGuard. Лимиты трафика, срок и количество устройств зависят от выбранного тарифа.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a> · <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал Still VPN ↗</a></section>
 </div>
 <div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
-<footer><span>© Still VPN · EDITION 08 · BUILT FOR EVERYDAY CONNECTION</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
+
+<footer><span>© Still VPN · EDITION 10 · BUILT FOR EVERYDAY CONNECTION</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
 </main>
 <script>
 (()=>{'use strict';
@@ -4333,8 +4483,9 @@ async function saveConfigLocally(conf,filename){
  saveBlobConfig(conf,filename);toast('Проверьте загрузки. Если файла нет, скопируйте текст в .conf вручную.',true);
 }
 async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
-lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Приватный ключ хранится только на этой странице, не отправляется серверу. Сохраните файл сейчас. Если потеряете его, отзовите устройство и создайте новое.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-save">Сохранить .conf на устройство</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Выбирайте локальное сохранение. Конфигурация содержит приватный ключ и не отправляется нашему серверу.</p></div>`;$('#conf-display').textContent=configText;
+lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Ключ создан локально. Если отправите .conf в Telegram, он однократно пройдёт через сервер по HTTPS и останется в вашем личном чате. Другие способы сохраняют файл локально.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-telegram">✉ Отправить .conf в личный чат</button><button class="cta outline tiny" id="conf-save">Сохранить локально</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Отправка в личный чат требует привязанного Telegram-аккаунта; ключ проходит через API и Telegram без сохранения в нашей базе. Приоритет приватности — локальное сохранение.</p></div>`;$('#conf-display').textContent=configText;
 const configFilename='still-vpn-'+r.id.slice(0,8)+'.conf';
+$('#conf-telegram').onclick=async()=>{const b=$('#conf-telegram');if(!confirm('Отправить ваш приватный ключ в Telegram? Файл останется в личном чате.'))return;b.disabled=true;b.textContent='Отправляем…';try{await api('devices/'+r.id+'/send-conf',{method:'POST',body:JSON.stringify({private_key:kp.priv})});toast('Файл отправлен в личный чат с ботом');b.textContent='✓ Отправлено в Telegram'}catch(e){toast(e.message,true);b.disabled=false;b.textContent='✉ Отправить .conf в личный чат'}};
 $('#conf-save').onclick=()=>saveConfigLocally(configText,configFilename);
 $('#conf-download').onclick=()=>saveBlobConfig(configText,configFilename);
 $('#conf-copy').onclick=()=>navigator.clipboard.writeText(configText).then(()=>toast('Конфигурация скопирована'),()=>toast('Не удалось скопировать',true));await loadDevices();me.device_count+=1;box.scrollIntoView({behavior:'smooth'});
@@ -4360,7 +4511,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>STILL VPN / EDITION 08</title><meta name="still-release" content="8.0.0">
+<title>STILL VPN / EDITION 10</title><meta name="still-release" content="10.0.0"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -4478,9 +4629,17 @@ body{background:var(--bg)}#app{padding-top:calc(env(safe-area-inset-top) + 19px)
 .usage-track{height:5px;background:#322a30;overflow:hidden;border-radius:0}.usage-track span{display:block;background:#bd7388;height:100%}.usage-head{color:#c0b0b4}.status-rail{padding:15px 0;border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:14px}.status-rail b{font-size:13px;font-weight:560;text-align:right}
 .panel{border-radius:6px;background:#1a191e}.tabs{background:rgba(15,17,21,.96)}
 @media(max-width:380px){.community-actions{grid-template-columns:1fr}.community-actions button:nth-child(3){grid-column:span 1}.hero{padding:21px 17px}.signal-data{gap:0 9px}}
+
+.vpn-control{background:linear-gradient(135deg,#241921,#151016);border:1px solid #63405b;border-radius:18px;padding:23px;margin:19px 0 27px;box-shadow:0 16px 40px #0002}
+.vpn-control-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.vpn-control-head .kicker{margin:0}.vpn-control-main{display:flex;align-items:center;gap:16px;margin:22px 0}.vpn-control-main h2{font-size:21px;margin:0 0 7px}.vpn-control-main p{margin:0}
+.vpn-power{width:76px;height:76px;flex:none;border-radius:22px;background:linear-gradient(145deg,#8e526e,#312134);border:1px solid #b37591;display:flex;align-items:center;justify-content:center;font-size:42px;color:#f5dde8;box-shadow:0 9px 27px #0004}
+.vpn-how{margin-top:17px;padding-top:15px;border-top:1px solid #705064;color:var(--ink);line-height:1.6}.vpn-how p{font-size:13px;margin:0 0 12px}.vpn-how a{color:#eab9d2;text-decoration:underline}
+.vpn-status-fresh{color:#c1e3ca!important;border-color:#56806b!important}.vpn-status-idle{color:#d4b8cc!important}
+@media(max-width:390px){.vpn-control{padding:16px}.vpn-power{width:56px;height:56px;font-size:33px}.vpn-control-main h2{font-size:18px}}
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
-<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 08</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
+<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 10</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
 <nav class="tabs" id="tabs" aria-label="Разделы"></nav>
 <script>
 (()=>{
@@ -4515,7 +4674,7 @@ async function miniReferrals(){try{const r=await api('referrals');const box=$('#
 function home(){const s=me.subscription;
 main.innerHTML=section('STILL / ЛИЧНЫЙ КАБИНЕТ',`На связи, ${esc(me.first_name||'друг')}.`,'Твой интернет. Твои устройства. Твой ритм.')+
 `<div class="hero"><div class="hero-mark"><small>ВАШЕ ПОДКЛЮЧЕНИЕ</small><span class="pill"><i class="dot"></i>${s?'Доступ активен':'Нет доступа'}</span></div>
-<div class="big">${s?esc(s.name):'Начнём с подключения.'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Настройте пробный период или выберите подходящий тариф.'}</div><div class="hero-foot"><span>STILL / VPN</span><span class="hero-number">№ 08 — PRIVATE NETWORK</span></div></div>
+<div class="big">${s?esc(s.name):'Начнём с подключения.'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Настройте пробный период или выберите подходящий тариф.'}</div><div class="hero-foot"><span>STILL / VPN</span><span class="hero-number">№ 10 — PRIVATE NETWORK</span></div></div>
 <div class="quick-row"><button id="quick-connect"><span>01 / УСТРОЙСТВА</span><strong>Подключить ↗</strong></button><button id="quick-plans"><span>02 / ПОДПИСКА</span><strong>Выбрать тариф ↗</strong></button></div>
 <div class="usage-head"><span>Трафик за период</span><strong>${s?gb(s.used)+' / '+gb(s.limit):'—'}</strong></div>
 ${s&&s.limit!==null&&s.limit>0?`<div class="usage-track" aria-label="Использовано трафика"><span style="width:${Math.min(100,Math.max(0,s.used/s.limit*100)).toFixed(1)}%"></span></div>`:''}
@@ -4524,7 +4683,7 @@ ${s&&s.limit!==null&&s.limit>0?`<div class="usage-track" aria-label="Испол�
 ${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать бесплатный пробный период</button><p class="small muted">Один раз на аккаунт. Длительность и объём — по настройкам сервиса.</p></div>':''}
 <div class="signal-card"><div class="signal-head"><p class="kicker">03 / СЕТЬ STILL</p><span class="signal-country">🇳🇱 NL</span></div><h2>Где находится сервер?</h2><p class="small muted">Наш основной узел находится в Нидерландах. Состояние сети обновляется по данным агента — без выдуманных показателей скорости.</p><div id="server-signal"><p class="small muted">Получаем информацию…</p></div></div>
 <div class="community-box"><p class="kicker">04 / ДАЛЬШЕ ВМЕСТЕ</p><h2>Передай хорошую связь.</h2><p class="small muted">Поделись Still VPN с друзьями, следи за обновлениями и открывай сайт напрямую. Подписка на канал — по желанию.</p><div class="community-actions"><button id="invite-share">↗ Поделиться VPN</button><button id="channel-open">◈ Наш канал</button><button id="site-open">🌐 Перейти на сайт Still VPN ↗</button></div><p id="ref-count" class="small muted">Статистика приглашений загружается…</p></div>
-<div class="edition-footer"><span>STILL VPN / RELEASE 08</span><a href="https://t.me/StillVPN_official" id="channel-link">CHANNEL ↗</a></div>`;
+<div class="edition-footer"><span>STILL VPN / RELEASE 10</span><a href="https://t.me/StillVPN_official" id="channel-link">CHANNEL ↗</a></div>`;
 $('#quick-connect').onclick=()=>nav('connect');$('#quick-plans').onclick=()=>nav('plans');
 $('#channel-open').onclick=()=>openOutside(me.channel_url||'https://t.me/StillVPN_official');
 $('#site-open').onclick=()=>openOutside(me.site_url||location.origin+'/web');
@@ -4548,12 +4707,14 @@ async function loadPayments(){try{payments=await api('payments');if(page!=='plan
 $('#history').innerHTML=payments.length?payments.map(p=>`<div class="statrow" style="align-items:flex-start"><span><b>${esc(p.plan)}</b><br><span class="small muted">${day(p.date)} · ${p.kind==='gift'?'Подарок':'Подписка'}<br>ID ${esc(p.id)}</span></span><span><b>${p.amount} ⭐</b><br><span class="small muted">${esc(p.status)}</span></span></div>`).join(''):'<p class="muted small">Пока нет платежей.</p>';
 }catch(e){toast(e.message,true)}}
 function connectPage(){const e=me.subscription;
-main.innerHTML=section('VPN','Ваши устройства.','Отдельная конфигурация WireGuard для каждого устройства. Никому не передавайте приватный ключ.')+
+main.innerHTML=section('VPN','Ваши устройства.','Создайте профиль один раз, затем включайте и выключайте туннель через настройки телефона или WireGuard.')+
+`<div class="vpn-control" id="vpn-control"><div class="vpn-control-head"><span class="kicker">STILL / СТАТУС ПОДКЛЮЧЕНИЯ</span><span id="vpn-activity" class="pill">Проверяем устройства…</span></div><div class="vpn-control-main"><div class="vpn-power" aria-hidden="true">⏻</div><div><h2>VPN под вашим контролем</h2><p class="small muted">Mini App показывает данные сервера, но не может включать системный VPN без приложения.</p></div></div><button id="vpn-how-toggle" class="button secondary compact">Как включать / выключать быстро ↗</button><div id="vpn-how" class="vpn-how" hidden><p><b>Android:</b> откройте WireGuard и активируйте профиль. Для быстрого доступа добавьте VPN в быстрые настройки или используйте совместимый виджет.</p><p><b>iPhone:</b> откройте настройки iOS → VPN или приложение WireGuard и включите конфигурацию.</p><p class="small muted">Это управление в системе устройства. Кнопка в Mini App не имитирует включение VPN.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a></div></div>`+
 (!e?'<div class="notice error">Для создания конфигурации активируйте тариф или пробный период.</div>':'')+
 `<div class="panel"><h3>Новое подключение</h3><label>Название устройства</label><input id="dev-name" maxlength="60" placeholder="Мой iPhone" autocomplete="off"><label>Платформа</label><select id="dev-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select><div style="height:18px"></div><button id="create-device" class="button" ${!e?'disabled':''}>Создать конфигурацию</button></div>`+
 `<div id="new-config"></div><div class="section"><h2>Добавленные устройства</h2><div id="device-list"></div></div>`;
-$('#create-device').onclick=createDevice;loadDevices();}
+$('#create-device').onclick=createDevice;$('#vpn-how-toggle').onclick=()=>{$('#vpn-how').hidden=!$('#vpn-how').hidden};loadDevices();}
 async function loadDevices(){try{devices=await api('devices');if(page!=='connect')return;
+const indicator=$('#vpn-activity');if(indicator){const active=devices.filter(d=>d.enabled&&d.provisioned);const recent=active.some(d=>d.last_handshake&&Date.now()-new Date(d.last_handshake).getTime()<180000);indicator.textContent=recent?'Связь с сервером недавно':active.length?'Профиль готов':'Нет активного профиля';indicator.className='pill '+(recent?'vpn-status-fresh':'vpn-status-idle')}
 const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.platform)} · ${day(d.created_at)}<br>${d.last_handshake?'Последняя активность '+day(d.last_handshake):'Нет данных о подключении'}</span></div><span class="pill">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div><div class="row" style="justify-content:flex-start;margin-top:13px">${d.enabled?`<button class="button ghost compact" data-rename="${d.id}">Переименовать</button><button class="button ghost compact" data-delete="${d.id}">Отозвать</button>`:''}</div></div>`).join(''):'<p class="muted small">Устройства пока не добавлены.</p>';
 box.querySelectorAll('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id===b.dataset.rename),name=prompt('Новое название',d.name);if(!name)return;try{await api('devices/'+d.id,{method:'PATCH',body:JSON.stringify({name})});loadDevices()}catch(e){toast(e.message,true)}});
 box.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать VPN-доступ для этого устройства?'))return;try{await api('devices/'+b.dataset.delete,{method:'DELETE'});toast('Отзыв отправлен');loadDevices();await reload()}catch(e){toast(e.message,true)}});
@@ -4599,13 +4760,14 @@ async function createDevice(){const btn=$('#create-device');btn.disabled=true;bt
  try{const name=$('#dev-name').value.trim(),platform=$('#dev-platform').value;if(!name)throw new Error('Введите название устройства');
  const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:keys.publicKey})});
  const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
- currentConfig={name,conf};
- const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Сохраните конфигурацию прямо сейчас. Приватный ключ не отправлялся на сервер и не хранится в базе. При потере файла удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><div class="export-actions"><button id="share-conf" class="button compact">Сохранить на телефон</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">На Android выберите «Файлы» или локальное сохранение в системном меню. Не отправляйте конфигурацию в чаты и облако. Telegram может блокировать обычные загрузки — поэтому есть два способа.</p><p class="small muted" id="install-help"></p></div>`;
+ currentConfig={name,conf,deviceId:response.id,privateKey:keys.privateKey};
+ const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Ключ создан локально. При нажатии «Получить в Telegram» он однократно передаётся защищённому API и в ваш личный чат; сервер не сохраняет его в базе. При потере конфигурации удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><button id="send-conf-telegram" class="button">✉ Получить .conf в личный чат Telegram</button><p class="export-info">По вашему нажатию ключ отправляется боту по HTTPS, затем приходит личным документом в Telegram. Хранение файла в Telegram зависит от настроек и политики мессенджера.</p><div class="export-actions"><button id="share-conf" class="button secondary compact">Сохранить локально</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">Храните профиль как пароль. Не отправляйте файл посторонним. Для максимальной приватности выбирайте локальное сохранение.</p><p class="small muted" id="install-help"></p></div>`;
  $('#config-text').textContent=conf;
  const tips={android:'Android: установите WireGuard из Google Play или F-Droid, добавьте туннель из файла или QR-кода.',ios:'iPhone/iPad: установите WireGuard из App Store, откройте приложение и выберите «Создать туннель» → из файла или QR-кода.',windows:'Windows: установите официальный WireGuard с wireguard.com/install, затем «Import tunnel(s) from file».',macos:'macOS: установите WireGuard, выберите «Import tunnel(s) from file».',linux:'Linux: установите wireguard-tools, сохраните файл как /etc/wireguard/wg-still.conf (права 600) и запустите sudo wg-quick up wg-still.'};
  $('#install-help').textContent=(tips[platform]||'')+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
  if(window.QRCode){try{new QRCode($('#qr'),{text:conf,width:205,height:205,correctLevel:QRCode.CorrectLevel.L})}catch{$('#qr').textContent='QR слишком большой. Скачайте файл.'}}else $('#qr').textContent='QR не загрузился. Скачайте файл.';
  const confFilename='still-'+name.replace(/[^a-z0-9-_]/gi,'-')+'.conf';
+ $('#send-conf-telegram').onclick=async()=>{const b=$('#send-conf-telegram');if(!confirm('Отправить конфигурацию с приватным ключом в ваш личный Telegram-чат? Сервер не будет хранить ключ, но файл останется в Telegram.'))return;b.disabled=true;b.textContent='Отправляем в чат…';try{await api('devices/'+response.id+'/send-conf',{method:'POST',body:JSON.stringify({private_key:keys.privateKey})});toast('Файл отправлен в личный чат с ботом. Закройте Mini App, чтобы найти его.');b.textContent='✓ Файл отправлен в Telegram'}catch(e){toast(e.message,true);b.disabled=false;b.textContent='✉ Получить .conf в личный чат Telegram'}};
  $('#download').onclick=()=>wireguardBlobDownload(conf,confFilename);
  $('#share-conf').onclick=()=>saveWireguardConf(conf,confFilename);
  $('#copy-conf').onclick=async()=>{try{await navigator.clipboard.writeText(conf);toast('Конфигурация скопирована')}catch{toast('Буфер обмена недоступен',true)}};
