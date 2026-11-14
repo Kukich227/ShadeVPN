@@ -146,7 +146,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse, unquote, quote
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -161,6 +161,7 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "/app/data")).expanduser()
 DATABASE_PATH = pathlib.Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "shade.db"))).expanduser()
+BOT_META_STATE_PATH = DATA_DIR / "bot_profile_state.json"
 if MODE == "app" and not DATABASE_URL:
     # Bothost mounts /app/data as a persistent volume. Never keep the DB in /app root.
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -604,6 +605,7 @@ if MODE == "app":
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from aiogram import Bot, Dispatcher, Router, F
     from aiogram.filters import Command, CommandStart
+    from aiogram.exceptions import TelegramRetryAfter
     from aiogram.types import (
         Message, CallbackQuery, PreCheckoutQuery, WebAppInfo,
         InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
@@ -612,6 +614,68 @@ if MODE == "app":
     from cryptography.fernet import Fernet
     from html import escape as html_escape
     import httpx
+
+    def _read_bot_meta_state() -> dict[str, Any]:
+        try:
+            if BOT_META_STATE_PATH.exists():
+                data = json.loads(BOT_META_STATE_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            LOG.debug("Cannot read bot profile state", exc_info=True)
+        return {}
+
+    def _write_bot_meta_state(data: dict[str, Any]) -> None:
+        try:
+            BOT_META_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            BOT_META_STATE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            LOG.debug("Cannot write bot profile state", exc_info=True)
+
+    async def sync_bot_profile(bot: Bot) -> None:
+        desired = {
+            "name": "Still VPN",
+            "short_description": "Still VPN — управление подпиской и VPN-подключениями в Telegram.",
+            "description": (
+                "Still VPN: личный кабинет, подписки, устройства и безопасные "
+                "WireGuard-подключения. Откройте Mini App через /start. "
+                "Поддержка: /support."
+            ),
+        }
+        desired_hash = hashlib.sha256(
+            json.dumps(desired, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        state = _read_bot_meta_state()
+        now_ts = int(time.time())
+        if state.get("desired_hash") == desired_hash and now_ts < int(state.get("next_attempt_after", 0) or 0):
+            return
+        try:
+            await bot.set_my_name(name=desired["name"])
+            await bot.set_my_short_description(short_description=desired["short_description"])
+            await bot.set_my_description(description=desired["description"])
+            _write_bot_meta_state({
+                "desired_hash": desired_hash,
+                "updated_at": now_ts,
+                "next_attempt_after": now_ts + 86400,
+            })
+        except TelegramRetryAfter as exc:
+            retry_after = int(getattr(exc, "retry_after", 3600) or 3600)
+            LOG.warning(
+                "Telegram ограничил обновление имени/описания бота; повтор позже через %s сек.",
+                retry_after,
+            )
+            _write_bot_meta_state({
+                "desired_hash": desired_hash,
+                "updated_at": now_ts,
+                "next_attempt_after": now_ts + retry_after + 60,
+            })
+        except Exception as exc:
+            LOG.warning("Не удалось обновить имя/описание бота через Telegram: %s", exc)
+            _write_bot_meta_state({
+                "desired_hash": desired_hash,
+                "updated_at": now_ts,
+                "next_attempt_after": now_ts + 21600,
+            })
 
     class UTCDateTime(TypeDecorator):
         """UTC-aware timestamps for BOTH SQLite and PostgreSQL.
@@ -3768,6 +3832,14 @@ if MODE == "app":
     async def standalone_site():
         return HTMLResponse(STILL_WEB_HTML)
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(status_code=204)
+
+    @app.get("/site", response_class=HTMLResponse, include_in_schema=False)
+    async def standalone_site_alias():
+        return HTMLResponse(STILL_WEB_HTML)
+
     @app.get("/web/terms",response_class=HTMLResponse)
     async def standalone_terms():
         return HTMLResponse("""<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -3876,8 +3948,8 @@ if MODE == "app":
         if not BOT_TOKEN or not WEBAPP_URL.startswith("https://") or not engine or not OWNER_IDS or len(CODE_PEPPER) < 32:
             raise RuntimeError("Нужны BOT_TOKEN, HTTPS WEBAPP_URL, база SQLite/PostgreSQL, OWNER_IDS и CODE_PEPPER (>=32)")
         if ENABLE_PAYMENTS and not payments_ready():
-            LOG.error("Telegram Stars выключены: проверьте TERMS_URL (HTTPS), GIFT_FERNET_KEY и WG_AGENT_SECRET >=32; "
-                      "бот и VPN продолжат работать, новые счета запрещены")
+            LOG.warning("Telegram Stars сейчас недоступны: проверьте TERMS_URL (HTTPS), GIFT_FERNET_KEY и WG_AGENT_SECRET >=32; "
+                        "бот и VPN продолжат работать, новые счета запрещены")
         await initialize_db()
         # The website's Telegram button is resolved from Bot API or BOT_USERNAME.
         if not BOT_USERNAME["value"]:
@@ -3886,18 +3958,9 @@ if MODE == "app":
                 BOT_USERNAME["value"] = bot_profile.username or ""
             except Exception as exc:
                 LOG.warning("Cannot resolve bot username for site: %s", exc)
-        # Update the Telegram display name as well as the messages and Mini App.
+        # Update the Telegram display name carefully to avoid flood limits on every restart.
         # Bot API cannot change @username; that is managed separately in BotFather.
-        try:
-            await bot.set_my_name(name="Still VPN")
-            await bot.set_my_short_description(short_description="Still VPN — управление подпиской и VPN-подключениями в Telegram.")
-            await bot.set_my_description(description=(
-                "Still VPN: личный кабинет, подписки, устройства и безопасные "
-                "WireGuard-подключения. Откройте Mini App через /start. "
-                "Поддержка: /support."
-            ))
-        except Exception as exc:
-            LOG.warning("Не удалось обновить имя/описание бота через Telegram: %s", exc)
+        await sync_bot_profile(bot)
         await bot.set_my_commands([
             BotCommand(command="start", description="Открыть Still VPN"),
             BotCommand(command="profile", description="Профиль"),
