@@ -1,4 +1,4 @@
-"""STILL VPN v7 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
+"""STILL VPN v8 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -61,7 +61,7 @@ BotHost использует Python-зависимости из интерфей
 Дополнительные команды /admin -> «Команды управления».
 Сервис считает покупку подтверждённой ТОЛЬКО при successful_payment Telegram.
 
-STILL VPN WEB v7 (на BotHost, без Telegram):
+STILL VPN WEB v8 (на BotHost, без Telegram):
     Адрес: https://<домен-WEBAPP_URL>/web — один FastAPI процесс, одна SQLite.
     WEB_REGISTRATION_ENABLED=1  # самостоятельная регистрация логин/пароль (по умолчанию).
     BOT_USERNAME=<username без @>  # необязательно: бот попробует получить через Bot API.
@@ -75,7 +75,7 @@ STILL VPN WEB v7 (на BotHost, без Telegram):
     Без отдельного платёжного провайдера сайт не может принимать платные платежи.
     Требуется тестирование российских сетей без VPN и юридические документы.
 
-v7: /api/admin/users/{id}/trial/shorten доступен только Owner, требует причину,
+v8 (сохранена функция v7): /api/admin/users/{id}/trial/shorten доступен только Owner, требует причину,
     не продлевает срок, записывает Audit Log и синхронизирует доступ с агентом.
     В админке пользователя действия «До 5 минут» и «Завершить сейчас».
     Экспорт .conf: сначала локальное системное сохранение/передача файла,
@@ -83,9 +83,19 @@ v7: /api/admin/users/{id}/trial/shorten доступен только Owner, т�
     загрузку blob:-URL: полноценная гарантия скачивания невозможна без
     платформенной поддержки. Приватные клиентские ключи на сервер не отправляются.
 
-MINI APP АДМИНКА v7: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
+v8 — дизайн: новый редакционный сайт и Mini App, экраны «Наш сервер», «Поделиться», канал
+https://t.me/StillVPN_official (подписка не обязательна). /adm_start_photo — ответом
+на загруженное в бот фото, /adm_start_photo_off — удалить. /adm_log_test — проверить группу. /invite — ссылка.
+Логи регистраций, первых подключений, устройств, покупок, поддержки и действий админа
+в LOG_CHAT_ID=-1004452182801: добавить бота в закрытую группу с разрешением писать.
+Telegram ID, имя, фамилия и @username сохраняются, ключи/пароли в логи не попадают.
+/api/servers/public — публичная информация о сервере. PUBLIC_SERVER_COUNTRY=Нидерланды,
+PUBLIC_SERVER_PROVIDER=SKRIME. /build отдаёт релиз 8.0.0.
+Рефералы: только учёт приглашений, без автоматических бонусов за регистрацию.
+
+MINI APP АДМИНКА v8: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
 из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
-базу не удалять. Только v7 на BotHost, VPN-агент v4 на VPS остаётся совместимым.
+базу не удалять. Обновлять до v8 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
     python shade.py selftest                  — автономные тесты криптографических проверок
@@ -133,7 +143,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import parse_qsl, urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote, quote
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -184,6 +194,14 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
+RELEASE = "8.0.0"
+CHANNEL_URL = "https://t.me/StillVPN_official"
+PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
+PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
+try:
+    LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "-1004452182801"))
+except ValueError:
+    raise RuntimeError("LOG_CHAT_ID должен быть числовым Telegram chat id")
 WG_INTERFACE = os.getenv("WG_INTERFACE", "wg0")
 ENABLE_PAYMENTS = os.getenv("ENABLE_PAYMENTS", "0") == "1"
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
@@ -627,6 +645,7 @@ if MODE == "app":
         id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
         username: Mapped[str] = mapped_column(String(128), default="")
         first_name: Mapped[str] = mapped_column(String(200), default="")
+        last_name: Mapped[str] = mapped_column(String(200), default="")
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
         blocked: Mapped[bool] = mapped_column(Boolean, default=False)
         traffic_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -804,6 +823,24 @@ if MODE == "app":
         result: Mapped[str] = mapped_column(String(20), default="ok")
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
 
+    class ActivityEvent(Base):
+        """Durable, privacy-limited outbox for the owner's Telegram activity group."""
+        __tablename__ = "activity_events"
+        id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+        kind: Mapped[str] = mapped_column(String(64))
+        user_id: Mapped[int] = mapped_column(BigInteger)
+        details: Mapped[str] = mapped_column(String(700), default="")
+        created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+        sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+        attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+    class Referral(Base):
+        """Invite attribution only; no auto-bonuses, to avoid trial farming."""
+        __tablename__ = "referrals"
+        invitee_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+        inviter_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+        created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
     class WebAccount(Base):
         """Independent site account bound to a User (negative ID unless explicitly linked)."""
         __tablename__ = "web_accounts"
@@ -896,12 +933,15 @@ if MODE == "app":
         user = await s.get(User, uid)
         username = (tg.username if hasattr(tg, "username") else tg.get("username")) or ""
         first = (tg.first_name if hasattr(tg, "first_name") else tg.get("first_name")) or ""
+        last = (tg.last_name if hasattr(tg, "last_name") else tg.get("last_name")) or ""
         if not user:
-            user = User(id=uid, username=username[:128], first_name=first[:200])
+            user = User(id=uid, username=username[:128], first_name=first[:200], last_name=last[:200])
             s.add(user)
+            record_event(s, "registration_telegram", uid, "Новый пользователь Telegram")
         else:
             user.username = username[:128]
             user.first_name = first[:200]
+            user.last_name = last[:200]
         await s.flush()
         return user
 
@@ -916,8 +956,61 @@ if MODE == "app":
             role = await role_of(s, uid)
         return role in permitted
 
+    def record_event(s: AsyncSession, kind: str, user_id: int, details: str = "") -> None:
+        # Never include passwords, .conf/private keys, auth tokens, email, or traffic contents.
+        if LOG_CHAT_ID:
+            s.add(ActivityEvent(kind=kind[:64], user_id=int(user_id), details=details[:700]))
+
     def audit(s: AsyncSession, admin_id: int, action: str, target: Any, details: str = ""):
         s.add(Audit(admin_id=admin_id, action=action, target=str(target)[:140], details=details[:4000]))
+        record_event(s, "admin_" + action[:55], admin_id, "Цель: " + str(target)[:100] +
+                     (" · " + details[:190] if details else ""))
+
+    async def deliver_group_events() -> None:
+        """Committed event outbox: retries without holding DB connection over Telegram I/O."""
+        if not LOG_CHAT_ID or not bot:
+            return
+        async with Session() as s:
+            events = (await s.scalars(select(ActivityEvent).where(
+                ActivityEvent.sent_at.is_(None)
+            ).order_by(ActivityEvent.id).limit(25))).all()
+            outgoing = []
+            for evt in events:
+                user = await s.get(User, evt.user_id)
+                if user:
+                    full_name = html_escape((user.first_name + " " + user.last_name).strip() or "Имя не указано")
+                    username = "@" + html_escape(user.username) if user.username and not user.username.startswith("web:") else "без @username"
+                    if user.id > 0:
+                        identity = f'<a href="tg://user?id={user.id}">{full_name}</a> · {username}'
+                    else:
+                        identity = f"{full_name} · сайт (без Telegram)"
+                else:
+                    identity = "Пользователь неизвестен"
+                text = (f"<b>STILL / {html_escape(evt.kind.replace('_', ' ').upper())}</b>\n"
+                        f"👤 {identity}\n🆔 <code>{evt.user_id}</code>\n"
+                        f"🕒 {evt.created_at:%d.%m.%Y %H:%M} UTC"
+                        + ("\n📝 " + html_escape(evt.details) if evt.details else ""))
+                outgoing.append((evt.id, text))
+        for event_id, text in outgoing:
+            try:
+                await bot.send_message(LOG_CHAT_ID, text, parse_mode="HTML",
+                                       disable_web_page_preview=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                async with Session.begin() as s:
+                    evt = await s.get(ActivityEvent, event_id)
+                    if evt: evt.attempts += 1
+                LOG.warning("Activity group delivery failed (chat %s, event %s): %s",
+                            LOG_CHAT_ID, event_id, str(exc)[:180])
+                break
+            async with Session.begin() as s:
+                evt = await s.get(ActivityEvent, event_id)
+                if evt and evt.sent_at is None:
+                    evt.sent_at = now()
+        async with Session.begin() as s:
+            await s.execute(delete(ActivityEvent).where(
+                ActivityEvent.sent_at < now() - timedelta(days=30)))
 
     async def setting(s: AsyncSession, key: str, default: str) -> str:
         item = await s.get(Setting, key)
@@ -957,6 +1050,8 @@ if MODE == "app":
                            traffic_bytes=traffic, baseline_bytes=user.traffic_bytes if end <= now() else None,
                            source=source, payment_id=payment_id)
         s.add(sub)
+        record_event(s, "subscription_issued", user.id,
+                     f"Источник: {source} · {name} · {days} дней · {devices} устройств")
         await s.flush()
         return sub
 
@@ -985,7 +1080,9 @@ if MODE == "app":
         else:
             from sqlalchemy.dialects.postgresql import insert
         stmt = insert(Notice).values(user_id=uid, kind=kind, ref=ref, text=text, sent=False)
-        await s.execute(stmt.on_conflict_do_nothing(index_elements=["user_id", "kind", "ref"]))
+        result = await s.execute(stmt.on_conflict_do_nothing(index_elements=["user_id", "kind", "ref"]))
+        if result.rowcount and kind in ("trial_ended", "expired", "traffic_exhausted"):
+            record_event(s, kind, uid, "Серверное событие: " + text[:150])
 
     async def get_node(s: AsyncSession, node_id: int) -> ServerNode:
         node = await s.get(ServerNode, node_id)
@@ -1047,8 +1144,12 @@ if MODE == "app":
             if not should and not dev.provisioned:
                 continue
             try:
+                previously_active = bool(dev.provisioned)
                 await apply_peer(dev, node, should, granted["end"] if should else None)
                 dev.provisioned = should
+                if previously_active and not should:
+                    record_event(s, "vpn_access_ended", uid,
+                                 f"Доступ закрыт: {dev.name} · {dev.peer_ip}")
             except Exception as exc:
                 LOG.warning("Peer reconcile failed (%s): %s", dev.id, exc)
 
@@ -1070,7 +1171,16 @@ if MODE == "app":
                 dev.peer_rx, dev.peer_tx = rx, tx
                 hs = int(p.get("handshake") or 0)
                 if hs:
-                    dev.last_handshake = datetime.fromtimestamp(hs, UTC)
+                    latest = datetime.fromtimestamp(hs, UTC)
+                    if dev.last_handshake is None:
+                        record_event(s, "vpn_connected", dev.user_id,
+                                     f"Первое WireGuard-соединение: {dev.name} · {dev.peer_ip}")
+                    elif (latest - dev.last_handshake).total_seconds() > 600:
+                        # A reconnect after a real gap, not normal WireGuard
+                        # key re-handshakes during an uninterrupted session.
+                        record_event(s, "vpn_reconnected", dev.user_id,
+                                     f"Снова подключился: {dev.name} · {dev.peer_ip}")
+                    dev.last_handshake = latest
                 # Presence on the VPN server is independent of the local desired state.
                 # This is essential to detect/revoke stale peers for blocked users.
                 dev.provisioned = True
@@ -1165,7 +1275,9 @@ if MODE == "app":
             unsent = (await s.scalars(select(Notice).where(Notice.sent.is_(False)).order_by(Notice.id).limit(40))).all()
             for n in unsent:
                 try:
-                    await bot.send_message(n.user_id, n.text)
+                    notice_msg = ("<b>✦ STILL / УВЕДОМЛЕНИЕ</b>\n"
+                                  "━━━━━━━━━━━━━━━━━━\n\n" + html_escape(n.text))
+                    await bot.send_message(n.user_id, notice_msg, parse_mode="HTML")
                     n.sent = True
                     await s.commit()
                 except Exception:
@@ -1196,6 +1308,7 @@ if MODE == "app":
         while True:
             try:
                 await locked_background()
+                await deliver_group_events()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1208,6 +1321,7 @@ if MODE == "app":
             # New database: create_all installs the complete schema. Existing databases:
             # add only missing columns, with the appropriate syntax per SQL dialect.
             migration_columns = {
+                "users": {"last_name": "VARCHAR(200) NOT NULL DEFAULT ''"},
                 "payments": {
                     "promo_id": "INTEGER REFERENCES promos(id)",
                     "refunded_at": "TIMESTAMP",
@@ -1262,16 +1376,22 @@ if MODE == "app":
         # Keep navigation parameters separate from Telegram auth initData.
         return WEBAPP_URL + "/?tab=" + section
 
+    def invite_link(uid: int) -> str:
+        username = BOT_USERNAME["value"] or "StillVPNapp_bot"
+        return f"https://t.me/{username}?start=ref_{uid}"
+
     def user_menu(admin: bool = False) -> InlineKeyboardMarkup:
         links = [
-            [InlineKeyboardButton(text="Открыть Still VPN", web_app=WebAppInfo(url=mini_url()))],
-            [InlineKeyboardButton(text="Тарифы", web_app=WebAppInfo(url=mini_url("plans"))),
-             InlineKeyboardButton(text="Профиль", web_app=WebAppInfo(url=mini_url("account")))],
-            [InlineKeyboardButton(text="Подключение", web_app=WebAppInfo(url=mini_url("connect"))),
-             InlineKeyboardButton(text="Поддержка", callback_data="user:support")],
+            [InlineKeyboardButton(text="✦ Открыть Mini App", web_app=WebAppInfo(url=mini_url()))],
+            [InlineKeyboardButton(text="◈ Тарифы", web_app=WebAppInfo(url=mini_url("plans"))),
+             InlineKeyboardButton(text="⌁ Подключить", web_app=WebAppInfo(url=mini_url("connect")))],
+            [InlineKeyboardButton(text="🌐 Перейти на сайт", url=WEBAPP_URL + "/web"),
+             InlineKeyboardButton(text="↗ Поделиться", callback_data="user:share")],
+            [InlineKeyboardButton(text="📣 Наш канал · необязательно", url=CHANNEL_URL),
+             InlineKeyboardButton(text="✉ Поддержка", callback_data="user:support")],
         ]
         if admin:
-            links.append([InlineKeyboardButton(text="Панель управления", web_app=WebAppInfo(url=mini_url("admin")))])
+            links.append([InlineKeyboardButton(text="⚙ Панель управления", web_app=WebAppInfo(url=mini_url("admin")))])
         return InlineKeyboardMarkup(inline_keyboard=links)
 
     async def send_user_menu(message: Message, focus: str = "home") -> None:
@@ -1280,22 +1400,133 @@ if MODE == "app":
         async with Session.begin() as s:
             await upsert_user(s, message.from_user)
             role = await role_of(s, message.from_user.id)
+            banner = await setting(s, "start_photo_file_id", "")
         name = html_escape(message.from_user.first_name or "друг")
         if focus == "home":
-            text_msg = (f"<b>STILL VPN</b>  ·  PRIVATE NETWORK\n\n"
-                        f"Привет, {name}.\n"
-                        "Ваше подключение, устройства и подписка — в одном месте.\n\n"
-                        "<b>Откройте приложение</b>, чтобы проверить доступ или настроить VPN.\n"
-                        "Если нужна помощь, напишите /support.")
+            text_msg = (
+                "<b>STILL VPN</b>  /  PRIVATE NETWORK\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                f"Привет, <b>{name}</b>! 👋\n\n"
+                "<b>Один VPN — для всего интернета.</b>\n"
+                "Подключай устройства, следи за трафиком и управляй подпиской без лишних шагов.\n\n"
+                "🌍 <b>Сервер:</b> Нидерланды\n"
+                "🔐 <b>Протокол:</b> WireGuard\n\n"
+                "<i>Новости и обновления — в нашем канале. Подписка добровольная.</i>"
+            )
         else:
-            names = {"plans": "Тарифы и подписка", "account": "Ваш профиль", "connect": "Подключение"}
-            text_msg = (f"<b>{names.get(focus, 'Still VPN')}</b>\n\n"
-                        "Выберите раздел ниже. Все изменения выполняются в защищённом Mini App.")
-        await message.answer(text_msg, parse_mode="HTML", reply_markup=user_menu(bool(role)))
+            names = {"plans": "Тарифы и подписка", "account": "Личный кабинет", "connect": "Подключение"}
+            text_msg = (f"<b>STILL / {names.get(focus, 'VPN')}</b>\n"
+                        "━━━━━━━━━━━━━━━━━━\n\n"
+                        "Открой раздел в Mini App или перейди на сайт. Все устройства и подписки привязаны к одному аккаунту.")
+        markup = user_menu(bool(role))
+        if focus == "home" and banner:
+            try:
+                await message.answer_photo(banner, caption=text_msg, parse_mode="HTML", reply_markup=markup)
+                return
+            except Exception as exc:
+                LOG.warning("START photo invalid; falling back to text: %s", str(exc)[:160])
+        await message.answer(text_msg, parse_mode="HTML", reply_markup=markup)
 
     @router.message(CommandStart())
     async def cmd_start(message: Message):
+        if not message.from_user or message.chat.type != "private":
+            return
+        # Attribution only on first registration. No rewards for self invites/trial farms.
+        match = re.fullmatch(r"/start(?:@\w+)?\s+ref_([1-9][0-9]{0,18})\s*", message.text or "")
+        if match:
+            inviter_id = int(match.group(1))
+            invitee_id = message.from_user.id
+            if inviter_id != invitee_id:
+                async with Session.begin() as s:
+                    existing = await s.get(User, invitee_id)
+                    inviter = await s.get(User, inviter_id)
+                    if existing is None and inviter is not None and inviter_id > 0:
+                        await upsert_user(s, message.from_user)
+                        s.add(Referral(invitee_id=invitee_id, inviter_id=inviter_id))
+                        record_event(s, "referral_joined", inviter_id,
+                                     f"Приглашён новый пользователь · ID {invitee_id}")
+        async with Session.begin() as s:
+            record_event(s, "bot_start", message.from_user.id, "Открыл /start в Telegram")
         await send_user_menu(message)
+
+    @router.message(Command("invite"))
+    async def cmd_invite(message: Message):
+        if not message.from_user or message.chat.type != "private": return
+        link = invite_link(message.from_user.id)
+        async with Session() as s:
+            count = await s.scalar(select(func.count()).select_from(Referral).where(
+                Referral.inviter_id == message.from_user.id)) or 0
+        await message.answer(
+            "<b>STILL / ПРИГЛАСИ ДРУГА</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"Твоя ссылка:\n<code>{html_escape(link)}</code>\n\n"
+            f"👥 Зарегистрировались по приглашению: <b>{count}</b>\n"
+            "<i>Пока без бонусных дней: так мы защищаем пробные доступы от накрутки.</i>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↗ Поделиться в Telegram",
+                                      url="https://t.me/share/url?url=" +
+                                          quote(link, safe='') +
+                                          "&text=Still%20VPN%20%E2%80%94%20%D0%BC%D0%BE%D0%B9%20VPN")]
+            ]))
+
+    @router.callback_query(F.data == "user:share")
+    async def user_share_callback(callback: CallbackQuery):
+        await callback.answer()
+        if callback.message and callback.from_user:
+            link = invite_link(callback.from_user.id)
+            await callback.message.answer(
+                "<b>Пригласи друга в Still VPN</b>\n\n"
+                "Отправь ссылку ниже — она привязана к твоему аккаунту.\n"
+                f"<code>{html_escape(link)}</code>", parse_mode="HTML")
+
+    @router.message(Command("adm_start_photo"))
+    async def adm_start_photo(message: Message):
+        if not message.from_user or message.chat.type != "private": return
+        if not await require_role(message.from_user.id, {"owner"}):
+            await message.answer("⛔ Только владелец может менять приветственную картинку.")
+            return
+        source = (message.reply_to_message if message.reply_to_message and
+                  message.reply_to_message.photo else message)
+        if not source.photo:
+            await message.answer("<b>Баннер /start</b>\n\n"
+                                 "1. Отправь боту картинку как <b>фото</b>.\n"
+                                 "2. Ответь на неё командой <code>/adm_start_photo</code>.\n\n"
+                                 "Или отправь фото с подписью <code>/adm_start_photo</code>.",
+                                 parse_mode="HTML")
+            return
+        file_id = source.photo[-1].file_id
+        async with Session.begin() as s:
+            row = await s.get(Setting, "start_photo_file_id")
+            if row: row.value = file_id
+            else: s.add(Setting(key="start_photo_file_id", value=file_id))
+            audit(s, message.from_user.id, "start_photo_set", "welcome", "Баннер /start обновлён")
+        await message.answer("✅ Картинка установлена. Напиши /start, чтобы увидеть её.")
+
+    @router.message(Command("adm_start_photo_off"))
+    async def adm_start_photo_off(message: Message):
+        if not message.from_user or message.chat.type != "private": return
+        if not await require_role(message.from_user.id, {"owner"}): return
+        async with Session.begin() as s:
+            row = await s.get(Setting, "start_photo_file_id")
+            if row: await s.delete(row)
+            audit(s, message.from_user.id, "start_photo_remove", "welcome")
+        await message.answer("✅ Приветственная картинка убрана. /start снова отправляет текст.")
+
+    @router.message(Command("adm_log_test"))
+    async def adm_log_test(message: Message):
+        if not message.from_user or message.chat.type != "private": return
+        if not await require_role(message.from_user.id, {"owner"}): return
+        async with Session.begin() as s:
+            record_event(s, "test_delivery", message.from_user.id,
+                         "Проверка доставки в закрытую служебную группу")
+        await deliver_group_events()
+        async with Session() as s:
+            pending = await s.scalar(select(func.count()).select_from(ActivityEvent).where(
+                ActivityEvent.sent_at.is_(None))) or 0
+        await message.answer("<b>STILL / ЖУРНАЛ</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+                             f"Чат: <code>{LOG_CHAT_ID}</code>\n"
+                             f"Событий в очереди: <b>{pending}</b>\n\n"
+                             "Если тестового сообщения нет в группе, добавь бота и разреши ему отправлять сообщения. "
+                             "Повторная отправка запланирована автоматически.", parse_mode="HTML")
 
     @router.message(Command("profile"))
     async def cmd_profile(message: Message):
@@ -1321,7 +1552,7 @@ if MODE == "app":
     @router.message(Command("help"))
     async def cmd_help(message: Message):
         await message.answer(
-            "<b>Still VPN · помощь</b>\n\n"
+            "<b>STILL / НАВИГАЦИЯ</b>\n━━━━━━━━━━━━━━━━━━\n\n"
             "<b>Быстрые команды</b>\n"
             "/start — открыть приложение\n"
             "/profile — профиль\n"
@@ -1330,7 +1561,10 @@ if MODE == "app":
             "/support — написать в поддержку\n"
             "/terms — условия использования\n"
             "/linkweb — привязка к веб-кабинету\n"
-            "/paysupport — оплата и возвраты\n\n"
+            "/paysupport — оплата и возвраты\n"
+            "/invite — пригласить друга\n\n"
+            f'🌐 <a href="{html_escape(WEBAPP_URL)}/web">Сайт Still VPN</a>\n'
+            f'📣 <a href="{CHANNEL_URL}">Новости и обновления</a>\n\n'
             "<i>Управление подпиской, QR-коды и VPN-конфигурации доступны в Mini App.</i>",
             parse_mode="HTML", reply_markup=user_menu(False))
 
@@ -1362,6 +1596,7 @@ if MODE == "app":
                 t = Ticket(user_id=user.id)
                 s.add(t)
                 await s.flush()
+                record_event(s, "ticket_opened", user.id, f"Бот · обращение #{t.id}")
             ticket_id = t.id
         await message.answer(f"<b>Обращение #{ticket_id}</b>\n\nОпишите вашу проблему одним сообщением. "
                              "Ответ придёт здесь, в Telegram.\n\n"
@@ -1444,9 +1679,14 @@ if MODE == "app":
                            traffic_bytes=payment.traffic_bytes, expires_at=now() + timedelta(days=90)))
             await queue_notice(s, user.id, "paid", payment.id, "✅ Оплата Still VPN подтверждена. " +
                                ("Подарок создан — заберите код в Mini App → Подарки." if payment.kind == "gift" else "Подписка активирована/продлена."))
+            record_event(s, "stars_paid", user.id,
+                         f"{payment.kind} · {payment.plan_title} · {payment.amount} Stars · заказ {payment.id}")
             newly_paid = True
         if newly_paid:
-            await message.answer("✅ Оплата подтверждена! Откройте Still VPN.")
+            await message.answer("<b>✦ STILL / ОПЛАТА ПРИНЯТА</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+                                 "Спасибо! Оплата подтверждена сервером Telegram.\n"
+                                 "Твоя подписка готова в Mini App. ✨", parse_mode="HTML",
+                                 reply_markup=user_menu(False))
 
     ADMIN_ROLES = {"owner", "administrator", "support", "finance", "viewer"}
     WRITERS = {"owner", "administrator"}
@@ -1540,6 +1780,10 @@ if MODE == "app":
         "/adm_maintenance ТЕКСТ — уведомить всех о работах (owner)\n"
         "/adm_trial_config ЧАСЫ ГБ УСТРОЙСТВА — настройка пробного доступа\n"
         "/adm_notice_hours 72 24 3 — часы уведомлений о завершении\n"
+        "/adm_start_photo — ответьте на фото командой, чтобы поставить баннер /start (owner)\n"
+        "/adm_start_photo_off — убрать баннер (owner)\n"
+        "/adm_log_test — проверить доставку событий в группу (owner)\n"
+        "/invite — своя реферальная ссылка\n"
         "/adm_plan_edit ID ДНИ STARS УСТРОЙСТВА ГБ Название — изменить будущие продажи\n"
         "/adm_find username — поиск\n"
         "/adm_ticket ID — история обращения\n"
@@ -1562,7 +1806,9 @@ if MODE == "app":
                 txt = f"STILL · Поддержка\nОткрытых обращений: {tickets}\nИспользуйте кнопки и /adm_reply."
             else:
                 txt = "STILL · Доступ по роли " + str(role)
-        await message.answer(txt, reply_markup=admin_keyboard(role))
+        await message.answer("<b>STILL / АДМИН-ПАНЕЛЬ</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+                             + "<pre>" + html_escape(txt[:3700]) + "</pre>",
+                             parse_mode="HTML", reply_markup=admin_keyboard(role))
 
     @router.callback_query(F.data.startswith("adm:"))
     async def admin_callback(callback: CallbackQuery):
@@ -1594,7 +1840,9 @@ if MODE == "app":
                 txt = "VPN-серверы:\n" + "\n".join(f"#{x.id} {x.location} ({x.endpoint}) {'✅' if x.enabled else '⛔'}" for x in nodes)
             else:
                 txt = ADMIN_HELP
-        await callback.message.answer(txt[:4000])
+        await callback.message.answer("<b>STILL / " + html_escape(action.upper()) + "</b>\n"
+                                      "━━━━━━━━━━━━━━━━━━\n\n<pre>" +
+                                      html_escape(txt[:3600]) + "</pre>", parse_mode="HTML")
         await callback.answer()
 
     @router.message(Command("adm_user"))
@@ -2234,12 +2482,12 @@ if MODE == "app":
             t = await s.scalar(select(Ticket).where(Ticket.user_id == message.from_user.id,
                                                       Ticket.status == "open").order_by(Ticket.id.desc()))
             if not t:
-                txt = "Для обращения в поддержку отправьте /support. Для управления VPN откройте /start."
+                txt = "✉ STILL / ПОДДЕРЖКА\n\nДля обращения в поддержку отправьте /support. Для управления VPN откройте /start."
             else:
                 s.add(TicketMessage(ticket_id=t.id, sender="user", text=(message.text or "")[:4000]))
                 assigned_admin = t.assigned_admin
                 ticket_id = t.id
-                txt = f"Сообщение добавлено в обращение #{t.id}."
+                txt = f"✉ STILL / ОБРАЩЕНИЕ #{t.id}\n\nТвоё сообщение передано поддержке. Ответ придёт сюда."
         await message.answer(txt)
         if 'assigned_admin' in locals() and assigned_admin:
             try: await bot.send_message(assigned_admin,
@@ -2268,8 +2516,12 @@ if MODE == "app":
         user = await s.get(User, uid)
         if not user:
             bad(403, "Сначала отправьте боту /start")
+        # Telegram initData is verified. Keep displayed identity current, including surname.
         if user.blocked:
             bad(403, "Аккаунт заблокирован. Обратитесь в поддержку.")
+        user.username = (person.get("username") or "")[:128]
+        user.first_name = (person.get("first_name") or "")[:200]
+        user.last_name = (person.get("last_name") or "")[:200]
         # `get()` begins an implicit transaction. End it before write endpoints use s.begin().
         await s.commit()
         return user
@@ -2311,7 +2563,41 @@ if MODE == "app":
     async def health():
         async with Session() as check:
             await check.execute(text("SELECT 1"))
-        return {"status": "ok", "component": "shade-app", "database": "ok"}
+        return {"status": "ok", "component": "still-app", "database": "ok", "release": RELEASE}
+
+    @app.get("/build")
+    async def build_info():
+        return {"release": RELEASE, "site": "/web", "mini_app": "/",
+                "agent": "совместимо с WireGuard-агентом v4"}
+
+    async def server_public_data(s: AsyncSession) -> list[dict]:
+        nodes = (await s.scalars(select(ServerNode).where(
+            ServerNode.enabled.is_(True)).order_by(ServerNode.id).limit(12))).all()
+        result = []
+        for n in nodes:
+            h = await s.get(NodeHealth, n.id)
+            healthy = bool(h and h.last_seen and h.last_seen > now() - timedelta(minutes=3)
+                           and not h.error)
+            loc = n.location if n.location and n.location.lower() not in ("primary", "main") else PUBLIC_SERVER_COUNTRY
+            result.append({"id": n.id, "location": loc,
+                           "country": PUBLIC_SERVER_COUNTRY if n.id == 1 else loc,
+                           "provider": PUBLIC_SERVER_PROVIDER if n.id == 1 else "VPN-узел",
+                           "protocol": "WireGuard", "status": "online" if healthy else "checking"})
+        return result
+
+    @app.get("/api/servers/public")
+    async def public_servers(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        return await server_public_data(s)
+
+    @app.get("/api/referrals")
+    async def referral_summary(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        count = await s.scalar(select(func.count()).select_from(Referral).where(
+            Referral.inviter_id == user.id)) or 0
+        paid = await s.scalar(select(func.count(func.distinct(Referral.invitee_id))).select_from(Referral).join(
+            Payment, Payment.user_id == Referral.invitee_id).where(
+            Referral.inviter_id == user.id, Payment.status == "paid", Payment.kind == "subscription")) or 0
+        return {"link": invite_link(user.id) if user.id > 0 else None,
+                "registered": count, "paid": paid, "rewards_enabled": False}
 
     @app.get("/api/me")
     async def api_me(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
@@ -2330,7 +2616,8 @@ if MODE == "app":
                 "device_count": count, "trial_used": tr is not None,
                 "subscription": e and {**e, "end": e["end"].isoformat()},
                 "payments_enabled": payments_ready(),
-                "admin_role": await role_of(s, user.id)}
+                "admin_role": await role_of(s, user.id), "release": RELEASE,
+                "site_url": WEBAPP_URL + "/web", "channel_url": CHANNEL_URL}
 
     @app.get("/api/plans")
     async def api_plans(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
@@ -2360,6 +2647,7 @@ if MODE == "app":
                       baseline_bytes=u.traffic_bytes, traffic_bytes=gb * 1024**3 if gb else None,
                       devices=max_devices)
             s.add(t)
+            record_event(s, "trial_started", u.id, f"Пробник: {hours} ч · {gb} ГБ · {max_devices} устройств")
             await queue_notice(s, u.id, "trial", str(u.id), f"Пробный Still VPN активирован на {hours} ч.")
         return {"ok": True}
 
@@ -2527,6 +2815,8 @@ if MODE == "app":
             d = Device(id=str(uuid.uuid4()), user_id=u.id, server_id=node.id, name=data.name,
                        platform=data.platform, public_key=data.public_key, peer_ip=peer_ip)
             s.add(d)
+            record_event(s, "device_created", u.id,
+                         f"{d.name} · {d.platform} · {peer_ip} · сервер #{node.id}")
             await s.flush()
             response = {"id": d.id, "address": peer_ip + "/32", "dns": "1.1.1.1",
                         "server_key": node.public_key, "endpoint": node.endpoint,
@@ -2547,6 +2837,7 @@ if MODE == "app":
             d = await s.get(Device, device_id)
             if not d or d.user_id != user.id: bad(404, "Устройство не найдено")
             d.enabled = False
+            record_event(s, "device_revoked", user.id, f"{d.name} · {d.peer_ip}")
             node = await s.get(ServerNode, d.server_id)
         try:
             await apply_peer(d, node, False)
@@ -3100,7 +3391,10 @@ if MODE == "app":
                 "registration_enabled": WEB_REGISTRATION_ENABLED,
                 "trial_enabled": WEB_TRIAL_ENABLED,
                 "email_enabled": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")),
-                "terms_url": TERMS_URL if TERMS_URL.startswith("https://") else "/web/terms"}
+                "terms_url": TERMS_URL if TERMS_URL.startswith("https://") else "/web/terms",
+                "channel_url": CHANNEL_URL, "release": RELEASE,
+                "servers": [{"country": PUBLIC_SERVER_COUNTRY,
+                             "provider": PUBLIC_SERVER_PROVIDER, "protocol": "WireGuard"}]}
 
     @app.post("/web/api/register")
     async def web_register(data: WebRegistration, req: Request):
@@ -3125,6 +3419,7 @@ if MODE == "app":
                 while await s.get(User, uid):
                     uid = - (secrets.randbelow(2**60) + 1)
                 s.add(User(id=uid, username="web:" + login, first_name=login))
+                record_event(s, "registration_web", uid, "Регистрация на отдельном сайте · логин " + login)
                 salt = secrets.token_hex(16)
                 recovery = "STILL-" + secrets.token_urlsafe(24)
                 account = WebAccount(user_id=uid, login=login, password_salt=salt,
@@ -3168,6 +3463,7 @@ if MODE == "app":
                     denied = True
                 else:
                     token, csrf = await make_web_session(s, account)
+                    record_event(s, "web_login", user.id, "Успешный вход на сайт")
         if denied: bad(401, "Неверный логин или пароль, либо вход временно ограничен")
         return web_session_response({"ok": True, "csrf": csrf}, token)
 
@@ -3444,6 +3740,7 @@ if MODE == "app":
             if open_count >= 3: bad(429,"У вас уже три открытых обращения")
             t=Ticket(user_id=identity[0].id)
             s.add(t);await s.flush()
+            record_event(s, "ticket_opened", identity[0].id, f"Сайт · обращение #{t.id}")
             s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
             ticket_id=t.id
         return {"ok":True,"id":ticket_id}
@@ -3478,6 +3775,8 @@ if MODE == "app":
 <h1>Still VPN — условия тестирования</h1>
 <p>Сервис находится на этапе тестирования. VPN не гарантирует абсолютную анонимность, доступность всех сайтов или непрерывность соединения.</p>
 <p>Для работы сайта хранятся логин, хеш пароля, случайный идентификатор сессии, параметры подписки, устройства и счётчики трафика WireGuard. Содержание пользовательского трафика этим приложением не сохраняется.</p>
+<p>Для технического учёта владельцам в закрытой служебной группе Telegram могут отправляться уведомления о регистрации, подключениях устройств, оплатах и действиях администраторов с именем, @username и Telegram ID пользователя. Приватные VPN-ключи, пароли и тексты пользовательского трафика в группу не передаются.</p>
+<p>Подписка на информационный канал Still VPN добровольная.</p>
 <p>Пользователь обязан соблюдать применимое законодательство. Пробный доступ может быть ограничен и отозван при злоупотреблении.</p>
 <p>Покупка подписок на этом веб-сайте не реализована. Для платного коммерческого запуска требуются отдельные юридические документы с данными владельца сервиса, условиями возврата и контактами.</p>
 <a style='color:#c3a1d5' href='/web'>Вернуться в Still VPN</a></body></html>""")
@@ -3605,9 +3904,10 @@ if MODE == "app":
             BotCommand(command="plans", description="Тарифы"),
             BotCommand(command="connect", description="Подключение"),
             BotCommand(command="support", description="Поддержка"),
-            BotCommand(command="help", description="Помощь"),
+            BotCommand(command="help", description="Помощь и ссылки"),
             BotCommand(command="terms", description="Условия"),
             BotCommand(command="linkweb", description="Связать аккаунт с сайтом"),
+            BotCommand(command="invite", description="Пригласить друга"),
         ])
         tasks = [asyncio.create_task(dp.start_polling(bot)), asyncio.create_task(periodic_worker())]
         try:
@@ -3816,7 +4116,7 @@ else:
 # All data comes from the authenticated API; no fake subscriptions or statistics.
 STILL_WEB_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#100D11">
-<title>Still VPN — личный кабинет</title>
+<title>Still VPN — тишина в интерфейсе, свобода в сети</title><meta name="still-release" content="8.0.0">
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
 *{box-sizing:border-box}html{scroll-behavior:smooth}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink)}
@@ -3885,17 +4185,32 @@ h1{font-weight:570;letter-spacing:-.065em;line-height:1.03}
 @media(max-width:780px){.intro{grid-template-columns:1fr;gap:25px;padding-top:4px}.intro-copy{padding-top:9px}.intro-art{min-height:unset;padding:23px}.workflow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:18px 0}.workflow li{display:block;padding:10px 0;border:0}.workflow strong{font-size:13px}.workflow small{font-size:11px}.step-no{display:block;margin-bottom:9px}.intro-list{grid-template-columns:1fr}.intro-list div{border-right:0;border-bottom:1px solid var(--line);padding:10px 0}.intro-list div:last-child{border:0}}
 @media(max-width:520px){.shell{padding-top:24px}.intro h1{font-size:clamp(39px,11.8vw,56px)}.intro .lead{font-size:14px;line-height:1.7}.workflow{grid-template-columns:1fr}.workflow li{display:grid;grid-template-columns:29px 1fr;border-bottom:1px solid #382b35}.intro-art{padding:17px}.intro-list{gap:0}.intro-footnote{font-size:10px}.auth-shell{margin-top:52px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+/* STILL / EDITION 08: high-contrast editorial cover, diagrammatic connection board. */
+:root{--bg:#121217;--panel:#1c171e;--red:#792c43;--ink:#f4f0e8;--muted:#aa9caa;--line:rgba(242,233,231,.17)}
+body{background:var(--bg)}header{height:77px}a.subtle-link{color:#ce9bb0;text-decoration:underline;text-underline-offset:4px}
+.intro{align-items:stretch;grid-template-columns:minmax(0,1.12fr) minmax(270px,.78fr);min-height:570px;gap:0;padding:0;border:1px solid #4e3941;background:#eae3d7;color:#18171a;overflow:hidden;border-radius:0}
+.intro-copy{padding:53px 5vw 42px 44px}.intro .kicker{color:#69283e}.intro h1{color:#1b1a1d;font-size:clamp(45px,5.6vw,82px);margin:29px 0}.intro h1 em{color:#7c2a46}.intro .lead{color:#5a5359;font-size:16px;line-height:1.73;max-width:520px}
+.intro .cta{background:#75293f;border-color:#75293f;color:white}.intro .cta.outline{background:transparent;color:#2b242a;border-color:#766771}.intro .cta.outline:hover{background:#ded3c5;color:#2b242a}
+.hero-small-meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:42px;padding-top:18px;border-top:1px solid #cbbdb3;font-size:10px;letter-spacing:.07em;color:#6b5c64}.hero-small-meta span:not(:last-child){border-right:1px solid #b9aeb0;padding-right:14px}
+.intro-art{border:0;border-left:1px solid #4f3743;border-radius:0;padding:33px 30px 26px;min-height:0;background:#1a1720;color:#f7eee9;display:flex;flex-direction:column;justify-content:space-between}
+.intro-art .micro{color:#d2afb9}.route-visual{margin:57px 0 40px}.route-start{font:11px ui-monospace,monospace;letter-spacing:.13em;color:#d4b6c3}.route-line{display:block;height:130px;margin:23px 0 20px 21px;border-left:1px solid #986879;position:relative}.route-line:before,.route-line:after{content:"";position:absolute;width:8px;height:8px;border:2px solid #e6cbb7;border-radius:50%;left:-5px;top:-2px;background:#1a1720}.route-line:after{top:auto;bottom:-2px;background:#b56d7d}.route-line i{position:absolute;left:-3px;top:48%;width:5px;height:5px;background:#efdbbe;border-radius:50%}.route-end{font-size:72px;line-height:.92;letter-spacing:-.07em;font-weight:630;color:#f4eee3;display:block}.route-end small{display:block;font-size:11px;letter-spacing:.16em;font-weight:500;margin-top:15px;color:#b9a7b2}
+.route-data{border-top:1px solid #4a3945;margin-top:15px}.route-data div{border-bottom:1px solid #4a3945;padding:15px 0;display:flex;gap:14px;justify-content:space-between;align-items:center}.route-data span{font-size:10px;letter-spacing:.12em;color:#9e8a9b}.route-data strong{font-size:12px;text-align:right;font-weight:570}.route-footer{padding-top:22px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#ab99a4}.route-footer b{color:#e2a6b8;letter-spacing:.1em}
+.intro-list{padding-top:33px;padding-bottom:28px}.intro-list strong{font-size:14px}.intro-list p{font-size:13px;line-height:1.65}.community-strip{margin:34px 0 72px;padding:19px 0;border-top:1px solid #65515b;border-bottom:1px solid #65515b;display:flex;gap:20px;align-items:center;flex-wrap:wrap}.community-strip span{display:flex;flex:1;min-width:190px;flex-direction:column;gap:6px}.community-strip b{font-size:12px;letter-spacing:.1em}.community-strip small{color:#aa9caa;font-size:12px}.community-strip a,.community-strip button{color:#f0cfdb;border:0;border-bottom:1px solid #8a586e;background:transparent;padding:7px 2px;font-size:13px;text-decoration:none;white-space:nowrap}
+@media(max-width:900px){.intro{grid-template-columns:minmax(0,1fr) minmax(240px,.7fr)}.intro-copy{padding:43px 25px}.intro-art{min-height:450px;padding:24px}.route-visual{margin:28px 0}.route-line{height:80px}}
+@media(max-width:740px){.intro{display:block}.intro h1{font-size:clamp(43px,10vw,70px)}.intro-art{display:block;min-height:auto}.route-visual{display:grid;grid-template-columns:1fr 40px 1fr;align-items:center;gap:15px;margin:24px 0}.route-start{font-size:10px}.route-line{height:1px;border:0;border-top:1px solid #986879;margin:0;position:relative}.route-line:before,.route-line:after{display:none}.route-end{font-size:41px}.route-end small{font-size:9px}.route-data{margin-top:18px}.route-data div{padding:10px 0}.intro-copy{padding:35px 21px}.hero-small-meta{margin-top:26px}}
+@media(max-width:520px){.topnav{gap:8px}.topnav a{font-size:12px}.intro-copy{padding:28px 21px}.intro h1{font-size:clamp(40px,10.6vw,53px)}.intro .lead{font-size:14px}.intro .buttons .cta{width:100%}.hero-small-meta{gap:8px;font-size:9px}.hero-small-meta span:not(:last-child){padding-right:8px}.route-visual{grid-template-columns:1fr 28px 1fr}.route-end{font-size:42px}.community-strip{align-items:flex-start}.community-strip span{min-width:100%;flex:auto}}
 </style></head>
 <body>
-<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#ab9ba7">VPN</span></a><span class="micro desktop">Quietly connected.</span><nav class="topnav"><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram-бот ↗</a></nav></header>
+<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#d7c6ce">VPN</span></a><span class="micro desktop">EUROPE / PRIVATE NETWORK</span><nav class="topnav"><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал ↗</a><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram ↗</a></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
-<section class="intro"><div class="intro-copy"><p class="kicker">STILL / PRIVATE NETWORK</p><h1>Интернет остаётся<br><em>на связи.</em></h1><p class="lead">Ваш VPN-кабинет без зависимости от Telegram. Отдельные ключи для устройств, ясные лимиты и управление доступом в одном месте.</p><div class="buttons"><button class="cta" id="intro-create">Создать аккаунт <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Уже есть аккаунт</button></div><p class="intro-footnote">WireGuard · защищённые ключи · вход из браузера</p></div><div class="intro-art"><div class="workflow-title"><span class="micro">КАК ЭТО РАБОТАЕТ</span><span class="workflow-tag">STILL / 01—03</span></div><ol class="workflow"><li><span class="step-no">01</span><div><strong>Создайте профиль</strong><small>В кабинете Still VPN</small></div></li><li><span class="step-no">02</span><div><strong>Сохраните .conf</strong><small>Локально на своём устройстве</small></div></li><li><span class="step-no">03</span><div><strong>Включите WireGuard</strong><small>Отдельный ключ для каждого устройства</small></div></li></ol><span class="workflow-bottom">НЕЗАВИСИМЫЙ ВХОД / HTTPS</span></div></section>
-<div class="intro-list"><div><strong>01 / Своё устройство</strong><p>Уникальная конфигурация для каждого устройства.</p></div><div><strong>02 / Прозрачные лимиты</strong><p>Управляйте доступом и наблюдайте расход трафика.</p></div><div><strong>03 / Второй вход</strong><p>Независимый вход в веб-кабинет по логину и паролю.</p></div></div>
+<section class="intro"><div class="intro-copy"><p class="kicker">STILL / VPN WITH INTENTION — 08</p><h1>Тише снаружи.<br><em>Свободнее внутри.</em></h1><p class="lead">Интернет для твоих привычных дел. Смотри, общайся, работай — VPN на WireGuard без сложных настроек и скрытых лимитов.</p><div class="buttons"><button class="cta" id="intro-create">Начать со Still VPN <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти в кабинет</button></div><div class="hero-small-meta"><span>01 / WireGuard</span><span>02 / Нидерланды</span><span>03 / Android · iOS · PC</span></div></div><div class="intro-art"><div class="workflow-title"><span class="micro">ВАШ МАРШРУТ</span><span class="workflow-tag">STILL / CONNECTION</span></div><div class="route-visual"><span class="route-start">УСТРОЙСТВО</span><span class="route-line"><i></i></span><span class="route-end">NL <small>НИДЕРЛАНДЫ</small></span></div><div class="route-data"><div><span>ПРОТОКОЛ</span><strong>WireGuard®</strong></div><div><span>УЗЕЛ</span><strong>Europe / NL</strong></div><div><span>НАСТРОЙКА</span><strong>Свой .conf для каждого устройства</strong></div></div><div class="route-footer"><span>Подключение на твоих условиях.</span><b>→ STILL</b></div></div></section>
+<div class="intro-list"><div><strong>01 / Приватное подключение</strong><p>Уникальный WireGuard-профиль для каждого устройства, без передачи приватного ключа серверу.</p></div><div><strong>02 / Всё под контролем</strong><p>Срок подписки, трафик и список подключений всегда в кабинете.</p></div><div><strong>03 / Свой путь</strong><p>Вход через Telegram или отдельно на сайте. <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer" class="subtle-link">Следить за обновлениями ↗</a></p></div></div><div class="community-strip"><span><b>НЕ ТОЛЬКО VPN</b><small>Новости, обновления и советы — в нашем Telegram-канале.</small></span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Читать канал ↗</a><button id="share-site" type="button">Поделиться Still VPN ↗</button></div>
 <section class="auth-shell" id="authorization" style="margin-top:80px"><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
 </div>
 <div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
-<footer><span>© Still VPN · Ваше подключение, ваши правила.</span><span><a href="/web/terms">Условия тестирования и данные</a> · <span id="footer-bot"></span></span></footer>
+<footer><span>© Still VPN · EDITION 08 · BUILT FOR EVERYDAY CONNECTION</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
 </main>
 <script>
 (()=>{'use strict';
@@ -3909,6 +4224,7 @@ async function api(path,options={}){const method=options.method||'GET';const r=a
 async function guestApi(path,body){const r=await fetch('/web/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let d;try{d=await r.json()}catch{throw Error('Не удалось прочитать ответ сервера')};if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Ошибка '+r.status);return d}
 function showAuth(mode='login'){authMode=mode;$('#authorization').scrollIntoView({behavior:'smooth'});$$('[data-auth]').forEach(b=>b.classList.toggle('active',b.dataset.auth===mode));$('#auth-title').textContent=({login:'Вход в Still VPN',register:'Создать аккаунт',recover:'Восстановление доступа'})[mode];$('#email-field').classList.toggle('hidden',mode!=='register');$('#recovery-field').classList.toggle('hidden',mode!=='recover');$('#agree-field').classList.toggle('hidden',mode!=='register');$('#password-label').textContent=mode==='login'?'Пароль':mode==='recover'?'Новый пароль':'Придумайте пароль';$('#password').minLength=mode==='login'?1:12;$('#password').autocomplete=mode==='login'?'current-password':'new-password';$('#auth-submit').textContent=({login:'Войти в аккаунт',register:'Зарегистрироваться',recover:'Восстановить пароль'})[mode];$('#auth-error').innerHTML='';$('#auth-hint').textContent=mode==='register'?'Используйте уникальный пароль от 12 символов. Email нужен для подтверждения пробного доступа.':'Никаких обязательных входов через Telegram.'}
 $$('[data-auth]').forEach(b=>b.onclick=()=>showAuth(b.dataset.auth));$('#intro-create').onclick=()=>showAuth('register');$('#intro-login').onclick=()=>showAuth('login');
+$('#share-site').onclick=async()=>{const url=location.origin+'/web';try{if(navigator.share){await navigator.share({title:'Still VPN',text:'VPN для повседневного интернета',url});return}await navigator.clipboard.writeText(url);toast('Ссылка на Still VPN скопирована')}catch(e){if(e?.name!=='AbortError')toast('Ссылка: '+url)}};
 function showMemberRecovery(code){
 const modal=document.createElement('div');modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);display:grid;place-items:center;z-index:1000;padding:22px';
 modal.innerHTML='<div style="width:min(100%,510px);padding:28px;background:#191217;border:1px solid #694052;border-radius:16px"><p class="kicker">БЕЗОПАСНОСТЬ</p><h2>Сохраните код восстановления</h2><p class="small muted">Код показывается только сейчас. Без него восстановить доступ при потере пароля невозможно.</p><div class="codebox" id="new-recovery-code"></div><div class="buttons"><button class="cta outline" id="recovery-copy">Скопировать</button><button class="cta" id="recovery-close">Я сохранил код</button></div></div>';
@@ -3981,7 +4297,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>STILL VPN</title>
+<title>STILL VPN / EDITION 08</title><meta name="still-release" content="8.0.0">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -4084,9 +4400,24 @@ body{font-feature-settings:"tnum" 1}
 #config-text{max-height:132px;overflow:auto;color:#c6b7c2}
 @media(max-width:370px){.export-actions{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* STILL / 08: cream signal cover, oxblood edge, no stock imagery or fake metrics. */
+:root{--bg:#0f1115;--soft:#181b20;--red:#78334a;--deep:#492631;--violet:#cba0ad;--ink:#f0eae3;--muted:#aaa6ac;--hair:rgba(240,234,227,.15);--signal:#d6a19b}
+body{background:var(--bg)}#app{padding-top:calc(env(safe-area-inset-top) + 19px)}
+.top{border-bottom:1px solid #514049;padding-bottom:19px;margin-bottom:27px}.wordmark{letter-spacing:.18em}.mark{background:#b56c7e}.mark:after{background:var(--bg)}
+.kicker{color:#d6a0ab;letter-spacing:.2em}h1{font-weight:590;letter-spacing:-.065em}.button{background:#8d4257;border-color:#9a4f64;color:white}.button.secondary{background:transparent;border-color:#55434d}.button.ghost{color:#dbc3c8}
+.hero{padding:25px 23px 24px;border:0;background:#ede6da;color:#19171b;border-radius:3px;margin-top:17px;position:relative}
+.hero:before{content:"";position:absolute;top:0;left:0;width:53px;height:4px;background:#8e3b54}.hero .small{color:#635b62}.hero .pill{border-color:#c3a8ad;color:#7c364d;background:transparent}.hero .dot{background:#873e56}.hero .big{color:#201b20;font-weight:650;font-size:clamp(31px,8vw,47px);line-height:1.08;margin:22px 0 9px}.hero .subline{color:#5b5358;font-size:13px}.hero-mark{display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid #d4c8bd;padding-bottom:18px}.hero-mark small{font-size:10px;letter-spacing:.17em;color:#6c5862}.hero-number{font-size:12px;letter-spacing:.12em;color:#895269}.hero .hero-foot{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #d4c8bd;margin-top:25px;padding-top:15px;font-size:11px;color:#6f666c}
+.quick-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:13px 0 26px}.quick-row button{padding:16px 10px;text-align:left;min-height:94px;border:1px solid #49404a;border-radius:4px;background:#1c1b21;color:#efe5e2}.quick-row button span{display:block;font-size:11px;color:#ba929b;letter-spacing:.1em;margin-bottom:17px}.quick-row button strong{font-size:15px;letter-spacing:-.03em;font-weight:590}
+.signal-card{border:1px solid #4a3c43;background:#17171c;margin:28px 0 16px;padding:20px 18px;border-radius:4px}.signal-card h2{font-size:25px;margin:5px 0 7px;font-weight:590}.signal-head{display:flex;gap:10px;align-items:center;justify-content:space-between}.signal-head .kicker{margin:0}.signal-country{font-size:14px;color:#e1d3d3}.signal-data{display:grid;grid-template-columns:1fr 1fr;gap:0 16px;margin-top:14px}.signal-data>div{border-top:1px solid #40373d;padding:14px 0}.signal-data span{display:block;font-size:10px;color:#a79da1;letter-spacing:.1em;text-transform:uppercase}.signal-data strong{font-size:14px;font-weight:560;display:block;margin-top:7px}.signal-live{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:#b3d6bc}.signal-live:before{content:"";display:block;width:6px;height:6px;border-radius:50%;background:#87b59c}.signal-live.wait{color:#d2b59e}.signal-live.wait:before{background:#d4ae7d}
+.community-box{margin:31px 0 20px;border-top:1px solid #55414b;border-bottom:1px solid #55414b;padding:21px 0}.community-box h2{margin:7px 0;font-weight:600}.community-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:19px}.community-actions button{border:1px solid #674354;background:#3c2631;color:#f5e2e8;padding:14px 10px;border-radius:5px;font-size:13px;font-weight:580}.community-actions button:nth-child(2){background:transparent;border-color:#4e4249;color:#e9dfe1}.community-actions button:nth-child(3){grid-column:span 2;background:#e7ded3;color:#272127;border-color:#e7ded3}
+.edition-footer{margin-top:29px;padding:19px 0 4px;border-top:1px solid var(--hair);font:10px ui-monospace,monospace;letter-spacing:.1em;color:#8c858c;display:flex;justify-content:space-between;gap:14px}.edition-footer a{color:#cfa8b8;text-decoration:none}
+.usage-track{height:5px;background:#322a30;overflow:hidden;border-radius:0}.usage-track span{display:block;background:#bd7388;height:100%}.usage-head{color:#c0b0b4}.status-rail{padding:15px 0;border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:14px}.status-rail b{font-size:13px;font-weight:560;text-align:right}
+.panel{border-radius:6px;background:#1a191e}.tabs{background:rgba(15,17,21,.96)}
+@media(max-width:380px){.community-actions{grid-template-columns:1fr}.community-actions button:nth-child(3){grid-column:span 1}.hero{padding:21px 17px}.signal-data{gap:0 9px}}
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
-<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">PRIVATE NETWORK</span></div><main id="main"><p class="muted">Загружаем Still VPN…</p></main></div>
+<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 08</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
 <nav class="tabs" id="tabs" aria-label="Разделы"></nav>
 <script>
 (()=>{
@@ -4111,17 +4442,33 @@ const section=(label,title,desc='')=>`<p class="kicker">${label}</p><h1>${title}
 function activeText(){if(!me.subscription)return 'Нет активной подписки';const ms=new Date(me.subscription.end)-Date.now();return ms>0?Math.ceil(ms/86400000)+' дн. осталось':'Срок действия истёк'}
 function render(){if(!me){main.innerHTML='<p class="muted">Подключение к Still VPN…</p>';return}
  if(page==='home')home(); else if(page==='plans')planPage(); else if(page==='connect')connectPage(); else if(page==='admin')adminPage(); else accountPage()}
+function openOutside(url){if(!url)return;try{if(tg?.openLink){tg.openLink(url);return}}catch(e){}window.open(url,'_blank','noopener,noreferrer')}
+function shareTelegram(url){if(!url)return;const href='https://t.me/share/url?url='+encodeURIComponent(url)+'&text='+encodeURIComponent('Still VPN — VPN для повседневного интернета.');try{if(tg?.openTelegramLink){tg.openTelegramLink(href);return}}catch(e){}window.open(href,'_blank','noopener,noreferrer')}
+async function miniServers(){try{const list=await api('servers/public');const box=$('#server-signal');if(page!=='home'||!box)return;
+if(!list.length){box.innerHTML='<p class="small muted">Нет доступных локаций. Проверяем работу сети.</p>';return}
+box.innerHTML=list.map(n=>`<div class="signal-data"><div><span>Регион</span><strong>${esc(n.country)}</strong></div><div><span>Провайдер</span><strong>${esc(n.provider)}</strong></div><div><span>Протокол</span><strong>${esc(n.protocol)}</strong></div><div><span>Состояние</span><strong class="signal-live ${n.status==='online'?'':'wait'}">${n.status==='online'?'Узел доступен':'Проверяем'}</strong></div></div>`).join('');
+}catch(e){const box=$('#server-signal');if(box&&page==='home')box.innerHTML='<p class="small muted">Не удалось получить актуальное состояние. Обновите страницу.</p>'}}
+async function miniReferrals(){try{const r=await api('referrals');const box=$('#ref-count');if(box&&page==='home')box.textContent=`${r.registered} приглашено · ${r.paid} купили`;const btn=$('#invite-share');if(btn&&r.link){btn.onclick=()=>shareTelegram(r.link)}}catch(e){}}
 function home(){const s=me.subscription;
-main.innerHTML=section('Личный кабинет',`Здравствуйте, ${esc(me.first_name||'друг')}.`,'Ваша приватная сеть под контролем.')+
-`<div class="hero"><div class="row"><span class="small muted">ВАШ ДОСТУП</span><span class="pill"><i class="dot"></i>${s?'Активен':'Неактивен'}</span></div>
-<div class="big">${s?esc(s.name):'Начните со Still VPN'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Активируйте пробный доступ или выберите подписку'}</div></div>
+main.innerHTML=section('STILL / ЛИЧНЫЙ КАБИНЕТ',`На связи, ${esc(me.first_name||'друг')}.`,'Твой интернет. Твои устройства. Твой ритм.')+
+`<div class="hero"><div class="hero-mark"><small>ВАШЕ ПОДКЛЮЧЕНИЕ</small><span class="pill"><i class="dot"></i>${s?'Доступ активен':'Нет доступа'}</span></div>
+<div class="big">${s?esc(s.name):'Начнём с подключения.'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Настройте пробный период или выберите подходящий тариф.'}</div><div class="hero-foot"><span>STILL / VPN</span><span class="hero-number">№ 08 — PRIVATE NETWORK</span></div></div>
+<div class="quick-row"><button id="quick-connect"><span>01 / УСТРОЙСТВА</span><strong>Подключить ↗</strong></button><button id="quick-plans"><span>02 / ПОДПИСКА</span><strong>Выбрать тариф ↗</strong></button></div>
 <div class="usage-head"><span>Трафик за период</span><strong>${s?gb(s.used)+' / '+gb(s.limit):'—'}</strong></div>
 ${s&&s.limit!==null&&s.limit>0?`<div class="usage-track" aria-label="Использовано трафика"><span style="width:${Math.min(100,Math.max(0,s.used/s.limit*100)).toFixed(1)}%"></span></div>`:''}
-<div class="status-rail"><span>Устройства</span><b>${me.device_count} из ${s?s.devices:'—'}</b></div>
-<div class="status-rail"><span>Состояние сети</span><b>${me.service?.responsive_nodes||0} из ${me.service?.enabled_nodes||0} серверов доступно</b></div>
-<div class="section"><button class="button" id="home-action">${s?'Настроить подключение':'Посмотреть тарифы'}</button></div>
-${!s&&!me.trial_used?'<div class="section"><button class="button secondary" id="trial">Активировать пробный доступ</button><p class="small muted">Один раз на аккаунт · параметры задаёт администрация</p></div>':''}`;
-$('#home-action').onclick=()=>nav(s?'connect':'plans');if($('#trial'))$('#trial').onclick=async()=>{try{await api('trial',{method:'POST'});toast('Пробный доступ активирован');await reload();nav('home')}catch(e){toast(e.message,true)}};
+<div class="status-rail"><span>Устройства</span><b>${me.device_count} / ${s?s.devices:'—'}</b></div>
+<div class="status-rail"><span>Работающие узлы</span><b>${me.service?.responsive_nodes||0} из ${me.service?.enabled_nodes||0}</b></div>
+${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать бесплатный пробный период</button><p class="small muted">Один раз на аккаунт. Длительность и объём — по настройкам сервиса.</p></div>':''}
+<div class="signal-card"><div class="signal-head"><p class="kicker">03 / СЕТЬ STILL</p><span class="signal-country">🇳🇱 NL</span></div><h2>Где находится сервер?</h2><p class="small muted">Наш основной узел находится в Нидерландах. Состояние сети обновляется по данным агента — без выдуманных показателей скорости.</p><div id="server-signal"><p class="small muted">Получаем информацию…</p></div></div>
+<div class="community-box"><p class="kicker">04 / ДАЛЬШЕ ВМЕСТЕ</p><h2>Передай хорошую связь.</h2><p class="small muted">Поделись Still VPN с друзьями, следи за обновлениями и открывай сайт напрямую. Подписка на канал — по желанию.</p><div class="community-actions"><button id="invite-share">↗ Поделиться VPN</button><button id="channel-open">◈ Наш канал</button><button id="site-open">🌐 Перейти на сайт Still VPN ↗</button></div><p id="ref-count" class="small muted">Статистика приглашений загружается…</p></div>
+<div class="edition-footer"><span>STILL VPN / RELEASE 08</span><a href="https://t.me/StillVPN_official" id="channel-link">CHANNEL ↗</a></div>`;
+$('#quick-connect').onclick=()=>nav('connect');$('#quick-plans').onclick=()=>nav('plans');
+$('#channel-open').onclick=()=>openOutside(me.channel_url||'https://t.me/StillVPN_official');
+$('#site-open').onclick=()=>openOutside(me.site_url||location.origin+'/web');
+$('#invite-share').onclick=()=>shareTelegram('https://t.me/StillVPNapp_bot');
+$('#channel-link').onclick=e=>{e.preventDefault();openOutside(me.channel_url||'https://t.me/StillVPN_official')};
+if($('#trial'))$('#trial').onclick=async()=>{try{await api('trial',{method:'POST'});toast('Пробный доступ активирован');await reload();nav('home')}catch(e){toast(e.message,true)}};
+miniServers();miniReferrals();
 }
 function planPage(){main.innerHTML=section('Подписка','Выберите свой ритм.','Никаких скрытых параметров: цену и ограничения задаёт администратор.')+
 '<div class="section"><label>Скидочный промокод (если есть)</label><input id="discount-code" maxlength="80" placeholder="Необязательно"></div><div id="plan-list"></div><div class="section"><h2>История платежей</h2><div id="history"><p class="muted small">Загрузка…</p></div></div>';
