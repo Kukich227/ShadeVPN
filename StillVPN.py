@@ -199,7 +199,7 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "10.0.1"
+RELEASE = "11.0.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -861,17 +861,35 @@ if MODE == "app":
         __tablename__ = "tickets"
         id: Mapped[int] = mapped_column(Integer, primary_key=True)
         user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-        status: Mapped[str] = mapped_column(String(20), default="open")
+        title: Mapped[str] = mapped_column(String(140), default="Обращение")
+        priority: Mapped[str] = mapped_column(String(16), default="normal")
+        status: Mapped[str] = mapped_column(String(20), default="open")  # open / answered / closed
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+        updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+        closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
         assigned_admin: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     class TicketMessage(Base):
         __tablename__ = "ticket_messages"
         id: Mapped[int] = mapped_column(Integer, primary_key=True)
-        ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"))
+        ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), index=True)
         sender: Mapped[str] = mapped_column(String(12))
+        staff_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
         text: Mapped[str] = mapped_column(Text)
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+
+    TICKET_PRIORITIES = {"normal": "Обычный", "medium": "Средний", "critical": "Критический"}
+
+    def ticket_public(t: Ticket) -> dict:
+        return {"id": t.id, "user_id": t.user_id, "title": t.title,
+                "priority": t.priority, "status": t.status,
+                "created_at": dt_iso(t.created_at), "updated_at": dt_iso(t.updated_at),
+                "closed_at": dt_iso(t.closed_at), "assigned_admin": t.assigned_admin}
+
+    def ticket_event_details(t: Ticket) -> str:
+        # Never forward the full support conversation to the Telegram log group.
+        return (f"Тикет #{t.id} · {TICKET_PRIORITIES.get(t.priority, 'Обычный')} · "
+                f"{t.title[:110]}")
 
     class Admin(Base):
         __tablename__ = "admins"
@@ -1398,7 +1416,12 @@ if MODE == "app":
                     "refund_reason": "TEXT NOT NULL DEFAULT ''",
                 },
                 "promos": {"discount_percent": "INTEGER NOT NULL DEFAULT 0"},
-                "tickets": {"assigned_admin": "BIGINT"},
+                "tickets": {"assigned_admin": "BIGINT",
+                            "title": "VARCHAR(140) NOT NULL DEFAULT 'Обращение'",
+                            "priority": "VARCHAR(16) NOT NULL DEFAULT 'normal'",
+                            "updated_at": "TIMESTAMP",
+                            "closed_at": "TIMESTAMP"},
+                "ticket_messages": {"staff_id": "BIGINT"},
                 "audit": {"result": "VARCHAR(20) NOT NULL DEFAULT 'ok'"},
             }
             if DATABASE_IS_SQLITE:
@@ -1414,6 +1437,10 @@ if MODE == "app":
                     for col, column_type in cols.items():
                         await connection.execute(text(
                             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {column_type}"))
+        # Backfill timestamps on old tickets without touching existing messages or status.
+        async with Session.begin() as backfill_session:
+            await backfill_session.execute(text(
+                "UPDATE tickets SET updated_at = created_at WHERE updated_at IS NULL"))
         if WG_AGENT_URL and WG_SERVER_ENDPOINT and WG_SERVER_PUBLIC_KEY:
             if not validate_wg_key(WG_SERVER_PUBLIC_KEY):
                 raise RuntimeError("WG_SERVER_PUBLIC_KEY incorrect")
@@ -1434,10 +1461,16 @@ if MODE == "app":
                     node.cidr = WG_SERVER_CIDR
 
     @router.message.middleware()
-    async def private_admin_middleware(handler, event: Message, data: dict):
-        # Never expose user/payment/support administration in group chats.
-        command = (event.text or "").split(maxsplit=1)[0].split("@", 1)[0]
-        if (command == "/admin" or command.startswith("/adm_")) and event.chat.type != "private":
+    async def private_only_middleware(handler, event: Message, data: dict):
+        # Group / supergroup / channel updates must never trigger a reply, a ticket,
+        # a payment handler, or any other command. Outbound admin log delivery is unchanged.
+        if not event.chat or event.chat.type != "private":
+            return None
+        return await handler(event, data)
+
+    @router.callback_query.middleware()
+    async def private_callbacks_only(handler, event: CallbackQuery, data: dict):
+        if event.message and event.message.chat.type != "private":
             return None
         return await handler(event, data)
 
@@ -1458,7 +1491,7 @@ if MODE == "app":
             [InlineKeyboardButton(text="🌐 Перейти на сайт", url=WEBAPP_URL + "/web"),
              InlineKeyboardButton(text="↗ Поделиться", callback_data="user:share")],
             [InlineKeyboardButton(text="📣 Наш канал · необязательно", url=CHANNEL_URL),
-             InlineKeyboardButton(text="✉ Поддержка", callback_data="user:support")],
+             InlineKeyboardButton(text="✉ Поддержка", web_app=WebAppInfo(url=mini_url("tickets")))],
         ]
         if admin:
             links.append([InlineKeyboardButton(text="⚙ Панель управления", web_app=WebAppInfo(url=mini_url("admin")))])
@@ -1612,12 +1645,15 @@ if MODE == "app":
 
     @router.callback_query(F.data == "user:support")
     async def user_support_callback(callback: CallbackQuery):
-        await callback.answer()
         if callback.message and callback.message.chat.type == "private":
             await callback.message.answer(
-                "<b>Поддержка Still VPN</b>\n\n"
-                "Отправьте /support, затем опишите проблему обычным сообщением.\n"
-                "<i>Для вопросов по оплате используйте /paysupport.</i>", parse_mode="HTML")
+                "<b>STILL / ПОДДЕРЖКА</b>\n\nСоздайте обращение и переписывайтесь "
+                "с поддержкой в Mini App.\nНе отправляйте в тикеты приватные VPN-ключи.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Открыть тикеты", web_app=WebAppInfo(url=mini_url("tickets")))
+                ]]))
+        await callback.answer()
 
     @router.message(Command("help"))
     async def cmd_help(message: Message):
@@ -1628,7 +1664,7 @@ if MODE == "app":
             "/profile — профиль\n"
             "/plans — тарифы\n"
             "/connect — устройства и VPN\n"
-            "/support — написать в поддержку\n"
+            "/support — открыть тикеты в Mini App\n"
             "/terms — условия использования\n"
             "/linkweb — привязка к веб-кабинету\n"
             "/paysupport — оплата и возвраты\n"
@@ -1657,27 +1693,15 @@ if MODE == "app":
 
     @router.message(Command("support"))
     async def cmd_support(message: Message):
-        async with Session.begin() as s:
-            user = await s.get(User, message.from_user.id)
-            if not user:
-                user = await upsert_user(s, message.from_user)
-            t = await s.scalar(select(Ticket).where(Ticket.user_id == user.id, Ticket.status == "open").order_by(Ticket.id.desc()))
-            if not t:
-                t = Ticket(user_id=user.id)
-                s.add(t)
-                await s.flush()
-                record_event(s, "ticket_opened", user.id, f"Бот · обращение #{t.id}")
-            ticket_id = t.id
-        await message.answer(f"<b>Обращение #{ticket_id}</b>\n\nОпишите вашу проблему одним сообщением. "
-                             "Ответ придёт здесь, в Telegram.\n\n"
-                             "<i>Не пересылайте приватные ключи и пароли.</i>", parse_mode="HTML")
-        staff_ids = set(OWNER_IDS)
-        async with Session() as s:
-            staff_ids.update((await s.scalars(select(Admin.user_id).where(
-                Admin.role.in_(["administrator", "support"])))).all())
-        for admin_id in staff_ids:
-            try: await bot.send_message(admin_id, f"Still VPN · обращение #{ticket_id} от {message.from_user.id}. /adm_ticket {ticket_id}")
-            except Exception: LOG.debug("Admin %s not reachable", admin_id)
+        await message.answer(
+            "<b>STILL / ЦЕНТР ПОДДЕРЖКИ</b>\n\n"
+            "Откройте Mini App, выберите тему, важность и опишите проблему. "
+            "Все ответы и история переписки доступны там же.\n\n"
+            "<i>Никому не отправляйте приватные ключи и пароли.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✉ Открыть тикеты", web_app=WebAppInfo(url=mini_url("tickets")))
+            ]]))
 
     @router.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery):
@@ -1785,7 +1809,7 @@ if MODE == "app":
         registrations = await s.scalar(select(func.count()).select_from(User).where(User.created_at >= now() - timedelta(days=1))) or 0
         live_nodes = await s.scalar(select(func.count()).select_from(NodeHealth).where(
             NodeHealth.last_seen >= now() - timedelta(minutes=3))) or 0
-        tickets = await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0
+        tickets = await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status.in_(["open", "answered"]))) or 0
         return ("STILL VPN · Администрирование\n\n"
                 "ПОЛЬЗОВАТЕЛИ\n"
                 f"Всего: {users} · новых за 24 ч: {registrations}\n"
@@ -1872,7 +1896,7 @@ if MODE == "app":
             if can(role, "stats"):
                 txt = await dashboard_text(s)
             elif can(role, "support"):
-                tickets = await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0
+                tickets = await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status.in_(["open", "answered"]))) or 0
                 txt = f"STILL · Поддержка\nОткрытых обращений: {tickets}\nИспользуйте кнопки и /adm_reply."
             else:
                 txt = "STILL · Доступ по роли " + str(role)
@@ -1901,7 +1925,7 @@ if MODE == "app":
                 plans = (await s.scalars(select(Plan).order_by(Plan.id))).all()
                 txt = "Тарифы:\n" + "\n".join(f"#{p.id} {p.title}: {p.days}д, {p.stars}⭐, {p.devices} устр. {'✅' if p.enabled else '⛔'}" for p in plans)
             elif action == "tickets":
-                tickets = (await s.scalars(select(Ticket).where(Ticket.status == "open").order_by(Ticket.id.desc()).limit(15))).all()
+                tickets = (await s.scalars(select(Ticket).where(Ticket.status.in_(["open", "answered"])).order_by(Ticket.id.desc()).limit(15))).all()
                 txt = "Обращения:\n" + "\n".join(
                     f"#{t.id} · Telegram {t.user_id} · ответственный: {t.assigned_admin or '—'}"
                     for t in tickets)
@@ -2163,38 +2187,14 @@ if MODE == "app":
         await message.answer("Роль назначена")
 
     @router.message(Command("adm_reply"))
-    async def adm_reply(message: Message):
-        if not await require_role(message.from_user.id, {"owner", "administrator", "support"}): return
-        try:
-            _, ticket_id, body = message.text.split(maxsplit=2)
-            ticket_id = int(ticket_id)
-            assert body and len(body) < 3500
-        except (ValueError, AssertionError):
-            await message.answer("/adm_reply НОМЕР текст"); return
-        async with Session.begin() as s:
-            ticket = await s.get(Ticket, ticket_id)
-            if not ticket or ticket.status != "open":
-                await message.answer("Обращение не найдено или закрыто"); return
-            msg = TicketMessage(ticket_id=ticket_id, sender="staff", text=body)
-            s.add(msg)
-            await s.flush()
-            await queue_notice(s, ticket.user_id, "support_reply", str(msg.id),
-                               f"Still VPN · Поддержка #{ticket_id}:\n{body}")
-            audit(s, message.from_user.id, "ticket_reply", ticket_id)
-        await message.answer("Ответ сохранён и поставлен в очередь доставки")
-
     @router.message(Command("adm_ticket"))
-    async def adm_ticket(message: Message):
-        if not await require_role(message.from_user.id, {"owner", "administrator", "support"}): return
-        try: tid = int(message.text.split()[1])
-        except (ValueError, IndexError): await message.answer("/adm_ticket ID"); return
-        async with Session() as s:
-            ticket = await s.get(Ticket, tid)
-            rows = (await s.scalars(select(TicketMessage).where(TicketMessage.ticket_id == tid)
-                                    .order_by(TicketMessage.id.desc()).limit(15))).all() if ticket else []
-        if not ticket: await message.answer("Обращение не найдено"); return
-        contents = "\n".join(f"{m.sender}: {m.text[:250]}" for m in reversed(rows))
-        await message.answer(f"Обращение #{tid}, клиент {ticket.user_id}, {ticket.status}, сотрудник {ticket.assigned_admin or 'не назначен'}\n{contents}"[:3900])
+    async def adm_ticket_redirect(message: Message):
+        if not await require_role(message.from_user.id, ADMIN_ROLES): return
+        await message.answer(
+            "<b>STILL / ТИКЕТЫ</b>\n\nОтветы сотрудников доступны только в Mini App.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть обращения", web_app=WebAppInfo(url=mini_url("admin")))
+            ]]))
 
     @router.message(Command("adm_payments"))
     async def adm_payments(message: Message):
@@ -2220,17 +2220,12 @@ if MODE == "app":
                                  f"Причина возврата: {pay.refund_reason or '—'}")
 
     @router.message(Command("adm_close"))
-    async def adm_close(message: Message):
-        if not await require_role(message.from_user.id, {"owner", "administrator", "support"}): return
-        try: tid = int(message.text.split()[1])
-        except (ValueError, IndexError):
-            await message.answer("/adm_close ID"); return
-        async with Session.begin() as s:
-            t = await s.get(Ticket, tid)
-            if not t: await message.answer("Не найдено"); return
-            t.status = "closed"
-            audit(s, message.from_user.id, "ticket_close", tid)
-        await message.answer("Закрыто")
+    async def adm_close_redirect(message: Message):
+        if not await require_role(message.from_user.id, ADMIN_ROLES): return
+        await message.answer("Закрытие и повторное открытие тикетов доступны только в Mini App.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                 InlineKeyboardButton(text="Открыть обращения", web_app=WebAppInfo(url=mini_url("admin")))
+                             ]]))
 
     @router.message(Command("adm_refund"))
     async def adm_refund(message: Message):
@@ -2547,22 +2542,13 @@ if MODE == "app":
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def support_text(message: Message):
-        if not message.from_user: return
-        async with Session.begin() as s:
-            t = await s.scalar(select(Ticket).where(Ticket.user_id == message.from_user.id,
-                                                      Ticket.status == "open").order_by(Ticket.id.desc()))
-            if not t:
-                txt = "✉ STILL / ПОДДЕРЖКА\n\nДля обращения в поддержку отправьте /support. Для управления VPN откройте /start."
-            else:
-                s.add(TicketMessage(ticket_id=t.id, sender="user", text=(message.text or "")[:4000]))
-                assigned_admin = t.assigned_admin
-                ticket_id = t.id
-                txt = f"✉ STILL / ОБРАЩЕНИЕ #{t.id}\n\nТвоё сообщение передано поддержке. Ответ придёт сюда."
-        await message.answer(txt)
-        if 'assigned_admin' in locals() and assigned_admin:
-            try: await bot.send_message(assigned_admin,
-                                        f"Still VPN · новое сообщение в обращении #{ticket_id} от {message.from_user.id}. /adm_ticket {ticket_id}")
-            except Exception: LOG.debug("Assigned support user %s unavailable", assigned_admin)
+        # Do not silently turn every private text message into ticket content.
+        await message.answer(
+            "Чтобы обратиться в поддержку, откройте раздел «Тикеты» в Mini App. "
+            "Ответить на тикет можно только там.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✉ Тикеты", web_app=WebAppInfo(url=mini_url("tickets")))
+            ]]))
 
     # HTTP Mini App API
     app = FastAPI(title="Still VPN")
@@ -3097,7 +3083,7 @@ if MODE == "app":
                     ServerNode.enabled.is_(True), NodeHealth.last_seen >= now()-timedelta(minutes=3))) or 0,
                 "expired_subs": await s.scalar(select(func.count()).select_from(Subscription).where(
                     Subscription.ends_at <= now(), Subscription.revoked.is_(False))) or 0,
-                "tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0,
+                "tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status.in_(["open", "answered"]))) or 0,
             }
         if can(role, "finance"):
             output["finance"] = {
@@ -3106,7 +3092,7 @@ if MODE == "app":
                 "refunds": await s.scalar(select(func.count()).select_from(Payment).where(Payment.status == "refunded")) or 0,
             }
         if can(role, "support") and "stats" not in output:
-            output["support"] = {"open_tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status == "open")) or 0}
+            output["support"] = {"open_tickets": await s.scalar(select(func.count()).select_from(Ticket).where(Ticket.status.in_(["open", "answered"]))) or 0}
         if can(role, "audit"):
             events = (await s.scalars(select(Audit).order_by(Audit.id.desc()).limit(8))).all()
             output["events"] = [{"date": dt_iso(x.created_at), "action": x.action, "target": x.target,
@@ -3336,50 +3322,177 @@ if MODE == "app":
                  "status":p.status,"date":dt_iso(p.created_at),"charge_id":p.telegram_charge_id,
                  "refund_date":dt_iso(p.refunded_at)} for p in rows]
 
+    class TicketCreateIn(BaseModel):
+        title: str = Field(min_length=4, max_length=140)
+        description: str = Field(min_length=10, max_length=3500)
+        priority: str = Field(default="normal", max_length=16)
+
+    class TicketReplyIn(BaseModel):
+        text: str = Field(min_length=2, max_length=3500)
+
+    class TicketPriorityIn(BaseModel):
+        priority: str = Field(max_length=16)
+
+    @app.get("/api/tickets")
+    async def api_user_tickets(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        rows = (await s.scalars(select(Ticket).where(Ticket.user_id == user.id)
+                                 .order_by(Ticket.updated_at.desc(), Ticket.id.desc()).limit(60))).all()
+        return [ticket_public(t) for t in rows]
+
+    @app.post("/api/tickets")
+    async def api_ticket_create(data: TicketCreateIn, user: User = Depends(current_user)):
+        title, description = data.title.strip(), data.description.strip()
+        if len(title) < 4 or len(description) < 10: bad(422, "Укажите тему и описание проблемы")
+        if data.priority not in TICKET_PRIORITIES: bad(422, "Недопустимая важность")
+        async with Session.begin() as s:
+            # No more than 3 simultaneous open/answered cases and 4 new cases/hour.
+            active = await s.scalar(select(func.count()).select_from(Ticket).where(
+                Ticket.user_id == user.id, Ticket.status.in_(["open", "answered"]))) or 0
+            recent = await s.scalar(select(func.count()).select_from(Ticket).where(
+                Ticket.user_id == user.id, Ticket.created_at >= now()-timedelta(hours=1))) or 0
+            if active >= 3: bad(429, "Сначала завершите одно из трёх активных обращений")
+            if recent >= 4: bad(429, "Слишком много обращений за час")
+            t = Ticket(user_id=user.id, title=title, priority=data.priority,
+                       status="open", updated_at=now())
+            s.add(t)
+            await s.flush()
+            s.add(TicketMessage(ticket_id=t.id, sender="user", text=description))
+            record_event(s, "ticket_opened", user.id, ticket_event_details(t))
+            tid = t.id
+        return {"ok": True, "id": tid}
+
+    @app.get("/api/tickets/{ticket_id}")
+    async def api_ticket_detail(ticket_id: int, user: User = Depends(current_user),
+                                s: AsyncSession = Depends(db_session)):
+        t = await s.get(Ticket, ticket_id)
+        if not t or t.user_id != user.id: bad(404, "Обращение не найдено")
+        messages = (await s.scalars(select(TicketMessage).where(TicketMessage.ticket_id==ticket_id)
+                                    .order_by(TicketMessage.id).limit(200))).all()
+        return {**ticket_public(t), "messages": [{"id": m.id, "sender": m.sender,
+                 "text": m.text, "date": dt_iso(m.created_at)} for m in messages]}
+
+    @app.post("/api/tickets/{ticket_id}/reply")
+    async def api_ticket_reply(ticket_id: int, data: TicketReplyIn,
+                               user: User = Depends(current_user)):
+        body = data.text.strip()
+        if len(body) < 2: bad(422, "Сообщение слишком короткое")
+        async with Session.begin() as s:
+            t = await s.get(Ticket, ticket_id, with_for_update=True)
+            if not t or t.user_id != user.id: bad(404, "Обращение не найдено")
+            if t.status == "closed": bad(409, "Обращение закрыто. Сначала откройте его снова")
+            count = await s.scalar(select(func.count()).select_from(TicketMessage)
+                                   .where(TicketMessage.ticket_id==ticket_id)) or 0
+            if count >= 200: bad(409, "Лимит сообщений. Создайте новое обращение")
+            s.add(TicketMessage(ticket_id=t.id, sender="user", text=body))
+            t.status = "open"; t.updated_at = now()
+            record_event(s, "ticket_user_reply", user.id, ticket_event_details(t))
+        return {"ok": True}
+
+    @app.post("/api/tickets/{ticket_id}/close")
+    async def api_ticket_close(ticket_id: int, user: User = Depends(current_user)):
+        async with Session.begin() as s:
+            t = await s.get(Ticket, ticket_id, with_for_update=True)
+            if not t or t.user_id != user.id: bad(404, "Обращение не найдено")
+            if t.status == "closed": return {"ok": True}
+            t.status = "closed"; t.closed_at = now(); t.updated_at = now()
+            record_event(s, "ticket_closed_by_user", user.id, ticket_event_details(t))
+        return {"ok": True}
+
+    @app.post("/api/tickets/{ticket_id}/reopen")
+    async def api_ticket_reopen(ticket_id: int, user: User = Depends(current_user)):
+        async with Session.begin() as s:
+            t = await s.get(Ticket, ticket_id, with_for_update=True)
+            if not t or t.user_id != user.id: bad(404, "Обращение не найдено")
+            if t.status != "closed": bad(409, "Обращение уже открыто")
+            active = await s.scalar(select(func.count()).select_from(Ticket).where(
+                Ticket.user_id==user.id, Ticket.status.in_(["open", "answered"]))) or 0
+            if active >= 3: bad(429, "Уже открыто три обращения")
+            t.status = "open"; t.closed_at = None; t.updated_at = now()
+            record_event(s, "ticket_reopened_by_user", user.id, ticket_event_details(t))
+        return {"ok": True}
+
     @app.get("/api/admin/tickets")
-    async def admin_tickets(actor=Depends(admin_scope("support")),s:AsyncSession=Depends(db_session)):
-        rows=(await s.scalars(select(Ticket).order_by(Ticket.id.desc()).limit(60))).all()
-        return [{"id":t.id,"user_id":t.user_id,"status":t.status,
-                 "assigned_admin":t.assigned_admin,"created_at":dt_iso(t.created_at)} for t in rows]
+    async def admin_tickets(actor=Depends(admin_scope("support")), s:AsyncSession=Depends(db_session)):
+        rows=(await s.scalars(select(Ticket).order_by(Ticket.updated_at.desc(), Ticket.id.desc())
+                              .limit(160))).all()
+        out=[]
+        for t in rows:
+            u=await s.get(User,t.user_id)
+            out.append({**ticket_public(t), "user_name":
+                        ((u.first_name+" "+u.last_name).strip() if u else "") or "Пользователь",
+                        "username": (u.username if u else "")})
+        return out
 
     @app.get("/api/admin/tickets/{ticket_id}")
-    async def admin_ticket_detail(ticket_id:int, actor=Depends(admin_scope("support")),s:AsyncSession=Depends(db_session)):
+    async def admin_ticket_detail(ticket_id:int, actor=Depends(admin_scope("support")),
+                                  s:AsyncSession=Depends(db_session)):
         t=await s.get(Ticket,ticket_id)
         if not t: bad(404,"Обращение не найдено")
+        u=await s.get(User,t.user_id)
         rows=(await s.scalars(select(TicketMessage).where(TicketMessage.ticket_id==ticket_id)
-                              .order_by(TicketMessage.id).limit(150))).all()
-        return {"id":t.id,"user_id":t.user_id,"status":t.status,"assigned_admin":t.assigned_admin,
-                "messages":[{"sender":m.sender,"text":m.text,"date":dt_iso(m.created_at)} for m in rows]}
+                              .order_by(TicketMessage.id).limit(200))).all()
+        return {**ticket_public(t), "user_name":
+                ((u.first_name+" "+u.last_name).strip() if u else "") or "Пользователь",
+                "username": (u.username if u else ""),
+                "messages":[{"sender":m.sender,"staff_id":m.staff_id,
+                             "text":m.text,"date":dt_iso(m.created_at)} for m in rows]}
 
     @app.post("/api/admin/tickets/{ticket_id}/reply")
     async def admin_ticket_reply(ticket_id:int,data:AdminReply,actor=Depends(admin_scope("support"))):
-        async with Session() as s:
-            t=await s.get(Ticket,ticket_id)
-            if not t or t.status!="open": bad(404,"Нет открытого обращения")
-            target=t.user_id
-        # Browser accounts have no Telegram chat; their replies are available in /web.
-        # Telegram accounts still require a successful Bot API send before recording delivery.
-        if target > 0:
-            try:
-                await bot.send_message(target,"<b>Still VPN · Поддержка #"+str(ticket_id)+"</b>\n\n"+
-                                       html_escape(data.text),parse_mode="HTML")
-            except Exception:
-                LOG.exception("Support message delivery failed ticket=%s",ticket_id)
-                bad(502,"Сообщение Telegram не доставлено")
+        body=data.text.strip()
+        if len(body)<2: bad(422,"Напишите ответ")
         async with Session.begin() as s:
             t=await s.get(Ticket,ticket_id,with_for_update=True)
-            if t:
-                s.add(TicketMessage(ticket_id=t.id,sender="admin",text=data.text))
-                audit(s,actor[0],"ticket_reply",ticket_id,"Ответ через веб-кабинет" if target < 0 else "Ответ через Telegram")
+            if not t or t.status=="closed": bad(409,"Обращение закрыто")
+            count=await s.scalar(select(func.count()).select_from(TicketMessage)
+                                 .where(TicketMessage.ticket_id==ticket_id)) or 0
+            if count>=200: bad(409,"Достигнут лимит переписки")
+            t.status="answered";t.updated_at=now()
+            if t.assigned_admin is None: t.assigned_admin=actor[0]
+            s.add(TicketMessage(ticket_id=ticket_id,sender="admin",staff_id=actor[0],text=body))
+            audit(s,actor[0],"ticket_reply",ticket_id,"Ответ сохранён в Mini App")
+            record_event(s,"ticket_staff_reply",t.user_id,
+                         ticket_event_details(t)+f" · сотрудник {actor[0]}")
+            if t.user_id>0:
+                await queue_notice(s,t.user_id,"ticket_answer",str(ticket_id)+"-"+str(int(time.time()*1000)),
+                                   f"✉ Still VPN · Поддержка ответила по обращению #{ticket_id}. Откройте Mini App → Тикеты.")
         return {"ok":True}
 
     @app.post("/api/admin/tickets/{ticket_id}/close")
-    async def admin_ticket_close(ticket_id:int, data:AdminReason,actor=Depends(admin_scope("support"))):
+    async def admin_ticket_close(ticket_id:int,data:AdminReason,actor=Depends(admin_scope("support"))):
         async with Session.begin() as s:
             t=await s.get(Ticket,ticket_id,with_for_update=True)
             if not t: bad(404,"Обращение не найдено")
-            t.status="closed"
+            if t.status=="closed": return {"ok":True}
+            t.status="closed";t.closed_at=now();t.updated_at=now()
             audit(s,actor[0],"ticket_close",ticket_id,data.reason)
+            record_event(s,"ticket_closed_by_staff",t.user_id,ticket_event_details(t))
+            if t.user_id>0:
+                await queue_notice(s,t.user_id,"ticket_closed",str(ticket_id)+"-"+str(int(time.time()*1000)),
+                                   f"✉ Still VPN · Обращение #{ticket_id} закрыто. При необходимости откройте его снова в Mini App.")
+        return {"ok":True}
+
+    @app.post("/api/admin/tickets/{ticket_id}/reopen")
+    async def admin_ticket_reopen(ticket_id:int,actor=Depends(admin_scope("support"))):
+        async with Session.begin() as s:
+            t=await s.get(Ticket,ticket_id,with_for_update=True)
+            if not t: bad(404,"Обращение не найдено")
+            if t.status=="closed":
+                t.status="open";t.updated_at=now();t.closed_at=None
+                audit(s,actor[0],"ticket_reopen",ticket_id)
+                record_event(s,"ticket_reopened_by_staff",t.user_id,ticket_event_details(t))
+        return {"ok":True}
+
+    @app.post("/api/admin/tickets/{ticket_id}/priority")
+    async def admin_ticket_priority(ticket_id:int,data:TicketPriorityIn,
+                                    actor=Depends(admin_scope("support"))):
+        if data.priority not in TICKET_PRIORITIES: bad(422,"Неизвестная важность")
+        async with Session.begin() as s:
+            t=await s.get(Ticket,ticket_id,with_for_update=True)
+            if not t: bad(404,"Обращение не найдено")
+            t.priority=data.priority;t.updated_at=now()
+            audit(s,actor[0],"ticket_priority",ticket_id,data.priority)
+            record_event(s,"ticket_priority_changed",t.user_id,ticket_event_details(t))
         return {"ok":True}
 
     @app.get("/api/admin/audit")
@@ -3904,11 +4017,11 @@ if MODE == "app":
         site_rate(req,"web-support",subject=str(identity[1].id),limit=8,window=3600)
         async with Session.begin() as s:
             open_count=await s.scalar(select(func.count()).select_from(Ticket).where(
-                Ticket.user_id==identity[0].id,Ticket.status=="open"))
+                Ticket.user_id==identity[0].id,Ticket.status.in_(["open", "answered"])))
             if open_count >= 3: bad(429,"У вас уже три открытых обращения")
-            t=Ticket(user_id=identity[0].id)
+            t=Ticket(user_id=identity[0].id,title="Обращение с сайта",priority="normal",updated_at=now())
             s.add(t);await s.flush()
-            record_event(s, "ticket_opened", identity[0].id, f"Сайт · обращение #{t.id}")
+            record_event(s, "ticket_opened", identity[0].id, ticket_event_details(t)+" · сайт")
             s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
             ticket_id=t.id
         return {"ok":True,"id":ticket_id}
@@ -3926,9 +4039,11 @@ if MODE == "app":
         site_rate(req,"web-support-reply",subject=str(identity[1].id),limit=25,window=3600)
         async with Session.begin() as s:
             t=await s.get(Ticket,ticket_id)
-            if not t or t.user_id!=identity[0].id or t.status!="open":
+            if not t or t.user_id!=identity[0].id or t.status=="closed":
                 bad(404,"Нет открытого обращения")
             s.add(TicketMessage(ticket_id=t.id,sender="user",text=data.text.strip()))
+            t.status="open";t.updated_at=now()
+            record_event(s,"ticket_user_reply",t.user_id,ticket_event_details(t)+" · сайт")
         return {"ok":True}
 
     def seo_site_url() -> str:
@@ -4509,7 +4624,7 @@ $('#change-form').onsubmit=async e=>{e.preventDefault();if(!confirm('Смени�
 $('#link-form').onsubmit=async e=>{e.preventDefault();try{await api('link-telegram',{method:'POST',body:JSON.stringify({code:$('#link-code').value.trim()})});toast('Telegram привязан');await loadMe()}catch(e){toast(e.message,true)}}}
 async function loadWebTickets(){if(page!=='profile')return;const box=$('#my-tickets');if(!box)return;try{const rows=await api('tickets');box.innerHTML=rows.length?rows.map(t=>`<div class="listrow"><span>Обращение #${t.id} <small class="muted">${esc(t.status)}</small></span><button class="cta outline tiny" data-webticket="${t.id}">Открыть</button></div>`).join(''):'<p class="small muted">Обращений пока нет.</p>';
 $$('[data-webticket]').forEach(b=>b.onclick=()=>openWebTicket(Number(b.dataset.webticket)));}catch(e){box.textContent=e.message}}
-async function openWebTicket(id){const box=$('#my-tickets');try{const t=await api('tickets/'+id);box.innerHTML=`<button class="cta plain tiny" id="ticket-back">← К обращениям</button><h3>Обращение #${t.id} (${esc(t.status)})</h3>`+t.messages.map(m=>`<div class="panel"><span class="small muted">${m.sender==='admin'?'Поддержка':'Вы'} · ${date(m.date)}</span><p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</p></div>`).join('')+(t.status==='open'?`<form id="ticket-reply"><label class="field"><span>Ваш ответ</span><textarea id="reply-text" maxlength="3500" required style="width:100%;min-height:80px;background:#1b151a;color:#fff;padding:12px;border:1px solid #43343e;border-radius:9px"></textarea></label><button class="cta tiny">Отправить</button></form>`:'');$('#ticket-back').onclick=loadWebTickets;
+async function openWebTicket(id){const box=$('#my-tickets');try{const t=await api('tickets/'+id);box.innerHTML=`<button class="cta plain tiny" id="ticket-back">← К обращениям</button><h3>Обращение #${t.id} (${esc(t.status)})</h3>`+t.messages.map(m=>`<div class="panel"><span class="small muted">${m.sender==='admin'?'Поддержка':'Вы'} · ${date(m.date)}</span><p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</p></div>`).join('')+(t.status!=='closed'?`<form id="ticket-reply"><label class="field"><span>Ваш ответ</span><textarea id="reply-text" maxlength="3500" required style="width:100%;min-height:80px;background:#1b151a;color:#fff;padding:12px;border:1px solid #43343e;border-radius:9px"></textarea></label><button class="cta tiny">Отправить</button></form>`:'');$('#ticket-back').onclick=loadWebTickets;
 if($('#ticket-reply'))$('#ticket-reply').onsubmit=async ev=>{ev.preventDefault();try{await api('tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text:$('#reply-text').value.trim()})});await openWebTicket(id)}catch(e){toast(e.message,true)}};
 }catch(e){toast(e.message,true)}}
 async function init(){try{config=await api('config');if(config.bot_url){const b=$('#bot-link');b.href=config.bot_url;b.classList.remove('hidden');$('#footer-bot').innerHTML=`<a target="_blank" rel="noopener noreferrer" href="${esc(config.bot_url)}">Открыть Telegram-бота ↗</a>`}if(!config.registration_enabled){$$('[data-auth="register"]').forEach(x=>x.disabled=true);$('#intro-create').disabled=true}await loadMe()}catch(e){toast(e.message,true)}}
@@ -4520,7 +4635,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>STILL VPN / EDITION 10</title><meta name="still-release" content="10.0.0"><meta name="robots" content="noindex,nofollow">
+<title>STILL VPN / EDITION 11</title><meta name="still-release" content="11.0.0"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -4646,9 +4761,52 @@ body{background:var(--bg)}#app{padding-top:calc(env(safe-area-inset-top) + 19px)
 .vpn-how{margin-top:17px;padding-top:15px;border-top:1px solid #705064;color:var(--ink);line-height:1.6}.vpn-how p{font-size:13px;margin:0 0 12px}.vpn-how a{color:#eab9d2;text-decoration:underline}
 .vpn-status-fresh{color:#c1e3ca!important;border-color:#56806b!important}.vpn-status-idle{color:#d4b8cc!important}
 @media(max-width:390px){.vpn-control{padding:16px}.vpn-power{width:56px;height:56px;font-size:33px}.vpn-control-main h2{font-size:18px}}
+/* STILL 11 / Support desk. No flashy gradients; readable, tactile information design. */
+.tabs{justify-content:space-between;gap:2px;padding-left:9px;padding-right:9px}
+.tabs button{min-width:0;flex:1 1 0;font-size:9px;white-space:nowrap;letter-spacing:-.015em}
+.tabs svg{width:20px;height:20px}
+.ticket-top{margin:8px 0 24px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.ticket-top h1{font-size:clamp(29px,8vw,43px);margin:8px 0}
+.ticket-card{border:1px solid #463942;background:#1b1a20;padding:19px 17px;margin:11px 0;border-radius:8px;text-align:left;display:block;width:100%;color:var(--ink);font:inherit;cursor:pointer}
+.ticket-card:focus-visible,.ticket-pill:focus-visible{outline:2px solid #d4a2b3;outline-offset:2px}
+.ticket-topline{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.ticket-title{font-size:17px;font-weight:650;letter-spacing:-.03em;line-height:1.3;overflow-wrap:anywhere}
+.ticket-meta{font-size:11px;color:#ada3ab;line-height:1.7;margin-top:6px}
+.ticket-priority{display:inline-flex;align-items:center;gap:7px;color:#e7dfde;font-size:11px;white-space:nowrap}
+.ticket-dot{width:9px;height:9px;display:inline-block;border-radius:50%;background:#81bf99;box-shadow:0 0 0 3px #81bf9917;flex:none}
+.ticket-dot.medium{background:#e2b46c;box-shadow:0 0 0 3px #e2b46c21}
+.ticket-dot.critical{background:#e67a83;box-shadow:0 0 0 3px #e67a8320}
+.ticket-state{font-size:10px;letter-spacing:.035em;text-transform:uppercase;color:#d9c4c7;border:1px solid #634d55;border-radius:3px;padding:5px 7px;white-space:nowrap}
+.ticket-state.answered{border-color:#74887b;color:#bed9c5}.ticket-state.closed{color:#98929c;border-color:#423e43}
+.ticket-controls{display:flex;gap:8px;flex-wrap:wrap;margin:17px 0}
+.ticket-controls button{flex:1;min-width:90px}
+.ticket-form{background:#1d1b22;border:1px solid #514049;border-radius:9px;padding:19px 17px;margin:18px 0}
+.ticket-form label,.ticket-form>label{display:block;font-size:12px;color:#d5ccd1;margin:15px 0 7px}
+.ticket-form input,.ticket-form textarea,.ticket-form select{width:100%;font:inherit;color:#f3ecec;background:#131319;border:1px solid #54454d;border-radius:5px;padding:12px;box-sizing:border-box;outline-offset:2px}
+.ticket-form textarea{min-height:130px;resize:vertical;line-height:1.5}
+.ticket-form input:focus,.ticket-form textarea:focus{border-color:#c78ea3}
+.ticket-priority-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:12px 0}
+.ticket-priority-grid label{min-width:0;margin:0;border:1px solid #52434b;border-radius:5px;padding:11px 6px;display:flex;flex-direction:column;align-items:flex-start;gap:10px;font-size:11px;cursor:pointer;line-height:1.3}
+.ticket-priority-grid label:has(input:checked){background:#392b34;border-color:#bd8498}
+.ticket-priority-grid input{position:absolute;opacity:0;width:1px;height:1px;padding:0}
+.ticket-priority-grid input:focus-visible+span{outline:2px solid #f2d6e0}
+.ticket-priority-grid label span{display:flex;align-items:center;gap:7px}
+.ticket-chat{border-left:1px solid #4a3b45;padding:9px 0 11px 18px;margin:18px 0;min-height:80px}
+.ticket-bubble{padding:13px 15px;border:1px solid #443941;background:#1c1a20;border-radius:7px;margin:0 0 12px;overflow-wrap:anywhere}
+.ticket-bubble.staff{background:#292029;border-color:#735467}
+.ticket-bubble .byline{font-size:11px;color:#b2a5ac;display:flex;justify-content:space-between;gap:9px;margin-bottom:8px}
+.ticket-bubble p{margin:0;white-space:pre-wrap;line-height:1.6;font-size:14px}
+.ticket-intro{font-size:13px;color:var(--muted);line-height:1.6;border-top:1px solid #4d3d46;padding-top:14px}
+.ticket-filter{display:flex;gap:7px;overflow-x:auto;padding:4px 0 12px;margin:10px 0}
+.ticket-filter button{flex:none;background:transparent;border:1px solid #55434c;border-radius:22px;color:#d5c9cd;padding:9px 14px;font:inherit;font-size:12px}
+.ticket-filter button.active{background:#e8ded7;color:#261d23;border-color:#e8ded7}
+.ticket-admin-filter{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0}
+.ticket-admin-filter select,.ticket-admin-filter input{flex:1;min-width:100px;max-width:100%;background:#1d1a20;border:1px solid #53424c;border-radius:5px;color:#e8dfe3;padding:11px;font:inherit;font-size:12px}
+.ticket-admin-note{padding:12px 14px;border-left:3px solid #ac748b;background:#261e26;font-size:12px;color:#d9c5cd;line-height:1.55}
+@media(max-width:370px){.ticket-priority-grid{grid-template-columns:1fr}.ticket-priority-grid label{flex-direction:row;align-items:center}.ticket-priority-grid label span{gap:8px}}
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
-<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 10</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
+<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 11</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
 <nav class="tabs" id="tabs" aria-label="Разделы"></nav>
 <script>
 (()=>{
@@ -4667,12 +4825,12 @@ async function api(path,opts={}){
  if(!r.ok){const d=out.detail;throw new Error(typeof d==='string'?d:'Ошибка запроса '+r.status)}return out;
 }
 function nav(to){page=to;currentConfig=null;drawTabs();render();window.scrollTo(0,0)}
-const icons={admin:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
-function drawTabs(){const items=[['home','Главная'],['plans','Тарифы'],['connect','Подключить'],['account','Профиль']];if(me?.admin_role)items.push(['admin','Админ']);tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" class="${page===id?'active':''}"><svg viewBox="0 0 24 24">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
+const icons={tickets:'<path d="M4 4h16v13H8l-4 3z"/><path d="M8 9h8M8 13h5"/>',admin:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
+function drawTabs(){const items=[['home','Главная'],['plans','Тарифы'],['connect','VPN'],['tickets','Тикеты'],['account','Профиль']];if(me?.admin_role)items.push(['admin','Админ']);tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" class="${page===id?'active':''}"><svg viewBox="0 0 24 24">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
 const section=(label,title,desc='')=>`<p class="kicker">${label}</p><h1>${title}</h1>${desc?`<p class="para muted">${desc}</p>`:''}`;
 function activeText(){if(!me.subscription)return 'Нет активной подписки';const ms=new Date(me.subscription.end)-Date.now();return ms>0?Math.ceil(ms/86400000)+' дн. осталось':'Срок действия истёк'}
 function render(){if(!me){main.innerHTML='<p class="muted">Подключение к Still VPN…</p>';return}
- if(page==='home')home(); else if(page==='plans')planPage(); else if(page==='connect')connectPage(); else if(page==='admin')adminPage(); else accountPage()}
+ if(page==='home')home(); else if(page==='plans')planPage(); else if(page==='connect')connectPage(); else if(page==='tickets')ticketsPage(); else if(page==='admin')adminPage(); else accountPage()}
 function openOutside(url){if(!url)return;try{if(tg?.openLink){tg.openLink(url);return}}catch(e){}window.open(url,'_blank','noopener,noreferrer')}
 function shareTelegram(url){if(!url)return;const href='https://t.me/share/url?url='+encodeURIComponent(url)+'&text='+encodeURIComponent('Still VPN — VPN для повседневного интернета.');try{if(tg?.openTelegramLink){tg.openTelegramLink(href);return}}catch(e){}window.open(href,'_blank','noopener,noreferrer')}
 async function miniServers(){try{const list=await api('servers/public');const box=$('#server-signal');if(page!=='home'||!box)return;
@@ -4782,6 +4940,31 @@ async function createDevice(){const btn=$('#create-device');btn.disabled=true;bt
  $('#copy-conf').onclick=async()=>{try{await navigator.clipboard.writeText(conf);toast('Конфигурация скопирована')}catch{toast('Буфер обмена недоступен',true)}};
  toast('Устройство создано');await loadDevices();await reload();root.scrollIntoView({behavior:'smooth'});
  }catch(e){toast(e.message,true)}finally{btn.disabled=false;btn.textContent='Создать конфигурацию'}}
+let selectedTicket=null, ticketListFilter='active';
+const priorities={normal:'Обычный',medium:'Средний',critical:'Критический'};
+const statusTitles={open:'Ожидает ответа',answered:'Ответ поддержки',closed:'Закрыт'};
+const ticketPriority=(p)=>`<span class="ticket-priority"><i class="ticket-dot ${p==='critical'?'critical':p==='medium'?'medium':''}"></i>${esc(priorities[p]||priorities.normal)}</span>`;
+const ticketStatus=(s)=>`<span class="ticket-state ${s==='closed'?'closed':s==='answered'?'answered':''}">${esc(statusTitles[s]||s)}</span>`;
+function ticketsPage(){main.innerHTML=section('STILL / ЦЕНТР ПОДДЕРЖКИ','Мы на связи.','Заявки и переписка с командой — в одном месте, без сообщений в чате бота.')+
+`<div class="ticket-controls"><button class="button" id="ticket-new">Создать обращение</button><button class="button secondary" id="ticket-refresh">Обновить</button></div><div id="tickets-content"><p class="muted small">Загружаем обращения…</p></div><p class="ticket-intro">Ответы сотрудников появятся здесь. Если у вас есть Telegram, уведомление о новом ответе придёт в личный чат. Не отправляйте пароли, VPN-конфигурации и приватные ключи.</p>`;
+$('#ticket-new').onclick=showTicketForm;$('#ticket-refresh').onclick=()=>{selectedTicket=null;loadTickets()};
+if(selectedTicket)openTicket(selectedTicket);else loadTickets()}
+function showTicketForm(){selectedTicket=null;const box=$('#tickets-content');if(!box)return;
+box.innerHTML=`<div class="ticket-form"><p class="kicker">НОВОЕ ОБРАЩЕНИЕ</p><h2>Расскажите, что случилось</h2><form id="ticket-create-form"><label for="ticket-title">Тема обращения</label><input id="ticket-title" maxlength="140" minlength="4" required autocomplete="off" placeholder="Например: Не подключается WireGuard"><label for="ticket-body">Описание проблемы</label><textarea id="ticket-body" maxlength="3500" minlength="10" required placeholder="Что произошло, на каком устройстве, что уже пробовали?"></textarea><label>Важность</label><div class="ticket-priority-grid">${['normal','medium','critical'].map((p,i)=>`<label><input type="radio" name="ticket-priority" value="${p}" ${i===0?'checked':''}><span>${ticketPriority(p)}</span></label>`).join('')}</div><p class="small muted">Критический — полная недоступность сервиса; средний — мешает работе; обычный — вопрос или предложение.</p><div class="ticket-controls"><button class="button" type="submit" id="ticket-submit">Отправить обращение</button><button class="button secondary" type="button" id="ticket-cancel">Отмена</button></div></form></div>`;
+$('#ticket-cancel').onclick=()=>loadTickets();$('#ticket-create-form').onsubmit=async(e)=>{e.preventDefault();const b=$('#ticket-submit');b.disabled=true;
+try{const data={title:$('#ticket-title').value.trim(),description:$('#ticket-body').value.trim(),priority:document.querySelector('input[name="ticket-priority"]:checked').value};const r=await api('tickets',{method:'POST',body:JSON.stringify(data)});toast('Обращение создано');selectedTicket=r.id;await openTicket(r.id)}catch(err){toast(err.message,true)}finally{b.disabled=false}}}
+async function loadTickets(){const box=$('#tickets-content');if(!box||page!=='tickets')return;selectedTicket=null;
+try{const all=await api('tickets');const filtered=all.filter(t=>ticketListFilter==='all'||(ticketListFilter==='active'?t.status!=='closed':t.status==='closed'));
+box.innerHTML=`<div class="ticket-filter">${[['active','Активные'],['closed','Закрытые'],['all','Все']].map(([v,l])=>`<button data-filter="${v}" class="${ticketListFilter===v?'active':''}">${l}</button>`).join('')}</div><div class="ticket-rows">${filtered.length?filtered.map(t=>`<button class="ticket-card" data-ticket="${t.id}"><div class="ticket-topline">${ticketPriority(t.priority)}${ticketStatus(t.status)}</div><div class="ticket-title">${esc(t.title)}</div><div class="ticket-meta">Обращение #${t.id} · Обновлено ${day(t.updated_at||t.created_at)}</div></button>`).join(''):'<div class="ticket-form"><h2>Пока пусто</h2><p class="small muted">Здесь появятся ваши обращения. Создайте первое, если нужна помощь.</p></div>'}</div>`;
+box.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{ticketListFilter=b.dataset.filter;loadTickets()});box.querySelectorAll('[data-ticket]').forEach(b=>b.onclick=()=>openTicket(Number(b.dataset.ticket)));
+}catch(err){box.innerHTML=`<div class="notice error">${esc(err.message)}</div>`}}
+async function openTicket(id){selectedTicket=id;const box=$('#tickets-content');if(!box)return;box.innerHTML='<p class="small muted">Открываем обращение…</p>';
+try{const t=await api('tickets/'+id);if(page!=='tickets'||selectedTicket!==id)return;
+box.innerHTML=`<button class="button ghost compact" id="ticket-back">← Все обращения</button><div class="ticket-form"><div class="ticket-topline">${ticketPriority(t.priority)}${ticketStatus(t.status)}</div><h2>${esc(t.title)}</h2><p class="small muted">#${t.id} · Создано ${day(t.created_at)}</p></div><div class="ticket-chat">${t.messages.map(m=>`<div class="ticket-bubble ${m.sender==='admin'||m.sender==='staff'?'staff':''}"><div class="byline"><b>${m.sender==='admin'||m.sender==='staff'?'Поддержка Still VPN':'Вы'}</b><span>${day(m.date)}</span></div><p>${esc(m.text)}</p></div>`).join('')}</div>${t.status!=='closed'?`<form id="ticket-reply-form" class="ticket-form"><label for="ticket-reply-text">Дополнить обращение</label><textarea id="ticket-reply-text" maxlength="3500" minlength="2" required placeholder="Напишите ответ…"></textarea><button class="button" id="ticket-send">Отправить сообщение</button></form><button class="button ghost compact" id="ticket-close">Закрыть обращение</button>`:`<div class="ticket-form"><p>Обращение закрыто.</p><button class="button secondary" id="ticket-reopen">Открыть повторно</button></div>`}`;
+$('#ticket-back').onclick=()=>loadTickets();if($('#ticket-reply-form'))$('#ticket-reply-form').onsubmit=async ev=>{ev.preventDefault();const b=$('#ticket-send');b.disabled=true;try{await api('tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text:$('#ticket-reply-text').value.trim()})});toast('Сообщение отправлено');await openTicket(id)}catch(err){toast(err.message,true)}finally{b.disabled=false}};
+if($('#ticket-close'))$('#ticket-close').onclick=async()=>{if(!confirm('Закрыть обращение?'))return;try{await api('tickets/'+id+'/close',{method:'POST'});toast('Обращение закрыто');await openTicket(id)}catch(err){toast(err.message,true)}};
+if($('#ticket-reopen'))$('#ticket-reopen').onclick=async()=>{try{await api('tickets/'+id+'/reopen',{method:'POST'});toast('Обращение открыто повторно');await openTicket(id)}catch(err){toast(err.message,true)}};
+}catch(err){box.innerHTML=`<div class="notice error">${esc(err.message)}</div><button class="button secondary" id="ticket-list-return">Назад</button>`;$('#ticket-list-return').onclick=loadTickets}}
 function accountPage(){main.innerHTML=section('Ваш профиль','Приватность прежде всего.','Мы храним только данные, необходимые для подписки и доступа.')+
 `<div class="statrow"><span class="muted">Telegram ID</span><b>${me.id}</b></div>
 <div class="statrow"><span class="muted">Имя пользователя</span><b>${esc(me.username?'@'+me.username:'—')}</b></div>
@@ -4789,16 +4972,16 @@ function accountPage(){main.innerHTML=section('Ваш профиль','Прив�
 <div class="statrow"><span class="muted">Подписка</span><b>${esc(me.subscription?.name||'Не активна')}</b></div>
 <div class="statrow"><span class="muted">Статус аккаунта</span><b>${esc(me.account_status)}</b></div>
 <div class="section"><h2>Подарки и промокоды</h2><p class="muted small">Созданные подарки доступны после подтверждённой оплаты. Коды активируются один раз.</p><label>Код подарка / промокод</label><input id="redeem" placeholder="STILL-… или SH-…"><div style="height:12px"></div><button class="button" id="redeem-btn">Активировать код</button><div id="gift-list"></div></div>
-${me.admin_role?'<div class="section"><button id="open-admin" class="button secondary">Открыть админ-панель</button></div>':''}<div class="section"><h2>Помощь и документы</h2><p class="muted small">Вопросы решаются в переписке с ботом по команде /support. Платёжные вопросы: /paysupport.</p><button class="button secondary" id="support-btn">Вернуться в бот для /support</button></div>`;
+${me.admin_role?'<div class="section"><button id="open-admin" class="button secondary">Открыть админ-панель</button></div>':''}<div class="section"><h2>Помощь и документы</h2><p class="muted small">Создайте тикет, укажите тему и важность. История ответов доступна в Mini App.</p><button class="button secondary" id="support-btn">Открыть центр поддержки</button></div>`;
 $('#redeem-btn').onclick=async()=>{const code=$('#redeem').value.trim();try{const r=await api('redeem',{method:'POST',body:JSON.stringify({code})});toast(`Активировано: +${r.days} дней`);$('#redeem').value='';await reload();accountPage()}catch(e){toast(e.message,true)}};
-$('#support-btn').onclick=()=>{tg?.close();};if($('#open-admin'))$('#open-admin').onclick=()=>nav('admin');
+$('#support-btn').onclick=()=>nav('tickets');if($('#open-admin'))$('#open-admin').onclick=()=>nav('admin');
 loadGifts();}
 async function loadGifts(){try{gifts=await api('gifts');if(page!=='account')return;
 $('#gift-list').innerHTML=gifts.map(g=>`<div class="panel"><h3>${esc(g.name)}</h3><p class="small muted">Действует до ${day(g.expires_at)} · ${g.used?'Активирован':g.invalid?'Аннулирован':'Ожидает'}</p>${g.code?`<div class="code">${esc(g.code)}</div><button class="button secondary compact" data-code="${esc(g.id)}">Скопировать код</button>`:''}</div>`).join('');
 $('#gift-list').querySelectorAll('[data-code]').forEach(b=>b.onclick=async()=>{const g=gifts.find(x=>x.id===b.dataset.code);if(g?.code){await navigator.clipboard.writeText(g.code);toast('Код скопирован')}});
 }catch(e){toast(e.message,true)}}
 async function reload(){me=await api('me');if(page==='home')render()}
-async function boot(){drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const query=new URLSearchParams(location.search);const start=query.get('tab')||query.get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account'].includes(start)||(start==='admin'&&me.admin_role))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
+async function boot(){drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const query=new URLSearchParams(location.search);const start=query.get('tab')||query.get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account','tickets'].includes(start)||(start==='admin'&&me.admin_role))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
 // Only users with an authenticated admin role see this entrance. Every request
 // is also authorized by role on the FastAPI side; UI checks are cosmetic.
 let adminSection='overview', adminSelectedUser=null, adminSelectedTicket=null, adminPlanEdit=null;
@@ -4882,16 +5065,29 @@ async function adminServers(box){const rows=await api('admin/servers');box.inner
  box.querySelectorAll('[data-server]').forEach(b=>b.onclick=async()=>{const n=rows.find(x=>x.id===Number(b.dataset.server));const reason=adminReason();if(!reason)return;try{await api('admin/servers/'+n.id+'/state',{method:'POST',body:JSON.stringify({enabled:!n.enabled,reason})});toast('Состояние обновлено');adminLoad()}catch(e){toast(e.message,true)}});}
 async function adminPayments(box){const rows=await api('admin/payments');box.innerHTML=`<h2>Платежи</h2><p class="small muted">Показаны реальные транзакции Telegram Stars. Возврат выполняется владельцем через команду /adm_refund в боте с обязательной причиной и проверкой Telegram.</p>`+
  adminList(rows,p=>`<div class="admin-item"><div><b>${esc(p.plan)}</b><div class="small muted">Telegram ${p.user_id} · ${day(p.date)}<br>ID: ${esc(p.id)}<br>Charge: ${esc(p.charge_id||'—')}</div></div><div style="text-align:right"><b>${p.amount} ⭐</b><div>${stateTag(p.status,p.status==='paid')}</div></div></div>`);}
+let adminTicketFilter='active',adminTicketPriority='all',adminTicketSearch='';
 async function adminTickets(box){if(adminSelectedTicket){await adminTicketDetail(box,adminSelectedTicket);return}
- const rows=await api('admin/tickets');box.innerHTML='<h2>Обращения</h2><p class="small muted">Ответ доставляется пользователю через Telegram-бота.</p>'+
- adminList(rows,t=>`<div class="admin-item"><div><b>Обращение #${t.id}</b><div class="small muted">Telegram ${t.user_id} · ${day(t.created_at)}<br>Ответственный: ${t.assigned_admin||'—'}</div></div><button class="button secondary compact" data-ticket="${t.id}">${t.status==='open'?'Открыть':'История'}</button></div>`);
- box.querySelectorAll('[data-ticket]').forEach(b=>b.onclick=()=>{adminSelectedTicket=Number(b.dataset.ticket);adminLoad()});}
-async function adminTicketDetail(box,id){const t=await api('admin/tickets/'+id);box.innerHTML=`<button id="admin-ticket-back" class="admin-breadcrumb">← Все обращения</button><h2>Обращение #${t.id}</h2><p class="small muted">Telegram ID ${t.user_id} · ${esc(t.status)}</p>`+
- adminList(t.messages,m=>`<div class="admin-item"><div><b>${m.sender==='admin'?'Поддержка':'Пользователь'}</b><div class="small muted">${day(m.date)}</div><div style="margin-top:5px;white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</div></div></div>`)+
- (t.status==='open'?`<div class="admin-form"><label>Ответ пользователю</label><textarea id="admin-ticket-text" maxlength="3500" placeholder="Напишите ответ…"></textarea><div class="admin-actions"><button id="admin-ticket-send" class="button compact">Отправить</button><button id="admin-ticket-close" class="button ghost compact">Закрыть</button></div></div>`:'');
- $('#admin-ticket-back').onclick=()=>{adminSelectedTicket=null;adminLoad()};
- if($('#admin-ticket-send'))$('#admin-ticket-send').onclick=async()=>{const text=$('#admin-ticket-text').value.trim();if(!text)return;try{await api('admin/tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text})});toast('Ответ отправлен');adminLoad()}catch(e){toast(e.message,true)}};
- if($('#admin-ticket-close'))$('#admin-ticket-close').onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/tickets/'+id+'/close',{method:'POST',body:JSON.stringify({reason})});toast('Обращение закрыто');adminLoad()}catch(e){toast(e.message,true)}};}
+const rows=await api('admin/tickets');const priorityOrder={critical:0,medium:1,normal:2};
+const filtered=rows.filter(t=>{
+ const statusOk=adminTicketFilter==='all'||(adminTicketFilter==='active'?t.status!=='closed':t.status==='closed');
+ const priorityOk=adminTicketPriority==='all'||t.priority===adminTicketPriority;
+ const searchOk=!adminTicketSearch||`${t.id} ${t.user_name} ${t.username} ${t.title}`.toLowerCase().includes(adminTicketSearch.toLowerCase());
+ return statusOk&&priorityOk&&searchOk;
+}).sort((a,b)=>(a.status==='closed')-(b.status==='closed')||(priorityOrder[a.priority]??2)-(priorityOrder[b.priority]??2)||new Date(b.updated_at)-new Date(a.updated_at));
+box.innerHTML=`<h2>Центр поддержки</h2><p class="small muted">Все обращения управляются здесь. Ответ может отправить любой администратор. События отмечаются в служебной группе.</p><div class="ticket-admin-filter"><select id="admin-ticket-status"><option value="active">Активные</option><option value="closed">Закрытые</option><option value="all">Все</option></select><select id="admin-ticket-priority"><option value="all">Любая важность</option><option value="critical">🔴 Критические</option><option value="medium">🟡 Средние</option><option value="normal">🟢 Обычные</option></select><input id="admin-ticket-search" placeholder="Тема, ID, пользователь" value="${esc(adminTicketSearch)}"></div><p class="small muted">Найдено: ${filtered.length}</p>`+
+adminList(filtered,t=>`<div class="admin-item"><div style="min-width:0;flex:1"><div class="ticket-topline">${ticketPriority(t.priority)}${ticketStatus(t.status)}</div><b style="overflow-wrap:anywhere">#${t.id} · ${esc(t.title)}</b><div class="small muted">${esc(t.user_name)} ${t.username?'· @'+esc(t.username):''} · ID ${t.user_id}<br>Обновлён ${day(t.updated_at||t.created_at)}</div></div><button class="button secondary compact" data-ticket="${t.id}">Открыть</button></div>`);
+$('#admin-ticket-status').value=adminTicketFilter;$('#admin-ticket-priority').value=adminTicketPriority;
+$('#admin-ticket-status').onchange=e=>{adminTicketFilter=e.target.value;adminTickets(box)};
+$('#admin-ticket-priority').onchange=e=>{adminTicketPriority=e.target.value;adminTickets(box)};
+$('#admin-ticket-search').oninput=e=>{adminTicketSearch=e.target.value};$('#admin-ticket-search').onkeydown=e=>{if(e.key==='Enter')adminTickets(box)};
+box.querySelectorAll('[data-ticket]').forEach(b=>b.onclick=()=>{adminSelectedTicket=Number(b.dataset.ticket);adminLoad()});}
+async function adminTicketDetail(box,id){const t=await api('admin/tickets/'+id);box.innerHTML=`<button id="admin-ticket-back" class="admin-breadcrumb">← К обращениям</button><h2>${esc(t.title)}</h2><div class="ticket-topline">${ticketPriority(t.priority)}${ticketStatus(t.status)}</div><p class="small muted">Обращение #${t.id} · ${esc(t.user_name)} ${t.username?'· @'+esc(t.username):''} · ID ${t.user_id} · ${day(t.created_at)}</p><div class="ticket-admin-filter"><label class="small muted" for="admin-ticket-change-priority">Изменить важность</label><select id="admin-ticket-change-priority"><option value="normal">🟢 Обычный</option><option value="medium">🟡 Средний</option><option value="critical">🔴 Критический</option></select></div><div class="ticket-admin-note">Ответы сохраняются в Mini App. Пользователю придёт уведомление в личный чат, но переписка не отправляется в служебную группу.</div><div class="ticket-chat">${t.messages.map(m=>`<div class="ticket-bubble ${m.sender==='admin'||m.sender==='staff'?'staff':''}"><div class="byline"><b>${m.sender==='admin'||m.sender==='staff'?'Сотрудник'+(m.staff_id?' #'+m.staff_id:''):'Пользователь'}</b><span>${day(m.date)}</span></div><p>${esc(m.text)}</p></div>`).join('')}</div>`+
+(t.status!=='closed'?`<form id="admin-ticket-reply" class="ticket-form"><label for="admin-ticket-text">Ваш ответ</label><textarea id="admin-ticket-text" minlength="2" maxlength="3500" required placeholder="Объясните решение или задайте уточняющий вопрос…"></textarea><button class="button" type="submit" id="admin-ticket-send">Отправить ответ</button></form><button class="button ghost compact" id="admin-ticket-close">Закрыть обращение</button>`:`<div class="ticket-form"><p>Тикет закрыт.</p><button class="button secondary" id="admin-ticket-reopen">Открыть повторно</button></div>`);
+$('#admin-ticket-back').onclick=()=>{adminSelectedTicket=null;adminLoad()};$('#admin-ticket-change-priority').value=t.priority;
+$('#admin-ticket-change-priority').onchange=async e=>{try{await api('admin/tickets/'+id+'/priority',{method:'POST',body:JSON.stringify({priority:e.target.value})});toast('Важность обновлена');await adminLoad()}catch(err){toast(err.message,true)}};
+if($('#admin-ticket-reply'))$('#admin-ticket-reply').onsubmit=async e=>{e.preventDefault();const text=$('#admin-ticket-text').value.trim();if(text.length<2)return;const b=$('#admin-ticket-send');b.disabled=true;try{await api('admin/tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text})});toast('Ответ сохранён. Пользователь получит уведомление.');await adminLoad()}catch(err){toast(err.message,true);b.disabled=false}};
+if($('#admin-ticket-close'))$('#admin-ticket-close').onclick=async()=>{const reason=adminReason();if(!reason)return;try{await api('admin/tickets/'+id+'/close',{method:'POST',body:JSON.stringify({reason})});toast('Обращение закрыто');await adminLoad()}catch(err){toast(err.message,true)}};
+if($('#admin-ticket-reopen'))$('#admin-ticket-reopen').onclick=async()=>{try{await api('admin/tickets/'+id+'/reopen',{method:'POST'});toast('Обращение открыто');await adminLoad()}catch(err){toast(err.message,true)}};}
 async function adminSettings(box){const d=await api('admin/trial-settings');box.innerHTML=`<h2>Пробный доступ</h2><p class="small muted">Настройки применяются только к новым активациям. Ранее выданный доступ не изменяется.</p><div class="admin-form"><label><input id="at-enabled" type="checkbox" ${d.enabled?'checked':''} style="width:auto;min-height:0"> Доступен новым пользователям</label><div class="row"><div><label>Часов</label><input type="number" id="at-hours" min="1" max="720" value="${d.hours}"></div><div><label>Устройства</label><input type="number" id="at-devices" min="1" max="20" value="${d.devices}"></div></div><label>Трафик, ГБ (0 = без лимита)</label><input type="number" id="at-gb" min="0" max="10000" value="${d.traffic_gb}"><div style="height:15px"></div><button id="at-save" class="button">Сохранить настройки</button></div>`;
  $('#at-save').onclick=async()=>{const d={enabled:$('#at-enabled').checked,hours:Number($('#at-hours').value),devices:Number($('#at-devices').value),traffic_gb:Number($('#at-gb').value)};try{await api('admin/trial-settings',{method:'PUT',body:JSON.stringify(d)});toast('Настройки сохранены');adminLoad()}catch(e){toast(e.message,true)}};}
 async function adminStaff(box){const d=await api('admin/staff');box.innerHTML=`<h2>Доступ сотрудников</h2><p class="small muted">Owner назначается через OWNER_IDS на BotHost. Остальные роли имеют отдельные API-права.</p>`+
