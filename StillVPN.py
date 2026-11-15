@@ -1,4 +1,4 @@
-"""STILL VPN v10 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
+"""STILL VPN v13 — единый файл: Telegram Bot + админка в боте и Mini App + API + WireGuard-agent.
 
 РЕБРЕНДИНГ: видимое имя — Still VPN. Старые подарочные коды остаются действительными. Внутренние SHADE_MODE, X-Shade-*,
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
@@ -99,7 +99,7 @@ PUBLIC_SERVER_PROVIDER=SKRIME. /build отдаёт релиз 10.0.0.
 
 MINI APP АДМИНКА v8: кнопка «Админ» появляется только у OWNER_IDS или сотрудника
 из таблицы admins. Backend повторно проверяет права каждой операции. Старую SQLite
-базу не удалять. Обновлять до v10 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
+базу не удалять. Обновлять до v12 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
     python shade.py selftest                  — автономные тесты криптографических проверок
@@ -146,6 +146,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 from urllib.parse import parse_qsl, urlparse, unquote, quote
 
@@ -199,7 +200,7 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "11.0.0"
+RELEASE = "13.0.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -1044,9 +1045,49 @@ if MODE == "app":
             role = await role_of(s, uid)
         return role in permitted
 
+    QUIET_ACTIVITY_EVENTS = frozenset({"bot_start", "web_login"})
+
+    ACTIVITY_LABELS = {
+        "registration_telegram": "Новый пользователь Telegram",
+        "registration_web": "Регистрация на сайте",
+        "referral_joined": "Приглашение принято",
+        "trial_started": "Выдан пробный доступ",
+        "device_created": "Устройство добавлено",
+        "device_revoked": "Устройство отозвано",
+        "config_sent_to_owner": "VPN-профиль отправлен в Telegram",
+        "stars_paid": "Оплата Stars подтверждена",
+        "subscription_issued": "Подписка оформлена",
+        "vpn_connected": "Первое VPN-подключение",
+        "vpn_reconnected": "VPN-подключение восстановлено",
+        "vpn_access_ended": "VPN-доступ завершён",
+        "ticket_opened": "Новое обращение в поддержку",
+        "ticket_user_reply": "Сообщение пользователя в тикете",
+        "ticket_staff_reply": "Ответ сотрудника в тикете",
+        "ticket_closed_by_user": "Тикет закрыт пользователем",
+        "ticket_closed_by_staff": "Тикет закрыт поддержкой",
+        "ticket_reopened_by_user": "Тикет открыт повторно",
+        "ticket_reopened_by_staff": "Поддержка открыла тикет повторно",
+        "ticket_priority_changed": "Изменена важность тикета",
+        "test_delivery": "Проверка журнала событий",
+    }
+    ACTIVITY_ICONS = {
+        "registration_telegram": "👋", "registration_web": "👋",
+        "referral_joined": "👥", "trial_started": "🎁",
+        "device_created": "📱", "device_revoked": "🗑",
+        "config_sent_to_owner": "📄", "stars_paid": "⭐",
+        "subscription_issued": "✅", "vpn_connected": "🟢",
+        "vpn_reconnected": "🔄", "vpn_access_ended": "🔒",
+        "ticket_opened": "🎫", "ticket_user_reply": "💬",
+        "ticket_staff_reply": "✉️", "ticket_closed_by_user": "📁",
+        "ticket_closed_by_staff": "📁", "ticket_reopened_by_user": "🎫",
+        "ticket_reopened_by_staff": "🎫", "ticket_priority_changed": "⚑",
+        "test_delivery": "🧪",
+    }
+
     def record_event(s: AsyncSession, kind: str, user_id: int, details: str = "") -> None:
+        # Routine /start and web sign-ins aren't worth a service-group notification.
         # Never include passwords, .conf/private keys, auth tokens, email, or traffic contents.
-        if LOG_CHAT_ID:
+        if LOG_CHAT_ID and kind not in QUIET_ACTIVITY_EVENTS:
             s.add(ActivityEvent(kind=kind[:64], user_id=int(user_id), details=details[:700]))
 
     def audit(s: AsyncSession, admin_id: int, action: str, target: Any, details: str = ""):
@@ -1055,9 +1096,16 @@ if MODE == "app":
                      (" · " + details[:190] if details else ""))
 
     async def deliver_group_events() -> None:
-        """Committed event outbox: retries without holding DB connection over Telegram I/O."""
+        """Send only meaningful events; keep failures retryable and never block users."""
         if not LOG_CHAT_ID or not bot:
             return
+        # Discard old queued /start and routine website sign-in events on first run,
+        # even if they were produced by the previous release.
+        async with Session.begin() as s:
+            await s.execute(update(ActivityEvent).where(
+                ActivityEvent.sent_at.is_(None),
+                ActivityEvent.kind.in_(tuple(QUIET_ACTIVITY_EVENTS))
+            ).values(sent_at=now()))
         async with Session() as s:
             events = (await s.scalars(select(ActivityEvent).where(
                 ActivityEvent.sent_at.is_(None)
@@ -1066,22 +1114,43 @@ if MODE == "app":
             for evt in events:
                 user = await s.get(User, evt.user_id)
                 if user:
-                    full_name = html_escape((user.first_name + " " + user.last_name).strip() or "Имя не указано")
-                    username = "@" + html_escape(user.username) if user.username and not user.username.startswith("web:") else "без @username"
+                    real_username = user.username if user.username and not user.username.startswith("web:") else ""
+                    real_name = " ".join(part.strip() for part in (user.first_name, user.last_name) if part).strip()
+                    if real_name in ("", ".", "-", "_"):
+                        real_name = ("@" + real_username) if real_username else "Пользователь"
+                    safe_name = html_escape(real_name)
+                    username = "@" + html_escape(real_username) if real_username else ""
                     if user.id > 0:
-                        identity = f'<a href="tg://user?id={user.id}">{full_name}</a> · {username}'
+                        name_link = f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+                        identity = name_link + (f" · {username}" if username and username != safe_name else "")
                     else:
-                        identity = f"{full_name} · сайт (без Telegram)"
+                        identity = f"{safe_name} · веб-аккаунт"
                 else:
-                    identity = "Пользователь неизвестен"
-                text = (f"<b>STILL / {html_escape(evt.kind.replace('_', ' ').upper())}</b>\n"
-                        f"👤 {identity}\n🆔 <code>{evt.user_id}</code>\n"
-                        f"🕒 {evt.created_at:%d.%m.%Y %H:%M} UTC"
-                        + ("\n📝 " + html_escape(evt.details) if evt.details else ""))
-                outgoing.append((evt.id, text))
-        for event_id, text in outgoing:
+                    identity = "Данные пользователя недоступны"
+                label = ACTIVITY_LABELS.get(evt.kind, "Действие администратора" if evt.kind.startswith("admin_") else evt.kind.replace("_", " ").capitalize())
+                icon = ACTIVITY_ICONS.get(evt.kind, "🛠" if evt.kind.startswith("admin_") else "ℹ️")
+                when = evt.created_at
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=UTC)
+                try:
+                    when_text = when.astimezone(ZoneInfo("Europe/Riga")).strftime("%d.%m.%Y · %H:%M") + " (Рига)"
+                except Exception:
+                    when_text = when.astimezone(UTC).strftime("%d.%m.%Y · %H:%M") + " UTC"
+                message = (
+                    f"{icon} <b>{html_escape(label)}</b>\n\n"
+                    f"👤 <b>Пользователь:</b> {identity}\n"
+                    f"🆔 <b>ID:</b> <code>{evt.user_id}</code>"
+                )
+                if evt.kind.startswith("admin_"):
+                    action = evt.kind.removeprefix("admin_").replace("_", " ")
+                    message += f"\n⚙️ <b>Действие:</b> {html_escape(action)}"
+                if evt.details:
+                    message += f"\n📝 <b>Подробности:</b> {html_escape(evt.details)}"
+                message += f"\n🕒 {when_text}"
+                outgoing.append((evt.id, message))
+        for event_id, message in outgoing:
             try:
-                await bot.send_message(LOG_CHAT_ID, text, parse_mode="HTML",
+                await bot.send_message(LOG_CHAT_ID, message, parse_mode="HTML",
                                        disable_web_page_preview=True)
             except asyncio.CancelledError:
                 raise
@@ -1477,7 +1546,8 @@ if MODE == "app":
     def mini_url(section: str = "home") -> str:
         # WebAppInfo URL is opened inside the same Telegram bot WebView.
         # Keep navigation parameters separate from Telegram auth initData.
-        return WEBAPP_URL + "/?tab=" + section
+        # A release query prevents stale Telegram WebView cache after deployments.
+        return WEBAPP_URL + "/?tab=" + section + "&v=" + RELEASE
 
     def invite_link(uid: int) -> str:
         username = BOT_USERNAME["value"] or "StillVPNapp_bot"
@@ -1548,8 +1618,6 @@ if MODE == "app":
                         s.add(Referral(invitee_id=invitee_id, inviter_id=inviter_id))
                         record_event(s, "referral_joined", inviter_id,
                                      f"Приглашён новый пользователь · ID {invitee_id}")
-        async with Session.begin() as s:
-            record_event(s, "bot_start", message.from_user.id, "Открыл /start в Telegram")
         await send_user_menu(message)
 
     @router.message(Command("invite"))
@@ -3763,6 +3831,14 @@ if MODE == "app":
         shared["csrf"] = csrf
         return shared
 
+    @app.get("/web/api/public/plans", include_in_schema=False)
+    async def web_public_plans(s: AsyncSession = Depends(db_session)):
+        """Read-only catalog; public visitors never receive account or payment details."""
+        rows = (await s.scalars(select(Plan).where(Plan.enabled.is_(True))
+                                 .order_by(Plan.days, Plan.stars, Plan.id).limit(12))).all()
+        return [{"title": p.title, "days": p.days, "stars": p.stars,
+                 "devices": p.devices, "traffic_bytes": p.traffic_bytes} for p in rows]
+
     @app.get("/web/api/plans")
     async def web_plans(identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
         return await api_plans(identity[0], s)
@@ -4090,7 +4166,10 @@ if MODE == "app":
     @app.get("/web",response_class=HTMLResponse)
     @app.get("/web/",response_class=HTMLResponse)
     async def standalone_site():
-        return HTMLResponse(seo_public_html())
+        return HTMLResponse(seo_public_html(), headers={
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "X-Still-Release": RELEASE,
+        })
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
@@ -4098,7 +4177,10 @@ if MODE == "app":
 
     @app.get("/site", response_class=HTMLResponse, include_in_schema=False)
     async def standalone_site_alias():
-        return HTMLResponse(seo_public_html())
+        return HTMLResponse(seo_public_html(), headers={
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "X-Still-Release": RELEASE,
+        })
 
     @app.get("/web/terms",response_class=HTMLResponse)
     async def standalone_terms():
@@ -4117,7 +4199,10 @@ if MODE == "app":
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        return HTMLResponse(MINI_APP_HTML)
+        return HTMLResponse(MINI_APP_HTML, headers={
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "X-Still-Release": RELEASE,
+        })
 
     async def database_selftest():
         """Exercise the real configured database, then rollback every test record."""
@@ -4439,7 +4524,7 @@ else:
 # Telegram Web App UI is intentionally embedded here to honor the one-file request.
 # All data comes from the authenticated API; no fake subscriptions or statistics.
 STILL_WEB_HTML = r"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#100D11">
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#F3EFEA">
 <title>Still VPN — VPN для Android, iPhone и компьютера | WireGuard</title>
 <meta name="description" content="Still VPN — VPN на WireGuard с сервером в Нидерландах. Подключение через Telegram, тарифы и личный кабинет для Android, iPhone, Windows и macOS.">
 <meta name="robots" content="index,follow,max-image-preview:large">
@@ -4449,7 +4534,7 @@ STILL_WEB_HTML = r"""<!doctype html>
 <meta property="og:description" content="VPN через Telegram и личный кабинет. Нидерланды, Android, iPhone и компьютер.">
 <meta property="og:url" content="__STILL_CANONICAL__">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"Still VPN","url":"__STILL_CANONICAL__","inLanguage":"ru"}</script>
-<meta name="still-release" content="10.0.0">
+<meta name="still-release" content="13.0.0">
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
 *{box-sizing:border-box}html{scroll-behavior:smooth}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink)}
@@ -4535,19 +4620,187 @@ body{background:var(--bg)}header{height:77px}a.subtle-link{color:#ce9bb0;text-de
 @media(max-width:520px){.topnav{gap:8px}.topnav a{font-size:12px}.intro-copy{padding:28px 21px}.intro h1{font-size:clamp(40px,10.6vw,53px)}.intro .lead{font-size:14px}.intro .buttons .cta{width:100%}.hero-small-meta{gap:8px;font-size:9px}.hero-small-meta span:not(:last-child){padding-right:8px}.route-visual{grid-template-columns:1fr 28px 1fr}.route-end{font-size:42px}.community-strip{align-items:flex-start}.community-strip span{min-width:100%;flex:auto}}
 
 .seo-landing{border-top:1px solid var(--line);padding-top:36px;padding-bottom:40px}.seo-landing h2{max-width:830px}.seo-landing p{max-width:800px;color:var(--muted);font-size:14px}.seo-landing a{text-decoration:underline;text-underline-offset:4px;color:#d9b7cb}
+
+/* STILL / STUDIO 12 — restrained editorial site. The customer site stays light.
+   The member area uses the same typography, no faux VPN toggles or fake speeds. */
+:root{color-scheme:light;--bg:#F3EFEA;--panel:#FFFCF8;--red:#B9728B;--red2:#E9D9DC;--violet:#986075;--ink:#1A191B;--muted:#736D6E;--line:rgba(32,28,31,.13);--green:#3F8063}
+html,body{background:var(--bg);color:var(--ink)}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;letter-spacing:-.025em;-webkit-font-smoothing:antialiased}
+a:hover{color:#A8667B}::selection{background:#B9728B;color:white}
+header{max-width:1290px;height:86px;border-bottom:0;padding:0 38px}
+.logotype{font-size:24px;letter-spacing:.17em;font-weight:760;color:#181619}.logotype span{display:none}
+.iconmark{background:#B9728B;width:27px;height:27px;box-shadow:none}.iconmark:after{background:#F3EFEA}
+.topnav{display:flex;align-items:center;gap:28px}.topnav a{font-size:13px;color:#423C3E;font-weight:550}
+.topnav .header-login{color:#1A191B}.topnav .pill-link{color:white;background:#1A191B;border-radius:12px;padding:12px 17px}
+.shell{max-width:1290px;padding:0 38px;margin:auto}
+.intro{min-height:660px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(330px,.95fr);align-items:center;gap:70px;padding:48px 0 82px;background:transparent;border:0}
+.intro-copy{max-width:675px;padding:0}.intro-copy h1{font-weight:760;color:#171619;font-size:clamp(57px,6.2vw,94px);line-height:1.035;letter-spacing:-.077em;margin:34px 0 25px}
+.intro-copy h1 em{color:#A9657C;font-weight:760;font-style:normal}
+.intro-copy .lead{font-size:18px;line-height:1.64;color:#595153;max-width:525px;margin-bottom:32px;letter-spacing:-.018em}
+.intro .buttons .cta{background:#1A191B;border-color:#1A191B;color:#FFF9F3;box-shadow:none}.intro .buttons .cta.outline{background:transparent;border-color:#CBBFC0;color:#2A2326}.intro .buttons .cta:hover{background:#353034;color:#FFF9F3}.intro .buttons .cta.outline:hover{background:#E7DDDB;color:#2A2326}
+.studio-label{display:inline-flex;align-items:center;gap:9px;font-size:11px;letter-spacing:.115em;text-transform:uppercase;color:#8C5268;font-weight:760}
+.studio-dot{height:7px;width:7px;border-radius:50%;background:#B9728B;display:inline-block}
+.buttons{gap:13px;flex-wrap:wrap}.cta{background:#19181B;color:#F7F1EB;border:1px solid #19181B;border-radius:12px;min-height:53px;font-weight:650;padding:15px 23px;box-shadow:none}
+.cta:hover{background:#393235;color:#fff}.cta.outline{background:transparent;color:#272123;border:1px solid #CDC3BF}.cta.outline:hover{border-color:#8D7A7F}
+.studio-footnote{font-size:12px;color:#7A7373;margin:20px 0 0}
+.intro-art{background:#16161A!important;border:0!important;box-shadow:0 22px 65px rgba(27,20,24,.18);border-radius:26px!important;min-height:560px;padding:33px!important;color:#F3EEE8;display:flex;flex-direction:column;position:relative;overflow:hidden}
+.intro-art:before,.intro-art:after{content:none!important}
+.product-art-brand{display:flex;align-items:center;gap:9px;font-size:18px;letter-spacing:.17em}
+.product-art-brand .iconmark{background:#B9728B;width:22px;height:22px;flex:0 0 22px}.product-art-brand .iconmark:after{background:#16161A}
+.product-art-brand span{margin-left:auto;font-size:11px;letter-spacing:0;color:#B4A9AE}
+.product-art-status{color:#B6DEC4;background:#233A30;width:fit-content;border-radius:99px;font-size:12px;padding:9px 12px;margin:63px 0 14px}
+.studio-led{width:7px;height:7px;border-radius:50%;background:#96D9AE;display:inline-block;margin-right:6px}
+.product-art-heading{font-size:clamp(32px,3.1vw,47px);font-weight:690;letter-spacing:-.05em;line-height:1.12;margin-bottom:28px}
+.product-art-node{display:flex;align-items:center;gap:15px;border-radius:14px;background:#222126;padding:16px;margin-top:auto}
+.product-art-node>span:first-child{font-size:25px}.product-art-node>span:last-child{margin-left:auto;color:#D8A6B7;font-size:22px}
+.product-art-node div{display:flex;flex-direction:column;gap:3px}.product-art-node strong{font-size:15px}.product-art-node small{font-size:12px;color:#AFA6AD}
+.product-art-button{display:flex;justify-content:space-between;gap:10px;background:#B9728B;color:#20181C;padding:17px 18px;border-radius:12px;margin-top:14px;font-weight:700}
+.product-art-caption{font-size:11px;line-height:1.6;color:#918A90;margin-top:21px}
+.studio-features{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:34px;padding:32px 0 65px}
+.studio-features>div{min-width:0}.studio-features strong{display:block;font-size:15px;letter-spacing:-.02em}.studio-features p{font-size:13px;line-height:1.5;color:#756E71;margin:6px 0 0}
+.feature-icon{display:flex;align-items:center;justify-content:center;color:#AF6B83;background:#E9DCE0;width:38px;height:38px;border-radius:13px;margin-bottom:17px;font-size:21px}
+.studio-how{padding:90px 0 95px;background:#EAE4DF;border-radius:26px;margin:0 -20px;display:grid;grid-template-columns: .86fr 1.5fr;gap:35px}
+.studio-how-title{padding:0 32px 0 55px}.studio-how-title h2{font-size:clamp(29px,3.5vw,47px);line-height:1.13;letter-spacing:-.06em;margin:16px 0}.studio-how-title>p:last-child{color:#756B6D}
+.studio-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:25px;padding-right:36px}
+.studio-steps>div{padding:0 9px}.studio-steps span{background:#DEC9D0;color:#81485C;border-radius:10px;padding:9px;font-size:13px;font-weight:700;display:inline-block;margin-bottom:35px}
+.studio-steps strong{display:block;font-size:17px;letter-spacing:-.03em}.studio-steps p{color:#6F6668;font-size:13px;line-height:1.6}
+.studio-community{display:flex;align-items:center;justify-content:space-between;gap:38px;padding:86px 5px 72px}.studio-community h2{font-size:clamp(32px,4vw,51px);letter-spacing:-.06em;margin:10px 0}.studio-community p{max-width:510px;color:#746C6F}
+.studio-community-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.studio-community-actions a,.studio-community-actions button{background:#1D1A1D;color:white;border:1px solid #1D1A1D;border-radius:12px;padding:17px 21px;font-size:13px;font-weight:650}.studio-community-actions button{background:transparent;border-color:#C3B6B9;color:#282427}
+.auth-shell{border-radius:22px;background:#FFFCF9;border:1px solid #DDD1D0;padding:clamp(20px,4vw,46px);max-width:720px;margin:20px auto 70px!important;box-shadow:0 12px 35px #1F151410}
+.auth-tabs button{background:transparent;color:#756C70}.auth-tabs button.active{color:#191619;border-color:#A65D74}
+.field span{color:#625B5D}.field input{background:#FAF7F3;border-color:#D1C6C5;color:#222023;border-radius:10px}
+.field input:focus{border-color:#B9728B}#auth-error .notice{color:#5B2A3A}
+.seo-landing{color:#61585C;padding-bottom:60px}.seo-landing h2{color:#211C1D}.seo-landing a{color:#8E5068}
+footer{border-color:#D4C8C8;color:#746B6F}
+.subnav{border-color:#D5C9CA}.subnav button{color:#766C70}.subnav button.active{color:#272023;border-color:#A45F78}
+.side .note,.panel,.overview{background:#FFFCF9;border-color:#E1D5D5;color:#201D1F;border-radius:15px}
+.note,.notice,.listrow{color:#423B3E}.micro,.kicker,.muted,.small.muted{color:#776C70}
+.progress{background:#E3DADC}.progress i{background:#B9728B}
+textarea,select,input{color:#1E1B1D;background:#FFFCF9;border-color:#D6CACA}
+.codebox{background:#EAE5E0;color:#31262A;border-color:#D6CACA}
+@media(max-width:950px){header,.shell{padding-left:24px;padding-right:24px}.intro{gap:32px;min-height:0;padding-top:40px}.intro-copy h1{font-size:clamp(49px,6vw,75px)}.studio-how{display:block;padding:50px 20px}.studio-how-title{padding:0 18px 24px}.studio-steps{padding:0 18px}}
+@media(max-width:690px){header{height:70px;padding:0 20px}.shell{padding:0 20px}.topnav{gap:13px}.topnav .header-login{display:none}.topnav a{font-size:12px}.topnav .pill-link{padding:9px 12px}.intro{display:flex;flex-direction:column;align-items:stretch;gap:31px;padding:38px 0 50px}.intro-copy h1{font-size:clamp(53px,12vw,76px);margin:28px 0 18px}.intro-copy .lead{font-size:16px;line-height:1.55}.intro-art{min-height:430px;padding:25px!important;border-radius:19px!important}.product-art-status{margin:37px 0 14px}.product-art-heading{font-size:36px;margin-bottom:20px}.product-art-caption{margin-top:15px}.studio-features{grid-template-columns:repeat(2,1fr);gap:25px 20px;padding:20px 0 55px}.studio-how{margin:0 -12px;border-radius:18px;padding:44px 12px}.studio-steps{grid-template-columns:1fr;gap:18px}.studio-steps>div{padding:0 0 13px}.studio-steps span{margin-bottom:10px}.studio-community{display:block;padding:60px 0 35px}.studio-community-actions{margin-top:28px}.auth-shell{margin-top:30px!important}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+
+
+/* Brand-accurate symbol isolated from the original STILL logo supplied by owner. */
+.iconmark{background-image:url("data:image/png;base64,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")!important;background-color:transparent!important;background-repeat:no-repeat!important;background-size:contain!important;background-position:center!important;border-radius:0!important;transform:none!important;box-shadow:none!important;flex-shrink:0}
+.iconmark:after{display:none!important}
+
+/* STILL v13 — first approved product concept: real layout, no illustration dependency. */
+:root{--bg:#F5F0EB;--ink:#17171A;--muted:#706A6E;--line:#E5DBD7;--brand:#BA738D;--brand-ink:#863E5B;--paper:#FFFCF9;--soft:#EDE6E2;--green:#3C805D}
+html,body{background:var(--bg);color:var(--ink)}
+body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;line-height:1.55;letter-spacing:-.018em;-webkit-font-smoothing:antialiased}
+header{height:84px;max-width:1292px;padding:0 42px;border:0}
+.logotype{font-size:22px;letter-spacing:.175em;font-weight:800;gap:12px;color:#17171A}
+.iconmark{height:29px!important;width:33px!important}
+.topnav{gap:31px;color:#312C2F;font-weight:570}.topnav a:hover{color:var(--brand-ink)}
+.topnav .pill-link{display:inline-flex!important;background:var(--brand);color:#fff;border:0;border-radius:10px;padding:13px 19px;letter-spacing:0;font-size:13px;font-weight:700;white-space:nowrap}
+.topnav .pill-link:hover{background:#a45d78;color:white}
+.shell{max-width:1292px;padding:15px 42px 45px}
+.intro{grid-template-columns:minmax(0,1fr) minmax(330px,.86fr);gap:45px;border:0;min-height:520px;padding:42px 0 44px;align-items:center}
+.intro-copy{min-width:0}.intro-copy .studio-label{display:inline-flex;color:var(--brand-ink);font-size:12px;letter-spacing:.045em;text-transform:uppercase;font-weight:750}
+.studio-dot{background:var(--brand)!important}
+.intro-copy h1{font-size:clamp(49px,5.3vw,78px);line-height:1.035;letter-spacing:-.069em;font-weight:780;max-width:720px;margin:21px 0 22px;color:#141316}
+.intro-copy h1 em{font-style:normal;color:inherit}
+.intro-copy .lead{font-size:17px;line-height:1.53;color:#5D585D;max-width:535px}
+.intro-copy .buttons{margin-top:30px;align-items:center;gap:12px}
+.cta{background:#1F1E21;color:#fff;border:0;border-radius:11px;padding:13px 21px;font-size:14px;font-weight:700;min-height:49px;box-shadow:none;white-space:normal;text-align:center}
+.cta:hover{background:#393438;color:white}.cta.outline{background:transparent;border:1px solid #CFC4C4;color:#272327}.cta.outline:hover{background:#EBE3E0;color:#272327}
+.cta.tiny{background:var(--brand);color:white}.cta.tiny:hover{background:#A85E78}
+.studio-footnote{font-size:12px;color:#676067;line-height:1.5;margin-top:17px}
+.intro-art{min-height:400px!important;height:auto!important;background:transparent!important;border:0!important;padding:25px 13px 30px!important;overflow:visible!important;border-radius:0!important;display:flex;align-items:center;justify-content:center;isolation:isolate}
+.intro-art:before{content:""!important;position:absolute!important;inset:auto!important;right:5px!important;top:42px!important;width:89%!important;height:76%!important;border:0!important;border-radius:34% 43% 27% 40%!important;background:#E9CFD6!important;transform:rotate(-12deg)!important;opacity:.76;z-index:-1}
+.intro-art:after{display:none!important}
+.product-showcase{width:min(100%,365px);background:#17171B;color:#F3EFF0;border-radius:22px;box-shadow:0 28px 48px #231C212b,0 5px 14px #231C2122;transform:rotate(7deg);padding:24px 23px 23px;min-height:333px;border:1px solid #343038}
+.product-art-brand{display:flex;align-items:center;gap:9px;font-size:14px;letter-spacing:.13em;margin-bottom:22px}.product-art-brand .iconmark{width:24px!important;height:22px!important;filter:none}.product-art-brand b{font-weight:800}.product-art-brand>span{margin-left:auto;color:#ACA2AB;font-size:10px;letter-spacing:0}
+.product-showcase .product-art-status{display:inline-flex;align-items:center;gap:8px;background:#20372A;color:#B7E6C7;padding:8px 13px;border-radius:99px;font-size:11px;font-weight:690;margin:0 0 20px}
+.product-showcase .studio-led{background:#9ACCAA;width:8px;height:8px;border-radius:50%;display:inline-block}
+.product-art-heading{font-size:27px;font-weight:740;line-height:1.14;letter-spacing:-.04em;margin:0 0 21px}
+.product-art-node{display:flex;align-items:center;gap:12px;padding:15px 0;border-top:1px solid #363337;border-bottom:1px solid #363337;margin-bottom:12px}
+.product-art-node>span:first-child{font-size:25px}.product-art-node>span:last-child{margin-left:auto;color:#C5BDC3}
+.product-art-node div{display:flex;flex-direction:column;gap:2px}.product-art-node strong{font-size:14px}.product-art-node small{font-size:11px;color:#AAA2A7}
+.product-demo-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;font-size:11px;color:#AFA5AB}.product-demo-row strong{font-size:12px;color:#F4EEF0;font-weight:620}
+.product-demo-meter{height:5px;border-radius:20px;overflow:hidden;background:#40363E;margin:9px 0 0}.product-demo-meter>i{display:block;height:100%;width:38%;background:#BA738D;border-radius:20px}
+.product-art-caption{margin:15px 0 0;font-size:10px;color:#8F838B;line-height:1.5}
+.studio-features{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;margin:8px 0 0;padding:32px 0 49px;border-bottom:1px solid #E3D9D6}
+.studio-features>div{display:grid;grid-template-columns:42px 1fr;column-gap:13px;align-items:start;padding:6px 0}
+.feature-icon{width:40px;height:40px;margin:0!important;border-radius:50%;background:#F0E4E6;color:#A95A74;font-size:19px;grid-row:span 2}
+.studio-features strong{font-size:13px;letter-spacing:-.015em;line-height:1.24;margin-top:3px}.studio-features p{font-size:11px;color:#756F73;line-height:1.43;margin-top:4px}
+.studio-how{display:grid;grid-template-columns:minmax(180px,.8fr) 2fr;background:transparent;border:0;border-radius:0;padding:71px 0 65px;margin:0;gap:35px;border-bottom:1px solid #E3D9D6}
+.studio-how-title{padding:0}.studio-how-title h2{font-size:clamp(30px,3.5vw,47px);font-weight:770;letter-spacing:-.06em;max-width:260px;margin:0 0 15px;color:#161418}.studio-how-title>p:last-child{color:#766D71;font-size:13px}
+.studio-steps{grid-template-columns:repeat(3,minmax(0,1fr));gap:15px;padding:0}.studio-steps>div{padding:21px 18px 22px;background:#FFFCF9;border:1px solid #E6DAD7;border-radius:15px;box-shadow:0 8px 16px #6B56570a}
+.studio-steps span{font-size:12px;border-radius:8px;background:#ECD9DE;color:#95516B;padding:5px 9px;margin:0 0 24px;line-height:1.3}
+.studio-steps strong{font-size:15px;font-weight:730;line-height:1.3}.studio-steps p{font-size:12px;color:#756D71;line-height:1.48}
+.still-pricing{padding:78px 0 65px}.still-pricing-header{display:flex;justify-content:space-between;align-items:end;gap:25px;margin-bottom:26px}.still-pricing-header h2{font-size:clamp(34px,4vw,47px);letter-spacing:-.06em;font-weight:760;margin:4px 0}.still-pricing-header>p{font-size:13px;max-width:275px;color:#736B70;margin:0}
+.still-pricing-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.still-plan{padding:24px 23px;background:#FFFCF9;border:1px solid #E2D6D2;border-radius:17px;display:flex;flex-direction:column;min-height:220px;gap:10px}
+.still-plan.featured{background:#EAD8DF;border-color:#CDA4B3}.still-plan-top{display:flex;align-items:start;justify-content:space-between;gap:12px}.still-plan-top strong{font-size:19px;font-weight:770}.still-plan-tag{font-size:10px;border-radius:50px;background:#AE6882;color:white;padding:5px 9px;white-space:nowrap}
+.still-plan-meta{color:#676065;font-size:12px}.still-plan-cost{font-size:31px;font-weight:790;letter-spacing:-.05em;margin-top:11px}.still-plan-cost small{font-size:16px;font-weight:600;color:#53494E}.still-plan a{display:block;text-align:center;margin-top:auto;border-radius:10px;border:1px solid #C8B8B8;padding:11px;color:#292225;font-size:12px;font-weight:730;transition:background .2s}
+.still-plan.featured a{background:#B9728B;border-color:#B9728B;color:white}.still-plan a:hover{background:#EDDDE2}.still-plan.featured a:hover{background:#A45A74;color:white}
+.still-pricing-note{margin:14px 0 0;font-size:12px;color:#746A70}
+.studio-community{display:flex;justify-content:space-between;align-items:center;gap:22px;margin:8px 0 45px;padding:31px 34px;border-radius:19px;background:#EAE4E1}
+.studio-community h2{font-size:27px;line-height:1.2;letter-spacing:-.035em;margin:4px 0 6px}.studio-community p{font-size:12px;max-width:520px;margin:0}
+.studio-community-actions{gap:10px}.studio-community-actions a,.studio-community-actions button{padding:11px 16px;border-radius:9px;font-size:12px}
+.auth-shell{background:#FFFCF9;border:1px solid #E5D9D7;box-shadow:none}.field input,.field select,.field textarea{background:#FFFCF9;color:#282127;border-color:#D8CBCD}.field span{color:#675C61}
+#member{padding-top:32px}.panel,.overview{background:#FFFCF9;border-color:#E4D9D6;color:#252025}.subnav button.active{background:#EDDDE2;color:#372632;border-color:#CDAAB8}.side{border-color:#D8CFCC}
+.seo-landing{margin-top:32px;padding:35px 0;border-top:1px solid #E5DBD7}.seo-landing h2{font-size:24px}
+footer{padding:27px 0;color:#746D71;border-top:1px solid #E5DBD7;font-size:12px}
+@media(max-width:1030px){header{padding:0 24px}.shell{padding:10px 24px 40px}.intro{grid-template-columns:minmax(0,1fr) minmax(285px,.78fr);gap:17px}.intro-copy h1{font-size:clamp(47px,5.6vw,66px)}.studio-features{gap:10px}.studio-features>div{grid-template-columns:36px 1fr;gap:10px}.feature-icon{width:35px;height:35px}.studio-how{grid-template-columns:1fr;gap:20px}}
+@media(max-width:700px){header{height:70px;padding:0 18px}.shell{padding:4px 18px 30px}.topnav{gap:8px}.topnav a:not(.pill-link){display:none}.topnav .pill-link{font-size:11px;padding:10px 12px}.intro{display:flex;flex-direction:column;align-items:stretch;gap:12px;min-height:0;padding:36px 0 30px}.intro-copy h1{font-size:clamp(44px,12vw,68px);margin:19px 0 18px}.intro-copy .lead{font-size:15px}.intro-copy .buttons{display:flex;align-items:stretch;gap:9px;margin-top:21px}.intro-copy .buttons>*{flex:1;min-width:0;padding:12px 10px;font-size:12px}.studio-footnote{font-size:11px}.intro-art{min-height:360px!important;padding:20px 20px 30px!important}.product-showcase{transform:rotate(3deg);width:min(100%,318px);min-height:0;padding:19px 19px 22px}.intro-art:before{width:85%!important;left:10%!important;top:40px!important;height:78%!important}.product-art-heading{font-size:25px}.studio-features{grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 13px;padding:20px 0 32px}.studio-how{margin:0;padding:48px 0}.studio-how-title h2{font-size:34px;max-width:unset}.studio-steps{grid-template-columns:1fr;gap:10px}.studio-steps>div{padding:17px 18px;min-height:0}.studio-steps span{margin:0 0 11px}.still-pricing{padding:47px 0}.still-pricing-header{display:block}.still-pricing-header h2{font-size:36px}.still-pricing-cards{grid-template-columns:1fr;gap:10px}.still-plan{min-height:185px}.studio-community{padding:24px;display:block;margin-bottom:30px}.studio-community-actions{margin-top:23px}.studio-community h2{font-size:25px}.auth-shell{padding:24px 20px}.seo-landing{font-size:13px}}
+@media(max-width:345px){.intro-copy h1{font-size:40px}.intro-copy .buttons{flex-direction:column}.intro-art{padding-left:7px!important;padding-right:7px!important}.studio-features{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+.intro-art{box-shadow:none!important}
+@media(max-width:360px){.auth-tabs{flex-wrap:wrap;gap:10px 14px}.auth-tabs button{font-size:12px;padding-bottom:9px}}
+@media(min-width:1031px){.intro-copy h1{font-size:clamp(51px,4.4vw,68px)}}
+.studio-steps{align-items:start}
+.studio-steps>div{min-height:175px}
+@media(max-width:700px){.studio-steps>div{min-height:0}}
+
 </style></head>
 <body>
-<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL <span style="font-weight:400;letter-spacing:.13em;color:#d7c6ce">VPN</span></a><span class="micro desktop">EUROPE / PRIVATE NETWORK</span><nav class="topnav"><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал ↗</a><a href="/web/terms" class="hide-mobile">Условия</a><a href="#" id="bot-link" class="pill-link hidden" target="_blank" rel="noopener noreferrer">Telegram ↗</a></nav></header>
+<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL</a><nav class="topnav"><a href="#about-still" class="hide-mobile">Возможности</a><a href="#how-it-works" class="hide-mobile">Как подключиться</a><a href="#tariffs" class="hide-mobile">Тарифы</a><a href="#authorization" class="header-login">Кабинет</a><a href="https://t.me/StillVPNapp_bot" id="bot-link" class="pill-link" target="_blank" rel="noopener noreferrer">Открыть в Telegram ↗</a></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
-<section class="intro"><div class="intro-copy"><p class="kicker">STILL / VPN WITH INTENTION — 10</p><h1>Тише снаружи.<br><em>Свободнее внутри.</em></h1><p class="lead">Интернет для твоих привычных дел. Смотри, общайся, работай — VPN на WireGuard без сложных настроек и скрытых лимитов.</p><div class="buttons"><button class="cta" id="intro-create">Начать со Still VPN <span aria-hidden="true">↗</span></button><button class="cta outline" id="intro-login">Войти в кабинет</button></div><div class="hero-small-meta"><span>01 / WireGuard</span><span>02 / Нидерланды</span><span>03 / Android · iOS · PC</span></div></div><div class="intro-art"><div class="workflow-title"><span class="micro">ВАШ МАРШРУТ</span><span class="workflow-tag">STILL / CONNECTION</span></div><div class="route-visual"><span class="route-start">УСТРОЙСТВО</span><span class="route-line"><i></i></span><span class="route-end">NL <small>НИДЕРЛАНДЫ</small></span></div><div class="route-data"><div><span>ПРОТОКОЛ</span><strong>WireGuard®</strong></div><div><span>УЗЕЛ</span><strong>Europe / NL</strong></div><div><span>НАСТРОЙКА</span><strong>Свой .conf для каждого устройства</strong></div></div><div class="route-footer"><span>Подключение на твоих условиях.</span><b>→ STILL</b></div></div></section>
-<div class="intro-list"><div><strong>01 / Приватное подключение</strong><p>Уникальный WireGuard-профиль для каждого устройства. Приватный ключ отправляется только по вашему запросу в личный Telegram-чат.</p></div><div><strong>02 / Всё под контролем</strong><p>Срок подписки, трафик и список подключений всегда в кабинете.</p></div><div><strong>03 / Свой путь</strong><p>Вход через Telegram или отдельно на сайте. <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer" class="subtle-link">Следить за обновлениями ↗</a></p></div></div><div class="community-strip"><span><b>НЕ ТОЛЬКО VPN</b><small>Новости, обновления и советы — в нашем Telegram-канале.</small></span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Читать канал ↗</a><button id="share-site" type="button">Поделиться Still VPN ↗</button></div>
-<section class="auth-shell" id="authorization" style="margin-top:80px"><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
+<section class="intro" id="about-still">
+<div class="intro-copy"><span class="studio-label"><i class="studio-dot"></i> STILL VPN · WIREGUARD</span>
+<h1>Интернет<br>на твоих условиях.</h1>
+<p class="lead">VPN на WireGuard с управлением через Telegram. Подключай телефон или компьютер — без сложных настроек и непонятных условий.</p>
+<div class="buttons"><a class="cta" id="intro-trial" href="https://t.me/StillVPNapp_bot" target="_blank" rel="noopener noreferrer">↗ &nbsp;Попробовать бесплатно</a><button class="cta outline" id="intro-create" type="button">Создать аккаунт</button><button class="cta outline hidden" id="intro-login" type="button">Войти</button></div>
+<p class="studio-footnote">24 часа и 1 ГБ для новых пользователей · Сервер в Нидерландах</p>
+</div>
+<div class="intro-art" aria-label="Пример интерфейса Still VPN, данные демонстрационные">
+<div class="product-showcase">
+<div class="product-art-brand"><i class="iconmark" aria-hidden="true"></i><b>STILL</b><span>ПРИМЕР ПРИЛОЖЕНИЯ</span></div>
+<div class="product-art-status"><i class="studio-led"></i> Подписка активна</div>
+<div class="product-art-heading">Всё готово<br>к подключению.</div>
+<div class="product-art-node"><span aria-hidden="true">🇳🇱</span><div><strong>Нидерланды</strong><small>WireGuard · EU / NL</small></div><span aria-hidden="true">›</span></div>
+<div class="product-demo-row"><span>Подписка</span><strong>Доступ активен</strong></div>
+<div class="product-demo-row"><span>Профиль</span><strong>Подготовлен</strong></div>
+<div class="product-demo-meter"><i></i></div>
+<div class="product-art-caption">Пример интерфейса · данные демонстрационные</div>
+</div></div>
+</section>
+<section class="studio-features" aria-label="Возможности Still VPN">
+<div><span class="feature-icon" aria-hidden="true">ϟ</span><strong>WireGuard</strong><p>Быстрое и понятное подключение.</p></div>
+<div><span class="feature-icon" aria-hidden="true">◎</span><strong>Нидерланды</strong><p>Европейский VPN-сервер.</p></div>
+<div><span class="feature-icon" aria-hidden="true">▣</span><strong>Твои устройства</strong><p>Телефон и компьютер в одном кабинете.</p></div>
+<div><span class="feature-icon" aria-hidden="true">◇</span><strong>Защита соединения</strong><p>Шифрование между устройством и сервером.</p></div>
+</section>
+<section class="studio-how" id="how-it-works"><div class="studio-how-title"><p class="kicker">КАК НАЧАТЬ</p><h2>Как<br>подключиться</h2><p>Три простых шага, чтобы начать.</p></div>
+<div class="studio-steps"><div><span>01</span><strong>Открой Still VPN</strong><p>Войди через сайт или Telegram-бота.</p></div><div><span>02</span><strong>Получи профиль</strong><p>Сохрани конфигурацию WireGuard или получи её в Telegram.</p></div><div><span>03</span><strong>Включи VPN</strong><p>Импортируй профиль в WireGuard и включи соединение.</p></div></div></section>
+<section class="still-pricing" id="tariffs" aria-labelledby="pricing-title">
+  <div class="still-pricing-header"><div><p class="kicker">ВЫБЕРИ СВОЙ ДОСТУП</p><h2 id="pricing-title">Тарифы Still VPN</h2></div><p>Цена и объём трафика прозрачны. Оплата цифровой подписки — через Telegram Stars.</p></div>
+  <div class="still-pricing-cards" id="public-pricing" aria-live="polite"><p class="muted">Загружаем актуальные тарифы…</p></div>
+  <p class="still-pricing-note">Доступность тарифов и условия пробного периода могут меняться. Перед покупкой проверьте параметры в боте.</p>
+</section>
+<section class="studio-community"><div><span class="studio-label">STILL / COMMUNITY</span><h2>Мы на связи.</h2><p>Не получилось подключиться? Поддержка Still VPN поможет разобраться. Новости и инструкции — в нашем канале.</p></div><div class="studio-community-actions"><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал ↗</a><button id="share-site" type="button">Поделиться Still VPN</button></div></section>
+<section class="auth-shell" id="authorization" ><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
 <section class="seo-landing" aria-label="Информация о Still VPN"><h2>VPN на WireGuard для телефона и компьютера</h2><p>Still VPN помогает настроить защищённое соединение на Android, iPhone, Windows и macOS. Управляйте подпиской, пробным доступом и устройствами в Telegram Mini App или через личный кабинет сайта. Основной VPN-сервер расположен в Нидерландах.</p><p>После создания устройства скачайте файл WireGuard (.conf) или запросите его в личном чате Telegram. Для включения VPN импортируйте файл в приложение WireGuard. Лимиты трафика, срок и количество устройств зависят от выбранного тарифа.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a> · <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал Still VPN ↗</a></section>
 </div>
 <div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
 
-<footer><span>© Still VPN · EDITION 10 · BUILT FOR EVERYDAY CONNECTION</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
+<footer><span>© Still VPN · 2026 · Интернет на твоих условиях</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
 </main>
 <script>
 (()=>{'use strict';
@@ -4627,7 +4880,20 @@ $$('[data-webticket]').forEach(b=>b.onclick=()=>openWebTicket(Number(b.dataset.w
 async function openWebTicket(id){const box=$('#my-tickets');try{const t=await api('tickets/'+id);box.innerHTML=`<button class="cta plain tiny" id="ticket-back">← К обращениям</button><h3>Обращение #${t.id} (${esc(t.status)})</h3>`+t.messages.map(m=>`<div class="panel"><span class="small muted">${m.sender==='admin'?'Поддержка':'Вы'} · ${date(m.date)}</span><p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</p></div>`).join('')+(t.status!=='closed'?`<form id="ticket-reply"><label class="field"><span>Ваш ответ</span><textarea id="reply-text" maxlength="3500" required style="width:100%;min-height:80px;background:#1b151a;color:#fff;padding:12px;border:1px solid #43343e;border-radius:9px"></textarea></label><button class="cta tiny">Отправить</button></form>`:'');$('#ticket-back').onclick=loadWebTickets;
 if($('#ticket-reply'))$('#ticket-reply').onsubmit=async ev=>{ev.preventDefault();try{await api('tickets/'+id+'/reply',{method:'POST',body:JSON.stringify({text:$('#reply-text').value.trim()})});await openWebTicket(id)}catch(e){toast(e.message,true)}};
 }catch(e){toast(e.message,true)}}
-async function init(){try{config=await api('config');if(config.bot_url){const b=$('#bot-link');b.href=config.bot_url;b.classList.remove('hidden');$('#footer-bot').innerHTML=`<a target="_blank" rel="noopener noreferrer" href="${esc(config.bot_url)}">Открыть Telegram-бота ↗</a>`}if(!config.registration_enabled){$$('[data-auth="register"]').forEach(x=>x.disabled=true);$('#intro-create').disabled=true}await loadMe()}catch(e){toast(e.message,true)}}
+async function loadPublicPlans(){
+ const box=$('#public-pricing');if(!box)return;
+ try{
+   const r=await fetch('/web/api/public/plans',{credentials:'omit',headers:{'Accept':'application/json'}});
+   if(!r.ok)throw new Error('Каталог недоступен');
+   const list=await r.json();if(!Array.isArray(list))throw new Error('Неверный формат тарифов');
+   if(!list.length){box.innerHTML='<p class="muted">Тарифы скоро появятся. Следите за обновлениями в канале Still VPN.</p>';return;}
+   const n=list.slice(0,6);
+   const priceBytes=x=>x==null?'Без лимита':Math.round(Number(x)/1073741824)+' ГБ';
+   const target=config?.bot_url||'https://t.me/StillVPNapp_bot';
+   box.innerHTML=n.map((p,i)=>`<article class="still-plan ${i===Math.floor(Math.min(n.length,3)/2)?'featured':''}"><div class="still-plan-top"><strong>${esc(p.title)}</strong>${i===Math.floor(Math.min(n.length,3)/2)?`<span class="still-plan-tag">${Number(p.days)} дней</span>`:''}</div><div class="still-plan-meta">${Number(p.days)} дней · ${priceBytes(p.traffic_bytes)} · ${Number(p.devices)} устр.</div><div class="still-plan-cost">${Number(p.stars)} <small>⭐ Stars</small></div><a href="${esc(target)}" target="_blank" rel="noopener noreferrer">Выбрать в Telegram ↗</a></article>`).join('');
+ }catch(e){box.innerHTML='<p class="muted">Не удалось загрузить тарифы. Посмотрите актуальные предложения в Telegram-боте.</p>';}
+}
+async function init(){loadPublicPlans();try{config=await api('config');if(config.bot_url){const b=$('#bot-link');b.href=config.bot_url;b.classList.remove('hidden');$('#intro-trial').href=config.bot_url;$('#footer-bot').innerHTML=`<a target="_blank" rel="noopener noreferrer" href="${esc(config.bot_url)}">Открыть Telegram-бота ↗</a>`}loadPublicPlans();if(!config.registration_enabled){$$('[data-auth="register"]').forEach(x=>x.disabled=true);$('#intro-create').disabled=true}await loadMe()}catch(e){toast(e.message,true)}}
 init();
 })();
 </script></body></html>"""
@@ -4635,7 +4901,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>STILL VPN / EDITION 11</title><meta name="still-release" content="11.0.0"><meta name="robots" content="noindex,nofollow">
+<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.0"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -4804,9 +5070,111 @@ body{background:var(--bg)}#app{padding-top:calc(env(safe-area-inset-top) + 19px)
 .ticket-admin-filter select,.ticket-admin-filter input{flex:1;min-width:100px;max-width:100%;background:#1d1a20;border:1px solid #53424c;border-radius:5px;color:#e8dfe3;padding:11px;font:inherit;font-size:12px}
 .ticket-admin-note{padding:12px 14px;border-left:3px solid #ac748b;background:#261e26;font-size:12px;color:#d9c5cd;line-height:1.55}
 @media(max-width:370px){.ticket-priority-grid{grid-template-columns:1fr}.ticket-priority-grid label{flex-direction:row;align-items:center}.ticket-priority-grid label span{gap:8px}}
+
+/* STILL / STUDIO 12 — focus on the active connection, not an admin dashboard. */
+:root{--bg:#111114;--soft:#1C1B1F;--red:#B9728B;--deep:#31242B;--violet:#B9728B;--ink:#F4EEE8;--muted:#AEA6A9;--hair:rgba(244,238,232,.10);--signal:#B9728B}
+html,body{background:var(--bg);color:var(--ink)}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-feature-settings:"tnum" 1;-webkit-font-smoothing:antialiased;letter-spacing:-.02em}
+#app{padding:calc(env(safe-area-inset-top) + 18px) 21px calc(env(safe-area-inset-bottom) + 112px)}
+.top{margin:0 0 25px;padding:10px 0;border:0}.wordmark{font-size:22px;letter-spacing:.17em;font-weight:800}
+.mark{width:25px;height:25px;background:#B9728B;border-radius:7px 6px 5px 7px}.mark:after{background:var(--bg)}
+.top>.muted{font-size:10px;letter-spacing:.06em;text-transform:none}
+h1,h2,h3{letter-spacing:-.047em}h1{line-height:1.08}
+.button{border:0;background:#B9728B;color:#21181D;font-weight:690;border-radius:13px;min-height:54px}.button.secondary{color:#F4EEE8;border:1px solid #54454C;background:transparent}.button.ghost{background:transparent;border:1px solid #55464E;color:#C8B7BF}
+.button.compact{min-height:42px}.button:active{transform:scale(.987)}
+input,select,.ticket-form input,.ticket-form textarea,.ticket-form select{background:#201E22;border-color:#55484F;color:#F4EEE8;border-radius:10px}
+input:focus,select:focus{border-color:#B9728B}
+.panel{background:#201E22;border-color:#393438;border-radius:15px}.admin-nav button.active{background:#3D2A34;border-color:#B9728B}
+.tabs{background:rgba(17,17,20,.98);border-top:1px solid rgba(240,234,230,.10);padding-top:12px}.tabs button{color:#999298;font-size:10px;gap:6px}.tabs button.active{color:#D893AA}.tabs button.active svg{stroke-width:2.1}
+.tabs svg{width:21px;height:21px}
+.studio-home{padding-top:15px}.studio-home-intro{padding:0 3px 20px}
+.studio-status{display:inline-flex;align-items:center;gap:8px;color:#A5D3B7;background:#20382A;border-radius:99px;padding:9px 13px;font-size:12px;font-weight:650}
+.studio-status i{width:8px;height:8px;background:#98D2AE;border-radius:50%}.studio-status.inactive{color:#DFC3B4;background:#3A2928}.studio-status.inactive i{background:#E0B595}
+.studio-home-intro h1{font-size:clamp(36px,9vw,48px);font-weight:740;letter-spacing:-.067em;line-height:1.08;margin:21px 0 12px}
+.studio-home-intro p{margin:0;color:#BBB2B5;font-size:13px;line-height:1.55}
+.studio-node{background:#222125;border:1px solid rgba(240,233,230,.065);border-radius:21px;padding:21px;margin:16px 0 25px}
+.studio-node-row{display:flex;align-items:center;gap:13px}.studio-flag{width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:#2B292C;font-size:26px}
+.studio-node-title{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}.studio-node-title strong{font-size:17px;line-height:1.2}.studio-node-title span{font-size:12px;color:#ABA1A7}
+.studio-arrow{color:#B9B1B7;font-size:18px}
+.studio-node-signal{margin:18px 0 17px}.studio-server-line{border-top:1px solid rgba(237,226,229,.10);padding:16px 0 0;display:flex;justify-content:space-between;align-items:center;gap:12px}.studio-server-line small{color:#A79EA3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+.studio-signal-on,.studio-signal-off{font-size:12px;color:#A5D2B6;display:inline-flex;align-items:center;gap:8px}.studio-signal-on:before,.studio-signal-off:before{content:'';width:7px;height:7px;border-radius:50%;background:#98D2AE}.studio-signal-off{color:#D6B7AB}.studio-signal-off:before{background:#DDB5A0}
+.studio-node-signal p{margin:0;font-size:12px}
+.studio-main-action{display:flex;align-items:center;justify-content:space-between;text-align:left;padding:16px 18px;font-size:15px}
+.studio-main-action span{font-size:19px;line-height:1}
+/* Keep the non-home flows consistent with the compact first concept. */
+.vpn-control{background:#211F23;border:1px solid #3A343A;border-radius:18px;box-shadow:none;padding:21px}
+.vpn-power{background:#31272F;border:1px solid #594251;border-radius:17px;box-shadow:none;color:#D398AD}
+.vpn-control-main h2{font-size:20px}.vpn-how{border-color:#52424B}
+.ticket-card{background:#201E22;border:1px solid #3C353B;border-radius:15px;padding:18px}
+.ticket-form{background:#201F23;border:1px solid #413941;border-radius:15px}
+.ticket-bubble,.ticket-bubble.staff{border-radius:14px}
+.ticket-bubble.staff{background:#30252D;border-color:#624456}
+.ticket-priority-grid label{border-radius:10px}
+.ticket-filter button{border-radius:99px}
+.ticket-filter button.active{background:#B9728B;border-color:#B9728B;color:#201A1E}
+.admin-table{border-top-color:#40363E}.admin-item{border-bottom-color:#40363E}
+.studio-hint{margin:12px 0 0;font-size:11px;line-height:1.45;color:#A59BA2;text-align:center}
+.studio-numbers{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:4px 0 7px}
+.studio-numbers>div{min-width:0}.studio-numbers>div+div{padding-left:19px;border-left:1px solid rgba(240,234,230,.12)}
+.studio-numbers span{display:block;font-size:12px;color:#A89DA4;margin-bottom:8px}.studio-numbers strong{display:block;font-size:25px;line-height:1.2;letter-spacing:-.055em;font-weight:720;white-space:nowrap}
+.studio-numbers small{display:block;color:#AAA2A7;margin-top:8px;font-size:11px}
+.studio-usage{margin:18px 0 30px;background:#393239;height:5px;border-radius:99px}.studio-usage span{background:#B9728B;border-radius:99px}
+.studio-ticket-link{display:flex;gap:13px;align-items:center;width:100%;text-align:left;padding:18px;background:#201F23;border:1px solid rgba(240,234,230,.07);color:#F3EFEA;border-radius:16px;font:inherit;margin:25px 0 28px}
+.studio-ticket-link>span:nth-child(2){flex:1;display:flex;flex-direction:column;gap:4px}.studio-ticket-link b{font-size:15px}.studio-ticket-link small{font-size:11px;color:#AFA5AC}
+.studio-ticket-link>span:last-child{font-size:21px;color:#D29AAD}.studio-ticket-icon{color:#DB9AAF;background:#372932;border-radius:10px;padding:12px;font-size:19px}
+.studio-extra-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:8px 0 14px}.studio-extra-head strong{font-size:17px}.studio-extra-head button{background:transparent;border:0;color:#D49DB1;font-size:12px;padding:8px 0}
+.studio-extra-links{display:flex;flex-direction:column}.studio-extra-links button{background:transparent;text-align:left;border:0;border-bottom:1px solid rgba(240,234,230,.09);padding:15px 0;color:#EEE5E5;font:inherit;font-size:14px}
+.edition-footer{margin-top:26px;color:#827981;border-top:0;letter-spacing:.05em}.edition-footer a{color:#CDA6B5}
+@media(max-width:380px){#app{padding-left:16px;padding-right:16px}.studio-node{padding:17px}.studio-home-intro h1{font-size:35px}.studio-numbers strong{font-size:22px}.tabs button{font-size:9px}}
+@media(min-width:700px){#app{padding-left:29px;padding-right:29px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important}}
+
+
+/* Brand-accurate symbol isolated from the original STILL logo supplied by owner. */
+.mark{background-image:url("data:image/png;base64,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")!important;background-color:transparent!important;background-repeat:no-repeat!important;background-size:contain!important;background-position:center!important;border-radius:0!important;transform:none!important;box-shadow:none!important;flex-shrink:0}
+.mark:after{display:none!important}
+
+/* STILL v13 — approved dark Mini App: four destinations, one primary action. */
+:root{--bg:#111114;--soft:#202023;--ink:#F5F0EE;--muted:#ABA2A7;--hair:rgba(241,231,234,.1);--red:#B9728B;--violet:#B9728B;--brand:#B9728B}
+html,body{background:var(--bg);color:var(--ink)}
+body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;line-height:1.5;-webkit-font-smoothing:antialiased}
+#app{max-width:620px;padding:calc(env(safe-area-inset-top) + 25px) 23px calc(env(safe-area-inset-bottom) + 115px)}
+.top{display:flex;align-items:center;justify-content:space-between;margin:0 0 23px;padding:1px 0 20px;border-bottom:0}
+.wordmark{display:flex;align-items:center;gap:14px;font-size:29px;letter-spacing:.14em;font-weight:800}.mark{width:36px!important;height:32px!important}
+.top-profile{background:#222125;border:1px solid #3A373C;color:#DDD3D7;border-radius:100px;width:44px;height:44px;display:grid;place-items:center;font-size:21px;padding:0}.top-profile:hover{background:#312A30}
+h1,h2,h3{letter-spacing:-.042em}.kicker{color:#D39AB0;font-size:10px}.small{font-size:12px;color:inherit}.muted{color:var(--muted)}
+.studio-home{padding:0}.studio-home-intro{padding:0 1px 3px}.studio-status{background:#1E392A;color:#AFE3BF;padding:9px 12px;font-size:12px}.studio-status i{background:#A3D5B3}
+.studio-home-intro h1{font-size:22px;line-height:1.15;letter-spacing:-.035em;margin:16px 0 7px;font-weight:750}
+.studio-home-intro p{font-size:12px;color:#B9AFB5;line-height:1.45;margin:0}
+.studio-node{background:#202023;border:1px solid #312E32;border-radius:22px;padding:20px 21px 18px;margin:19px 0 23px}
+.studio-node-row{gap:13px}.studio-flag{width:48px;height:48px;background:#302D32;font-size:25px;border-radius:50%}.studio-node-title strong{font-size:18px;font-weight:740}.studio-node-title span{font-size:12px;color:#B2A9AE}.studio-arrow{font-size:20px;color:#B7AFB4}
+.studio-node-details{margin:17px 0 22px;border-top:1px solid rgba(238,227,232,.10);border-bottom:1px solid rgba(238,227,232,.10);padding:4px 0}
+.studio-node-details .studio-mini-stat{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:12px 0;font-size:12px}
+.studio-mini-stat+.studio-mini-stat{border-top:1px solid rgba(238,227,232,.075)}.studio-mini-stat span{color:#AFA5AC}.studio-mini-stat strong{font-size:12px;font-weight:650;color:#E7DEE2;text-align:right;line-height:1.3}
+.studio-mini-stat .status-ready{color:#A3DAB7}.studio-mini-stat .status-idle{color:#D8BBB8}
+.studio-main-action{min-height:55px;border:0;background:#BD778F;color:#fff;font-size:14px;letter-spacing:-.015em;font-weight:750;border-radius:12px;box-shadow:none}
+.studio-main-action:hover{background:#C9869F}.studio-hint{text-align:left;color:#A79CA3;margin:12px 0 0;font-size:11px;line-height:1.45}
+.studio-numbers{margin:7px 0 1px;gap:19px}.studio-numbers>div+div{border-left:1px solid rgba(241,231,234,.09)}.studio-numbers span{font-size:12px;color:#ABA0A7}.studio-numbers strong{font-size:24px;letter-spacing:-.045em}.studio-numbers small{font-size:11px;color:#A79EA4}
+.studio-usage{margin:15px 0 23px;background:#3A3338;height:6px}.studio-usage span{background:#BB768F}
+.studio-ticket-link{border-radius:17px;margin:18px 0 22px;background:#222125;border:1px solid #343034;padding:17px 16px}.studio-ticket-link b{font-size:14px}.studio-ticket-link small{font-size:11px}.studio-ticket-icon{display:grid;place-items:center;background:#3E2B35;color:#DDA5B8;border-radius:12px;width:46px;height:46px;padding:0}
+.studio-extra-head{margin:17px 0 3px}.studio-extra-head strong{font-size:16px}.studio-extra-links button{padding:14px 0;font-size:13px}.studio-extra-links button:last-child{border-bottom:0}
+.studio-home .edition-footer{display:none}
+.tabs{background:rgba(20,19,22,.97);padding:10px max(14px,env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left));border-top:1px solid rgba(238,228,231,.1);justify-content:space-evenly;box-shadow:0 -8px 24px #05030640}
+.tabs button{font-size:11px;min-width:0;flex:1;color:#A8A1A7;gap:7px;padding:5px 1px}.tabs button.active{color:#D895AB}.tabs svg{width:22px;height:22px;stroke-width:1.75}.tabs button.active svg{stroke-width:2}
+.button{background:#B9728B;color:#21171E;border:0;border-radius:12px;font-size:14px;font-weight:710;min-height:51px}.button:hover{background:#CA86A0}.button.secondary{background:#2B252B;border:1px solid #4A4047;color:#F6EFF1}.button.ghost{border:1px solid #4B4148;background:transparent;color:#CBBEC5}
+.button.compact{min-height:42px}.panel{background:#212024;border:1px solid #383238;border-radius:16px}.plan{border-color:#393238}.plan .price{font-weight:730}
+input,select,textarea,.ticket-form input,.ticket-form textarea,.ticket-form select{border:1px solid #50444C;background:#262127;color:#F5ECEF;border-radius:11px;outline-offset:2px}input:focus,select:focus,textarea:focus{border-color:#D18EA7}
+.ticket-card{border-radius:15px;background:#222024}.ticket-form{border-radius:15px;background:#212024}.ticket-bubble.staff{background:#30242D}
+.vpn-control{border-radius:17px;background:#222025;border-color:#423941}.vpn-power{background:#382934;color:#DCA1B7}
+.notice{border-radius:12px;background:#30232C;color:#EDD0DE;border-color:#5C3C50}.notice.error{background:#42252F;border-color:#A25A70}
+.top-profile:focus-visible,.tabs button:focus-visible,.studio-ticket-link:focus-visible,.studio-extra-links button:focus-visible{outline:2px solid #E0AFC0;outline-offset:3px}
+@media(max-width:370px){#app{padding-left:16px;padding-right:16px}.wordmark{font-size:25px}.studio-node{padding:17px}.studio-home-intro h1{font-size:21px}.studio-numbers strong{font-size:21px}.tabs button{font-size:10px}}
+@media(min-width:700px){#app{padding-left:34px;padding-right:34px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
+
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
-<div id="app"><div class="top"><div class="wordmark"><i class="mark"></i>STILL</div><span class="muted small">VPN / EDITION 11</span></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
+<div id="app"><div class="top"><div class="wordmark"><i class="mark" aria-hidden="true"></i>STILL</div><button id="open-profile-top" class="top-profile" type="button" aria-label="Открыть профиль"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/></svg></button></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
 <nav class="tabs" id="tabs" aria-label="Разделы"></nav>
 <script>
 (()=>{
@@ -4825,8 +5193,8 @@ async function api(path,opts={}){
  if(!r.ok){const d=out.detail;throw new Error(typeof d==='string'?d:'Ошибка запроса '+r.status)}return out;
 }
 function nav(to){page=to;currentConfig=null;drawTabs();render();window.scrollTo(0,0)}
-const icons={tickets:'<path d="M4 4h16v13H8l-4 3z"/><path d="M8 9h8M8 13h5"/>',admin:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-5"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
-function drawTabs(){const items=[['home','Главная'],['plans','Тарифы'],['connect','VPN'],['tickets','Тикеты'],['account','Профиль']];if(me?.admin_role)items.push(['admin','Админ']);tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" class="${page===id?'active':''}"><svg viewBox="0 0 24 24">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
+const icons={tickets:'<path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="2" y="12" width="4" height="8" rx="2"/><rect x="18" y="12" width="4" height="8" rx="2"/><path d="M20 20c0 2-3 2-5 2h-2"/>',admin:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',home:'<path d="m3 10 9-7 9 7v10H3z"/><path d="M9 20v-7h6v7"/>',plans:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',connect:'<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M10 18h4"/>',account:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/>'};
+function drawTabs(){const items=[['home','Главная'],['connect','Устройства'],['tickets','Поддержка'],['account','Профиль']];const selected=page==='plans'||page==='admin'?'account':page;tabs.innerHTML=items.map(([id,label])=>`<button data-nav="${id}" aria-label="${label}" aria-current="${selected===id?'page':'false'}" class="${selected===id?'active':''}"><svg viewBox="0 0 24 24" aria-hidden="true">${icons[id]}</svg>${label}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>nav(b.dataset.nav))}
 const section=(label,title,desc='')=>`<p class="kicker">${label}</p><h1>${title}</h1>${desc?`<p class="para muted">${desc}</p>`:''}`;
 function activeText(){if(!me.subscription)return 'Нет активной подписки';const ms=new Date(me.subscription.end)-Date.now();return ms>0?Math.ceil(ms/86400000)+' дн. осталось':'Срок действия истёк'}
 function render(){if(!me){main.innerHTML='<p class="muted">Подключение к Still VPN…</p>';return}
@@ -4834,30 +5202,52 @@ function render(){if(!me){main.innerHTML='<p class="muted">Подключени�
 function openOutside(url){if(!url)return;try{if(tg?.openLink){tg.openLink(url);return}}catch(e){}window.open(url,'_blank','noopener,noreferrer')}
 function shareTelegram(url){if(!url)return;const href='https://t.me/share/url?url='+encodeURIComponent(url)+'&text='+encodeURIComponent('Still VPN — VPN для повседневного интернета.');try{if(tg?.openTelegramLink){tg.openTelegramLink(href);return}}catch(e){}window.open(href,'_blank','noopener,noreferrer')}
 async function miniServers(){try{const list=await api('servers/public');const box=$('#server-signal');if(page!=='home'||!box)return;
-if(!list.length){box.innerHTML='<p class="small muted">Нет доступных локаций. Проверяем работу сети.</p>';return}
-box.innerHTML=list.map(n=>`<div class="signal-data"><div><span>Регион</span><strong>${esc(n.country)}</strong></div><div><span>Провайдер</span><strong>${esc(n.provider)}</strong></div><div><span>Протокол</span><strong>${esc(n.protocol)}</strong></div><div><span>Состояние</span><strong class="signal-live ${n.status==='online'?'':'wait'}">${n.status==='online'?'Узел доступен':'Проверяем'}</strong></div></div>`).join('');
-}catch(e){const box=$('#server-signal');if(box&&page==='home')box.innerHTML='<p class="small muted">Не удалось получить актуальное состояние. Обновите страницу.</p>'}}
+ if(!list.length){box.innerHTML='<div class="studio-mini-stat"><span>Сервер</span><strong class="status-idle">Проверяем доступность</strong></div>';return}
+ const primary=list[0];box.innerHTML=`<div class="studio-mini-stat"><span>Сервер</span><strong class="${primary.status==='online'?'status-ready':'status-idle'}">${primary.status==='online'?'Доступен':'Статус уточняется'}</strong></div>`;
+ }catch(e){const box=$('#server-signal');if(box&&page==='home')box.innerHTML='<div class="studio-mini-stat"><span>Сервер</span><strong class="status-idle">Статус недоступен</strong></div>'}}
+async function dashboardDevices(){
+ try{const rows=await api('devices');if(page!=='home')return;
+   const profile=$('#dashboard-profile-status'),last=$('#dashboard-handshake');if(!profile||!last)return;
+   const valid=rows.filter(d=>d.enabled&&d.provisioned);profile.textContent=valid.length?'Готов · '+valid.length+' устр.':'Не создан';profile.className=valid.length?'status-ready':'status-idle';
+   const timestamps=valid.map(d=>d.last_handshake?new Date(d.last_handshake).getTime():0).filter(t=>Number.isFinite(t)&&t>0);
+   const latest=timestamps.length?Math.max(...timestamps):0;const fresh=latest&&Date.now()-latest>=0&&Date.now()-latest<180000;
+   last.textContent=!latest?'Ещё не подключались':fresh?'Недавнее соединение':new Date(latest).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+   last.className=fresh?'status-ready':'status-idle';
+ }catch(e){const profile=$('#dashboard-profile-status');if(profile&&page==='home')profile.textContent='Не удалось проверить'}}
 async function miniReferrals(){try{const r=await api('referrals');const box=$('#ref-count');if(box&&page==='home')box.textContent=`${r.registered} приглашено · ${r.paid} купили`;const btn=$('#invite-share');if(btn&&r.link){btn.onclick=()=>shareTelegram(r.link)}}catch(e){}}
 function home(){const s=me.subscription;
-main.innerHTML=section('STILL / ЛИЧНЫЙ КАБИНЕТ',`На связи, ${esc(me.first_name||'друг')}.`,'Твой интернет. Твои устройства. Твой ритм.')+
-`<div class="hero"><div class="hero-mark"><small>ВАШЕ ПОДКЛЮЧЕНИЕ</small><span class="pill"><i class="dot"></i>${s?'Доступ активен':'Нет доступа'}</span></div>
-<div class="big">${s?esc(s.name):'Начнём с подключения.'}</div><div class="subline">${s?`До ${day(s.end)} · ${activeText()}`:'Настройте пробный период или выберите подходящий тариф.'}</div><div class="hero-foot"><span>STILL / VPN</span><span class="hero-number">№ 10 — PRIVATE NETWORK</span></div></div>
-<div class="quick-row"><button id="quick-connect"><span>01 / УСТРОЙСТВА</span><strong>Подключить ↗</strong></button><button id="quick-plans"><span>02 / ПОДПИСКА</span><strong>Выбрать тариф ↗</strong></button></div>
-<div class="usage-head"><span>Трафик за период</span><strong>${s?gb(s.used)+' / '+gb(s.limit):'—'}</strong></div>
-${s&&s.limit!==null&&s.limit>0?`<div class="usage-track" aria-label="Использовано трафика"><span style="width:${Math.min(100,Math.max(0,s.used/s.limit*100)).toFixed(1)}%"></span></div>`:''}
-<div class="status-rail"><span>Устройства</span><b>${me.device_count} / ${s?s.devices:'—'}</b></div>
-<div class="status-rail"><span>Работающие узлы</span><b>${me.service?.responsive_nodes||0} из ${me.service?.enabled_nodes||0}</b></div>
-${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать бесплатный пробный период</button><p class="small muted">Один раз на аккаунт. Длительность и объём — по настройкам сервиса.</p></div>':''}
-<div class="signal-card"><div class="signal-head"><p class="kicker">03 / СЕТЬ STILL</p><span class="signal-country">🇳🇱 NL</span></div><h2>Где находится сервер?</h2><p class="small muted">Наш основной узел находится в Нидерландах. Состояние сети обновляется по данным агента — без выдуманных показателей скорости.</p><div id="server-signal"><p class="small muted">Получаем информацию…</p></div></div>
-<div class="community-box"><p class="kicker">04 / ДАЛЬШЕ ВМЕСТЕ</p><h2>Передай хорошую связь.</h2><p class="small muted">Поделись Still VPN с друзьями, следи за обновлениями и открывай сайт напрямую. Подписка на канал — по желанию.</p><div class="community-actions"><button id="invite-share">↗ Поделиться VPN</button><button id="channel-open">◈ Наш канал</button><button id="site-open">🌐 Перейти на сайт Still VPN ↗</button></div><p id="ref-count" class="small muted">Статистика приглашений загружается…</p></div>
-<div class="edition-footer"><span>STILL VPN / RELEASE 10</span><a href="https://t.me/StillVPN_official" id="channel-link">CHANNEL ↗</a></div>`;
+const remaining=s&&s.limit!==null?Math.max(0,s.limit-s.used):null;
+const trafficPct=s&&s.limit!==null&&s.limit>0?Math.min(100,Math.max(0,s.used/s.limit*100)):0;
+main.innerHTML=`<section class="studio-home">
+  <div class="studio-home-intro"><span class="studio-status ${s?'active':'inactive'}"><i></i>${s?'Ваш доступ активен':'Нет активного доступа'}</span>
+    <h1>${s?'Всё готово к подключению.':'Добро пожаловать в Still.'}</h1>
+    <p>${s?`${esc(s.name)} · ${activeText()}`:'Начните с бесплатного пробного доступа или выберите тариф.'}</p>
+  </div>
+  <div class="studio-node">
+    <div class="studio-node-row"><div class="studio-flag" aria-hidden="true">🇳🇱</div><div class="studio-node-title"><strong>Нидерланды</strong><span>WireGuard · Europe NL</span></div><span class="studio-arrow" aria-hidden="true">›</span></div>
+    <div class="studio-node-details"><div class="studio-mini-stat"><span>VPN-профиль</span><strong id="dashboard-profile-status">Проверяем…</strong></div>
+       <div id="server-signal"><div class="studio-mini-stat"><span>Сервер</span><strong>Проверяем…</strong></div></div>
+       <div class="studio-mini-stat"><span>Последнее соединение</span><strong id="dashboard-handshake">Проверяем…</strong></div>
+    </div>
+    <button class="button studio-main-action" id="quick-connect">${s?'Получить VPN-профиль':'Настроить VPN'} <span aria-hidden="true">↗</span></button>
+    <p class="studio-hint">Подключение включается в WireGuard на устройстве.</p>
+  </div>
+  <div class="studio-numbers"><div><span>Осталось трафика</span><strong>${!s?'—':remaining===null?'Без лимита':gb(remaining)}</strong><small>${s&&s.limit!==null?`из ${gb(s.limit)} на период`:s?'Без ограничения по объёму':'Выберите подписку'}</small></div>
+  <div><span>Устройства</span><strong>${Number(me.device_count)||0} / ${s?Number(s.devices):'—'}</strong><small>Добавлено в кабинет</small></div></div>
+  ${s&&s.limit!==null&&s.limit>0?`<div class="usage-track studio-usage" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(trafficPct)}"><span style="width:${trafficPct.toFixed(1)}%"></span></div>`:''}
+  <button class="studio-ticket-link" id="studio-support"><span class="studio-ticket-icon" aria-hidden="true">✉</span><span><b>Поддержка</b><small>Обращения, ответы и статус тикетов</small></span><span aria-hidden="true">›</span></button>
+  ${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать пробный доступ</button><p class="small muted">Один пробный период на аккаунт. Срок и трафик указаны в тарифах.</p></div>':''}
+  <div class="studio-extra-head"><strong>Ваш Still VPN</strong><button id="quick-plans">Тарифы ↗</button></div>
+  <div class="studio-extra-links"><button id="invite-share">Пригласить друга ↗</button><button id="channel-open">Наш канал ↗</button><button id="site-open">Открыть сайт ↗</button></div>
+  <p id="ref-count" class="small muted" style="margin:12px 0 4px">Загружаем приглашения…</p>
+</section>`;
+$('#studio-support').onclick=()=>nav('tickets');
 $('#quick-connect').onclick=()=>nav('connect');$('#quick-plans').onclick=()=>nav('plans');
 $('#channel-open').onclick=()=>openOutside(me.channel_url||'https://t.me/StillVPN_official');
 $('#site-open').onclick=()=>openOutside(me.site_url||location.origin+'/web');
 $('#invite-share').onclick=()=>shareTelegram('https://t.me/StillVPNapp_bot');
-$('#channel-link').onclick=e=>{e.preventDefault();openOutside(me.channel_url||'https://t.me/StillVPN_official')};
 if($('#trial'))$('#trial').onclick=async()=>{try{await api('trial',{method:'POST'});toast('Пробный доступ активирован');await reload();nav('home')}catch(e){toast(e.message,true)}};
-miniServers();miniReferrals();
+miniServers();dashboardDevices();miniReferrals();
 }
 function planPage(){main.innerHTML=section('Подписка','Выберите свой ритм.','Никаких скрытых параметров: цену и ограничения задаёт администратор.')+
 '<div class="section"><label>Скидочный промокод (если есть)</label><input id="discount-code" maxlength="80" placeholder="Необязательно"></div><div id="plan-list"></div><div class="section"><h2>История платежей</h2><div id="history"><p class="muted small">Загрузка…</p></div></div>';
@@ -4971,17 +5361,17 @@ function accountPage(){main.innerHTML=section('Ваш профиль','Прив�
 <div class="statrow"><span class="muted">Дата регистрации</span><b>${day(me.created_at)}</b></div>
 <div class="statrow"><span class="muted">Подписка</span><b>${esc(me.subscription?.name||'Не активна')}</b></div>
 <div class="statrow"><span class="muted">Статус аккаунта</span><b>${esc(me.account_status)}</b></div>
-<div class="section"><h2>Подарки и промокоды</h2><p class="muted small">Созданные подарки доступны после подтверждённой оплаты. Коды активируются один раз.</p><label>Код подарка / промокод</label><input id="redeem" placeholder="STILL-… или SH-…"><div style="height:12px"></div><button class="button" id="redeem-btn">Активировать код</button><div id="gift-list"></div></div>
+<div class="section"><button class="button" id="account-plans">Посмотреть тарифы</button></div><div class="section"><h2>Подарки и промокоды</h2><p class="muted small">Созданные подарки доступны после подтверждённой оплаты. Коды активируются один раз.</p><label>Код подарка / промокод</label><input id="redeem" placeholder="STILL-… или SH-…"><div style="height:12px"></div><button class="button" id="redeem-btn">Активировать код</button><div id="gift-list"></div></div>
 ${me.admin_role?'<div class="section"><button id="open-admin" class="button secondary">Открыть админ-панель</button></div>':''}<div class="section"><h2>Помощь и документы</h2><p class="muted small">Создайте тикет, укажите тему и важность. История ответов доступна в Mini App.</p><button class="button secondary" id="support-btn">Открыть центр поддержки</button></div>`;
 $('#redeem-btn').onclick=async()=>{const code=$('#redeem').value.trim();try{const r=await api('redeem',{method:'POST',body:JSON.stringify({code})});toast(`Активировано: +${r.days} дней`);$('#redeem').value='';await reload();accountPage()}catch(e){toast(e.message,true)}};
-$('#support-btn').onclick=()=>nav('tickets');if($('#open-admin'))$('#open-admin').onclick=()=>nav('admin');
+$('#support-btn').onclick=()=>nav('tickets');$('#account-plans').onclick=()=>nav('plans');if($('#open-admin'))$('#open-admin').onclick=()=>nav('admin');
 loadGifts();}
 async function loadGifts(){try{gifts=await api('gifts');if(page!=='account')return;
 $('#gift-list').innerHTML=gifts.map(g=>`<div class="panel"><h3>${esc(g.name)}</h3><p class="small muted">Действует до ${day(g.expires_at)} · ${g.used?'Активирован':g.invalid?'Аннулирован':'Ожидает'}</p>${g.code?`<div class="code">${esc(g.code)}</div><button class="button secondary compact" data-code="${esc(g.id)}">Скопировать код</button>`:''}</div>`).join('');
 $('#gift-list').querySelectorAll('[data-code]').forEach(b=>b.onclick=async()=>{const g=gifts.find(x=>x.id===b.dataset.code);if(g?.code){await navigator.clipboard.writeText(g.code);toast('Код скопирован')}});
 }catch(e){toast(e.message,true)}}
 async function reload(){me=await api('me');if(page==='home')render()}
-async function boot(){drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const query=new URLSearchParams(location.search);const start=query.get('tab')||query.get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account','tickets'].includes(start)||(start==='admin'&&me.admin_role))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
+async function boot(){const topProfile=$('#open-profile-top');if(topProfile)topProfile.onclick=()=>nav('account');drawTabs();try{[me,plans]=await Promise.all([api('me'),api('plans')]);const query=new URLSearchParams(location.search);const start=query.get('tab')||query.get('tgWebAppStartParam')||tg?.initDataUnsafe?.start_param||'';if(['home','plans','connect','account','tickets'].includes(start)||(start==='admin'&&me.admin_role))page=start;drawTabs();render()}catch(e){main.innerHTML=`<div class="notice error">${esc(e.message)}</div><button id="retry" class="button secondary">Повторить</button>`;$('#retry').onclick=boot}}
 // Only users with an authenticated admin role see this entrance. Every request
 // is also authorized by role on the FastAPI side; UI checks are cosmetic.
 let adminSection='overview', adminSelectedUser=null, adminSelectedTicket=null, adminPlanEdit=null;
