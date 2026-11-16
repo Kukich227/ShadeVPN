@@ -41,6 +41,8 @@ Python 3.11+. Файл развёртывается ДВАЖДЫ, с разны�
     WG_SERVER_ENDPOINT=<IP-VPS>:51820
     WG_SERVER_PUBLIC_KEY=<публичный WireGuard ключ сервера>
     WG_SERVER_CIDR=10.13.0.0/24
+    WG_CLIENT_MTU=1280  # только для новых клиентских конфигураций (1280..1420)
+    WG_CLIENT_DNS=1.1.1.1  # IPv4-адрес DNS, меняйте осознанно
     PORT=<порт домена из BotHost, обычно 8000>
     ENABLE_PAYMENTS=0 (включить только после проверки работающего VPN)
     TERMS_URL=https://<реальная опубликованная страница условий>
@@ -115,6 +117,7 @@ MINI APP АДМИНКА v8: кнопка «Админ» появляется т�
 базу не удалять. Обновлять до v12 только BotHost; VPN-агент v4 на VPS остаётся совместимым.
 
 ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ:
+    python shade.py audit-vps               — безопасный аудит Linux VPS из Termius (без изменений)
     python shade.py selftest                  — автономные тесты криптографических проверок
     python shade.py dbtest                    — проверка подключения, миграций и транзакций БД
     python shade.py verify                    — проверка реального Telegram/БД/VPS (без записи)
@@ -128,6 +131,19 @@ failover и восстановления бэкапа необходимы до 
 Полноценный Alembic заменён встроенными идемпотентными SQL-миграциями.
 SQLite поддерживает только ОДИН экземпляр приложения и не подходит для
 горизонтального масштабирования; резервные копии /app/data обязательны.
+
+БЕЗОПАСНОСТЬ / ПРОВЕРКА VPS (v13.1):
+    SHADE_MODE=agent python shade.py audit-vps  # команды только чтения, подходит для Termius
+    Профили WireGuard: WG_CLIENT_MTU=1280 и WG_CLIENT_DNS=1.1.1.1 (новые .conf).
+    Не включайте DNS-резолвер на публичном 0.0.0.0:53 без ограничения клиентов.
+    Веб-агент должен быть доступен только через HTTPS Caddy, слушать 127.0.0.1:8080.
+    SSH: сначала проверьте вход с ключом в ДРУГОЙ Termius-сессии, затем отключайте
+    пароли; всегда сохраняйте рабочий доступ до изменения firewall/sshd.
+    WireGuard IPv4-only: IPv6 может обходить VPN; нельзя заявлять об отсутствии
+    утечек до настройки полноценного IPv6-туннеля и тестирования на клиентах.
+    Не запускайте чужие curl | bash скрипты напрямую на работающем VPS.
+    Настройка MTU/более мощный VPS не гарантирует снижение пинга.
+
 Многоузловая эксплуатация: для узлов 2+ настройте в окружении BotHost
 WG_AGENT_SECRETS JSON с ключами ID сервера и разными секретами; на каждом VPS
 установите собственный WG_AGENT_SECRET. Для дальнейшего роста перейти на PostgreSQL, выделить отдельный
@@ -213,7 +229,19 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "13.0.1"
+# Client profile tuning: defaults preserve existing working Still VPN profiles.
+# Changing these values only affects NEWLY exported/downloaded .conf files.
+try:
+    WG_CLIENT_MTU = int(os.getenv("WG_CLIENT_MTU", "1280"))
+except ValueError as exc:
+    raise RuntimeError("WG_CLIENT_MTU must be an integer (1280..1420)") from exc
+if WG_CLIENT_MTU not in range(1280, 1421):
+    raise RuntimeError("WG_CLIENT_MTU must be between 1280 and 1420")
+try:
+    WG_CLIENT_DNS = str(ipaddress.IPv4Address(os.getenv("WG_CLIENT_DNS", "1.1.1.1")))
+except ipaddress.AddressValueError as exc:
+    raise RuntimeError("WG_CLIENT_DNS must be a single valid IPv4 DNS resolver") from exc
+RELEASE = "13.1.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -309,6 +337,9 @@ WG_SERVER_ENDPOINT=VPS_PUBLIC_IP:51820
 WG_SERVER_PUBLIC_KEY=WIREGUARD_SERVER_PUBLIC_KEY
 WG_SERVER_CIDR=10.13.0.0/24
 WG_SERVER_LOCATION=Main
+# New client configurations only; test MTU on one device before rollout.
+WG_CLIENT_MTU=1280
+WG_CLIENT_DNS=1.1.1.1
 PORT=8000
 ENABLE_PAYMENTS=0
 SUPPORT_CONTACT=@support
@@ -591,18 +622,109 @@ def command_selftest():
         BOT_TOKEN = original
 
 
+def command_vps_audit() -> None:
+    """Read-only Linux security inspection. Does NOT modify SSH, firewall or WireGuard."""
+    import stat
+    import socket
+    print("STILL VPN | read-only VPS security audit")
+    print("No settings will be changed; no secrets are printed.\n")
+    if sys.platform != "linux":
+        print("WARN: this command is intended for a Linux VPS")
+        return
+
+    def show_file(label: str, path: pathlib.Path) -> None:
+        try:
+            st = path.stat()
+            mode = stat.S_IMODE(st.st_mode)
+            risk = bool(mode & 0o077)
+            print(("WARN" if risk else "OK") + f": {label}: mode {mode:04o}" +
+                  (" (other users may read this file)" if risk else ""))
+        except FileNotFoundError:
+            print(f"INFO: {label}: not found ({path})")
+        except PermissionError:
+            print(f"INFO: {label}: no permissions to inspect")
+
+    try:
+        forward = pathlib.Path("/proc/sys/net/ipv4/ip_forward").read_text().strip()
+        print(("OK" if forward == "1" else "WARN") +
+              ": IPv4 forwarding " + ("enabled" if forward == "1" else "disabled"))
+    except OSError as exc:
+        print("INFO: IPv4 forwarding not readable:", type(exc).__name__)
+
+    wg_cfg = pathlib.Path("/etc/wireguard") / (WG_INTERFACE + ".conf")
+    show_file("WireGuard configuration (may contain server private key)", wg_cfg)
+    show_file("WireGuard peer leases", WG_AGENT_LEASE_PATH)
+
+    def run(args: list[str]) -> str | None:
+        if shutil.which(args[0]) is None:
+            return None
+        try:
+            result = subprocess.run(args, check=False, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=5)
+            return result.stdout if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    status = run(["ufw", "status"])
+    if status is None:
+        print("INFO: UFW unavailable or requires elevated rights; check nftables/iptables")
+    else:
+        first = status.splitlines()[0] if status.splitlines() else "unknown"
+        print(("OK" if "active" in first and "inactive" not in first else "WARN") +
+              ": UFW " + first[:100])
+    # 'ss' output can contain public IPs, so only emit categorical findings.
+    sockets = run(["ss", "-H", "-lntu"])
+    if sockets is None:
+        print("INFO: Could not inspect listening ports (install iproute2)")
+    else:
+        for port in (53, 8080):
+            lines = [line for line in sockets.splitlines()
+                     if re.search(r"(?:\]|:|\.)" + str(port) + r"\b", line)]
+            public = [line for line in lines if re.search(
+                r"(?:0\.0\.0\.0|\[::\]|\*):" + str(port) + r"\b", line)]
+            if public:
+                print(f"WARN: port {port} appears to listen on public interfaces; verify firewall rules")
+            elif lines:
+                print(f"OK: port {port} appears bound to non-wildcard interfaces")
+            else:
+                print(f"INFO: port {port} not listening")
+        has_wg = any(re.search(r"(?:\]|:|\.)51820\b", line)
+                     for line in sockets.splitlines())
+        print(("OK" if has_wg else "INFO") + ": UDP/51820 " +
+              ("listener detected" if has_wg else "listener not detected"))
+
+    # Root SSH login & password authentication should be evaluated together with
+    # included sshd_config.d drop-ins. Don't change them automatically.
+    sshd = run(["sshd", "-T"])
+    if sshd is not None:
+        entries = dict((ln.split(None, 1) for ln in sshd.splitlines() if " " in ln))
+        password = entries.get("passwordauthentication")
+        rootlogin = entries.get("permitrootlogin")
+        print(("WARN" if password == "yes" else "OK") +
+              f": SSH passwordauthentication={password or 'unknown'}")
+        print(("WARN" if rootlogin == "yes" else "INFO") +
+              f": SSH permitrootlogin={rootlogin or 'unknown'}")
+    else:
+        print("INFO: sshd -T unavailable; verify authorized keys before SSH hardening")
+    print("\nRemember: a working VPN does not imply protection from IPv6/DNS leaks.")
+    print("Check from the client and verify firewall rules before accepting users.")
+
+
 def dispatch_cli():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("selftest", "generate", "backup", "restore"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("selftest", "generate", "backup", "restore", "audit-vps"):
         return
     ap = argparse.ArgumentParser(description="Still VPN auxiliary commands")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("selftest")
+    sub.add_parser("audit-vps")
     gen = sub.add_parser("generate"); gen.add_argument("directory", nargs="?", default="./shade-deploy")
     bk = sub.add_parser("backup"); bk.add_argument("directory")
     restore = sub.add_parser("restore"); restore.add_argument("filename")
     restore.add_argument("--confirm-restore", action="store_true")
     args = ap.parse_args()
     if args.command == "selftest": command_selftest()
+    elif args.command == "audit-vps": command_vps_audit()
     elif args.command == "generate": command_generate(args.directory)
     elif args.command == "backup": command_backup(args.directory)
     elif args.command == "restore": command_restore(args.filename, args.confirm_restore)
@@ -2983,7 +3105,7 @@ if MODE == "app":
             record_event(s, "device_created", u.id,
                          f"{d.name} · {d.platform} · {peer_ip} · сервер #{node.id}")
             await s.flush()
-            response = {"id": d.id, "address": peer_ip + "/32", "dns": "1.1.1.1",
+            response = {"id": d.id, "address": peer_ip + "/32", "dns": WG_CLIENT_DNS, "mtu": WG_CLIENT_MTU,
                         "server_key": node.public_key, "endpoint": node.endpoint,
                         "status": "provisioning"}
         try:
@@ -3045,8 +3167,8 @@ if MODE == "app":
             "[Interface]\n"
             f"PrivateKey = {data.private_key}\n"
             f"Address = {dev.peer_ip}/32\n"
-            "DNS = 1.1.1.1\n"
-            "MTU = 1280\n\n"
+            f"DNS = {WG_CLIENT_DNS}\n"
+            f"MTU = {WG_CLIENT_MTU}\n\n"
             "[Peer]\n"
             f"PublicKey = {node.public_key}\n"
             f"Endpoint = {node.endpoint}\n"
@@ -3060,7 +3182,7 @@ if MODE == "app":
                 document=BufferedInputFile(config.encode("utf-8"), filename=filename),
                 caption=("🔐 <b>Still VPN · конфигурация</b>\n"
                          "Откройте файл в WireGuard и включите туннель.\n"
-                         "⚠️ Файл содержит приватный ключ: не пересылайте его другим."),
+                         "⚠️ Файл содержит приватный ключ: не пересылайте его другим.\n⚠️ Только IPv4: IPv6-трафик может обходить VPN; проверьте устройство."),
                 parse_mode="HTML",
                 # Keep downloading enabled: protected Telegram messages can prevent file saving.
                 protect_content=False,
@@ -4379,6 +4501,17 @@ if MODE == "app":
 else:
     # Agent mode. NO bot token or application database access is needed on the VPN VPS.
     app = FastAPI(title="Still WireGuard Agent", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def agent_body_limit(req: Request, call_next):
+        # Reject oversized/chunked agent POST bodies before FastAPI parses JSON.
+        # BotHost sends small signed JSON requests with an explicit Content-Length.
+        if req.url.path.startswith("/agent/") and req.method in ("POST", "PUT", "PATCH"):
+            size = req.headers.get("content-length", "")
+            if not size.isdigit() or int(size) > 4096:
+                return JSONResponse({"detail": "Agent request too large or missing Content-Length"}, status_code=413)
+        return await call_next(req)
+
     used_nonces: dict[str, float] = {}
     lease_lock = asyncio.Lock()
     peer_leases: dict[str, dict[str, Any]] = {}
@@ -4394,7 +4527,11 @@ else:
 
     async def require_agent(request: Request) -> None:
         if len(WG_AGENT_SECRET) < 32: bad(503, "Secret not configured")
+        if request.headers.get("content-length", "").isdigit() and int(request.headers["content-length"]) > 4096:
+            bad(413, "Agent request too large")
         raw = await request.body()
+        if len(raw) > 4096:
+            bad(413, "Agent request too large")
         ts = request.headers.get("x-shade-ts", "")
         nonce = request.headers.get("x-shade-nonce", "")
         sig = request.headers.get("x-shade-sign", "")
@@ -4463,15 +4600,19 @@ else:
         async with lease_lock:
             current = set(wg("show", WG_INTERFACE, "peers").split())
             ts = int(time.time())
+            changed = False
             for pub in current:
                 lease = peer_leases.get(pub)
                 if not lease or lease["expires_at"] <= ts:
                     wg("set", WG_INTERFACE, "peer", pub, "remove")
-                    peer_leases.pop(pub, None)
+                    if peer_leases.pop(pub, None) is not None:
+                        changed = True
             for pub, lease in list(peer_leases.items()):
                 if lease["expires_at"] <= ts:
                     peer_leases.pop(pub, None)
-            save_peer_leases()
+                    changed = True
+            if changed:
+                save_peer_leases()
 
     async def peer_lease_worker() -> None:
         while True:
@@ -4552,7 +4693,7 @@ else:
     @app.get("/health")
     async def agent_health():
         wg("show", WG_INTERFACE, "public-key")
-        return {"status": "ok", "interface": WG_INTERFACE}
+        return {"status": "ok"}
 
     @asynccontextmanager
     async def lifespan_agent(a: FastAPI):
@@ -4582,7 +4723,7 @@ STILL_WEB_HTML = r"""<!doctype html>
 <meta property="og:description" content="VPN через Telegram и личный кабинет. Нидерланды, Android, iPhone и компьютер.">
 <meta property="og:url" content="__STILL_CANONICAL__">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"Still VPN","url":"__STILL_CANONICAL__","inLanguage":"ru"}</script>
-<meta name="still-release" content="13.0.1">
+<meta name="still-release" content="13.1.0">
 <script id="telegram-entry">__STILL_TG_REDIRECT__</script>
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
@@ -4908,8 +5049,8 @@ async function saveConfigLocally(conf,filename){
  if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){try{await navigator.share({files:[file],title:'Still VPN WireGuard'});toast('Выберите локальное сохранение файла');return}catch(e){if(e.name==='AbortError')return}}
  saveBlobConfig(conf,filename);toast('Проверьте загрузки. Если файла нет, скопируйте текст в .conf вручную.',true);
 }
-async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
-lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Ключ создан локально. Если отправите .conf в Telegram, он однократно пройдёт через сервер по HTTPS и останется в вашем личном чате. Другие способы сохраняют файл локально.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-telegram">✉ Отправить .conf в личный чат</button><button class="cta outline tiny" id="conf-save">Сохранить локально</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Отправка в личный чат требует привязанного Telegram-аккаунта; ключ проходит через API и Telegram без сохранения в нашей базе. Приоритет приватности — локальное сохранение.</p></div>`;$('#conf-display').textContent=configText;
+async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = ${r.mtu}\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
+lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Ключ создан локально. Если отправите .conf в Telegram, он однократно пройдёт через сервер по HTTPS и останется в вашем личном чате. Другие способы сохраняют файл локально.</p><p class="small muted">Важно: этот профиль направляет в туннель только IPv4; IPv6 может идти напрямую. Проверьте IPv6 и DNS-утечки перед передачей конфигурации другим пользователям.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-telegram">✉ Отправить .conf в личный чат</button><button class="cta outline tiny" id="conf-save">Сохранить локально</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Отправка в личный чат требует привязанного Telegram-аккаунта; ключ проходит через API и Telegram без сохранения в нашей базе. Приоритет приватности — локальное сохранение.</p></div>`;$('#conf-display').textContent=configText;
 const configFilename='still-vpn-'+r.id.slice(0,8)+'.conf';
 $('#conf-telegram').onclick=async()=>{const b=$('#conf-telegram');if(!confirm('Отправить ваш приватный ключ в Telegram? Файл останется в личном чате.'))return;b.disabled=true;b.textContent='Отправляем…';try{await api('devices/'+r.id+'/send-conf',{method:'POST',body:JSON.stringify({private_key:kp.priv})});toast('Файл отправлен в личный чат с ботом');b.textContent='✓ Отправлено в Telegram'}catch(e){toast(e.message,true);b.disabled=false;b.textContent='✉ Отправить .conf в личный чат'}};
 $('#conf-save').onclick=()=>saveConfigLocally(configText,configFilename);
@@ -4950,7 +5091,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.1"><meta name="robots" content="noindex,nofollow">
+<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.1.0"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -5365,9 +5506,9 @@ async function saveWireguardConf(conf,filename){
 async function createDevice(){const btn=$('#create-device');btn.disabled=true;btn.textContent='Создание ключа…';
  try{const name=$('#dev-name').value.trim(),platform=$('#dev-platform').value;if(!name)throw new Error('Введите название устройства');
  const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:keys.publicKey})});
- const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = 1280\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
+ const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = ${response.mtu}\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
  currentConfig={name,conf,deviceId:response.id,privateKey:keys.privateKey};
- const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Ключ создан локально. При нажатии «Получить в Telegram» он однократно передаётся защищённому API и в ваш личный чат; сервер не сохраняет его в базе. При потере конфигурации удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><button id="send-conf-telegram" class="button">✉ Получить .conf в личный чат Telegram</button><p class="export-info">По вашему нажатию ключ отправляется боту по HTTPS, затем приходит личным документом в Telegram. Хранение файла в Telegram зависит от настроек и политики мессенджера.</p><div class="export-actions"><button id="share-conf" class="button secondary compact">Сохранить локально</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">Храните профиль как пароль. Не отправляйте файл посторонним. Для максимальной приватности выбирайте локальное сохранение.</p><p class="small muted" id="install-help"></p></div>`;
+ const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Ключ создан локально. При нажатии «Получить в Telegram» он однократно передаётся защищённому API и в ваш личный чат; сервер не сохраняет его в базе. При потере конфигурации удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><button id="send-conf-telegram" class="button">✉ Получить .conf в личный чат Telegram</button><p class="export-info">По вашему нажатию ключ отправляется боту по HTTPS, затем приходит личным документом в Telegram. Хранение файла в Telegram зависит от настроек и политики мессенджера.</p><div class="export-actions"><button id="share-conf" class="button secondary compact">Сохранить локально</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">Храните профиль как пароль. Не отправляйте файл посторонним. Для максимальной приватности выбирайте локальное сохранение. Профиль покрывает только IPv4: IPv6 может обходить VPN — проверьте настройки устройства.</p><p class="small muted" id="install-help"></p></div>`;
  $('#config-text').textContent=conf;
  const tips={android:'Android: установите WireGuard из Google Play или F-Droid, добавьте туннель из файла или QR-кода.',ios:'iPhone/iPad: установите WireGuard из App Store, откройте приложение и выберите «Создать туннель» → из файла или QR-кода.',windows:'Windows: установите официальный WireGuard с wireguard.com/install, затем «Import tunnel(s) from file».',macos:'macOS: установите WireGuard, выберите «Import tunnel(s) from file».',linux:'Linux: установите wireguard-tools, сохраните файл как /etc/wireguard/wg-still.conf (права 600) и запустите sudo wg-quick up wg-still.'};
  $('#install-help').textContent=(tips[platform]||'')+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
