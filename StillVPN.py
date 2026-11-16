@@ -4,6 +4,18 @@
 платёжный payload shade: и путь /app/data/shade.db сохранены для совместимости
 с уже созданными данными, счетами и VPN-агентом.
 
+
+SEO PATCH v13.0.1 (16.11.2026):
+    /          — публичный сайт Still VPN (index,follow, canonical /).
+    /app       — Telegram Mini App (noindex,nofollow, отдельный CSP).
+    /web       — старый URL сайта продолжает работать, canonical ведёт на /.
+    /robots.txt и /sitemap.xml показывают публичную главную страницу.
+    Бот теперь открывает /app; старые BotFather-ссылки на / и старые ?tab=
+    перенаправляются в браузере Telegram на /app без потери параметров.
+    /web/api и cookie path=/web сохранены, чтобы не сбрасывать веб-сессии.
+    База данных, ключи устройств, платежи и VPN-агент не менялись.
+    После установки у BotFather рекомендуется /setmenubutton -> WEBAPP_URL/app.
+
 Python 3.11+. Файл развёртывается ДВАЖДЫ, с разными режимами:
     SHADE_MODE=app    — BotHost: Aiogram 3 polling + FastAPI Mini App + SQLite в /app/data.
     SHADE_MODE=agent  — VPS с WireGuard, отдельный HTTPS-домен через Caddy.
@@ -52,7 +64,7 @@ Python 3.11+. Файл развёртывается ДВАЖДЫ, с разны�
     Первое обновление агента удалит устаревшие Peer без lease: BotHost восстановит
     доступ действующим подписчикам после своей очередной синхронизации.
 
-BotFather: /newbot; /setmenubutton -> URL WEBAPP_URL. В BotHost: главный файл
+BotFather: /newbot; /setmenubutton -> URL WEBAPP_URL/app (старый URL / поддержан). В BotHost: главный файл
 StillVPN.py, Python, порт из PORT, свой HTTPS-поддомен, один экземпляр приложения.
 BotHost использует Python-зависимости из интерфейса или requirements.txt
 (можно сгенерировать: python shade.py generate DIR).
@@ -62,7 +74,8 @@ BotHost использует Python-зависимости из интерфей
 Сервис считает покупку подтверждённой ТОЛЬКО при successful_payment Telegram.
 
 STILL VPN WEB v8 (на BotHost, без Telegram):
-    Адрес: https://<домен-WEBAPP_URL>/web — один FastAPI процесс, одна SQLite.
+    Публичный сайт: https://<домен-WEBAPP_URL>/, Mini App: /app (Telegram), API сайта: /web/api/.
+    Старые ссылки на Mini App / автоматически перенаправляются на /app в Telegram.
     WEB_REGISTRATION_ENABLED=1  # самостоятельная регистрация логин/пароль (по умолчанию).
     BOT_USERNAME=<username без @>  # необязательно: бот попробует получить через Bot API.
     WEB_TRIAL_ENABLED=0  # по умолчанию, чтобы нельзя было массово создавать пробники.
@@ -200,7 +213,7 @@ WG_SERVER_ENDPOINT = os.getenv("WG_SERVER_ENDPOINT", "")
 WG_SERVER_PUBLIC_KEY = os.getenv("WG_SERVER_PUBLIC_KEY", "")
 WG_SERVER_CIDR = os.getenv("WG_SERVER_CIDR", "10.13.0.0/24")
 WG_SERVER_LOCATION = os.getenv("WG_SERVER_LOCATION", "Primary")
-RELEASE = "13.0.0"
+RELEASE = "13.0.1"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -1547,7 +1560,7 @@ if MODE == "app":
         # WebAppInfo URL is opened inside the same Telegram bot WebView.
         # Keep navigation parameters separate from Telegram auth initData.
         # A release query prevents stale Telegram WebView cache after deployments.
-        return WEBAPP_URL + "/?tab=" + section + "&v=" + RELEASE
+        return WEBAPP_URL + "/app?tab=" + section + "&v=" + RELEASE
 
     def invite_link(uid: int) -> str:
         username = BOT_USERNAME["value"] or "StillVPNapp_bot"
@@ -1558,7 +1571,7 @@ if MODE == "app":
             [InlineKeyboardButton(text="✦ Открыть Mini App", web_app=WebAppInfo(url=mini_url()))],
             [InlineKeyboardButton(text="◈ Тарифы", web_app=WebAppInfo(url=mini_url("plans"))),
              InlineKeyboardButton(text="⌁ Подключить", web_app=WebAppInfo(url=mini_url("connect")))],
-            [InlineKeyboardButton(text="🌐 Перейти на сайт", url=WEBAPP_URL + "/web"),
+            [InlineKeyboardButton(text="🌐 Перейти на сайт", url=WEBAPP_URL + "/"),
              InlineKeyboardButton(text="↗ Поделиться", callback_data="user:share")],
             [InlineKeyboardButton(text="📣 Наш канал · необязательно", url=CHANNEL_URL),
              InlineKeyboardButton(text="✉ Поддержка", web_app=WebAppInfo(url=mini_url("tickets")))],
@@ -1737,7 +1750,7 @@ if MODE == "app":
             "/linkweb — привязка к веб-кабинету\n"
             "/paysupport — оплата и возвраты\n"
             "/invite — пригласить друга\n\n"
-            f'🌐 <a href="{html_escape(WEBAPP_URL)}/web">Сайт Still VPN</a>\n'
+            f'🌐 <a href="{html_escape(WEBAPP_URL)}/">Сайт Still VPN</a>\n'
             f'📣 <a href="{CHANNEL_URL}">Новости и обновления</a>\n\n'
             "<i>Управление подпиской, QR-коды и VPN-конфигурации доступны в Mini App.</i>",
             parse_mode="HTML", reply_markup=user_menu(False))
@@ -2650,6 +2663,19 @@ if MODE == "app":
         await s.commit()
         return user
 
+    # Root / is a public SEO landing page; private Mini App lives on /app.
+    # Old Telegram menu buttons can still open /: a tiny client-side shim redirects
+    # the Telegram launch hash (or old ?tab= routes) to /app before rendering.
+    TELEGRAM_ENTRY_REDIRECT_JS = (
+        "(function(){"
+        "var h=location.hash||'', q=location.search||'';"
+        "if(/(?:^|[&#])tgWebApp(?:Data|Version|Platform)=/.test(h)||"
+        "/[?&]tab=(?:home|plans|connect|account|tickets|admin)(?:&|$)/.test(q)){"
+        "location.replace('/app'+q+h);"
+        "}"
+        "})();"
+    )
+
     @app.middleware("http")
     async def security_headers(req: Request, call_next):
         response = await call_next(req)
@@ -2658,9 +2684,9 @@ if MODE == "app":
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Strict-Transport-Security"] = "max-age=31536000"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
-        if req.url.path == "/" or req.url.path.startswith("/api/") or req.url.path.startswith("/web/api/"):
-            response.headers["X-Robots-Tag"] = ""
-        if req.url.path == "/":
+        if req.url.path.rstrip("/") == "/app" or req.url.path.startswith("/api/") or req.url.path.startswith("/web/api/"):
+            response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        if req.url.path.rstrip("/") == "/app":
             # Telegram Web renders Mini Apps in an iframe; X-Frame-Options SAMEORIGIN would break it.
             inline_js = MINI_APP_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
             js_digest = base64.b64encode(hashlib.sha256(inline_js.encode()).digest()).decode()
@@ -2671,19 +2697,29 @@ if MODE == "app":
                 "base-uri 'none'; object-src 'none'; "
                 "frame-ancestors https://web.telegram.org https://*.telegram.org"
             )
-        elif req.url.path.rstrip("/") == "/web":
+        elif req.url.path in ("/", "/web", "/web/", "/site"):
             web_js = STILL_WEB_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
             digest = base64.b64encode(hashlib.sha256(web_js.encode()).digest()).decode()
+            # The compatibility redirect has a separate exact CSP hash.
+            redirect_digest = base64.b64encode(
+                hashlib.sha256(TELEGRAM_ENTRY_REDIRECT_JS.encode()).digest()
+            ).decode()
             # JSON-LD must be included in CSP hashes as well as the main inline script.
             schema_json = seo_public_html().split('<script type="application/ld+json">', 1)[1].split('</script>', 1)[0]
             schema_digest = base64.b64encode(hashlib.sha256(schema_json.encode()).digest()).decode()
+            # Legacy BotFather menu URL points at /, so Telegram Web must still be
+            # allowed to frame the root long enough for the /app redirect to run.
+            is_legacy_telegram_entry = req.url.path == "/"
+            frame_rule = ("https://web.telegram.org https://*.telegram.org"
+                          if is_legacy_telegram_entry else "'none'")
             response.headers["Content-Security-Policy"] = (
-                "default-src 'none'; script-src 'sha256-" + digest + "' 'sha256-" + schema_digest + "'; "
+                "default-src 'none'; script-src 'sha256-" + digest + "' 'sha256-" + schema_digest + "' 'sha256-" + redirect_digest + "'; "
                 "style-src 'unsafe-inline'; img-src 'self' data:; "
                 "connect-src 'self'; form-action 'self'; base-uri 'none'; "
-                "object-src 'none'; frame-ancestors 'none'"
+                "object-src 'none'; frame-ancestors " + frame_rule
             )
-            response.headers["X-Frame-Options"] = "DENY"
+            if not is_legacy_telegram_entry:
+                response.headers["X-Frame-Options"] = "DENY"
         else:
             response.headers["X-Frame-Options"] = "DENY"
         return response
@@ -2696,7 +2732,7 @@ if MODE == "app":
 
     @app.get("/build")
     async def build_info():
-        return {"release": RELEASE, "site": "/web", "mini_app": "/",
+        return {"release": RELEASE, "site": "/", "mini_app": "/app",
                 "agent": "совместимо с WireGuard-агентом v4"}
 
     async def server_public_data(s: AsyncSession) -> list[dict]:
@@ -2746,7 +2782,7 @@ if MODE == "app":
                 "subscription": e and {**e, "end": e["end"].isoformat()},
                 "payments_enabled": payments_ready(),
                 "admin_role": await role_of(s, user.id), "release": RELEASE,
-                "site_url": WEBAPP_URL + "/web", "channel_url": CHANNEL_URL}
+                "site_url": WEBAPP_URL + "/", "channel_url": CHANNEL_URL}
 
     @app.get("/api/plans")
     async def api_plans(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
@@ -4125,12 +4161,14 @@ if MODE == "app":
     def seo_site_url() -> str:
         u = urlparse(WEBAPP_URL)
         if u.scheme != "https" or not u.netloc:
-            return "https://stillvpn.bothost.tech/web"
-        return f"{u.scheme}://{u.netloc}/web"
+            return "https://stillvpn.bothost.tech/"
+        return f"{u.scheme}://{u.netloc}/"
 
     def seo_public_html() -> str:
         # Static server response exposes real headings/links even when JS is not executed.
-        return STILL_WEB_HTML.replace("__STILL_CANONICAL__", html_escape(seo_site_url(), quote=True))
+        return (STILL_WEB_HTML
+                .replace("__STILL_CANONICAL__", html_escape(seo_site_url(), quote=True))
+                .replace("__STILL_TG_REDIRECT__", TELEGRAM_ENTRY_REDIRECT_JS))
 
     # Public Google Search Console verification endpoint, from the original HTML file.
     # Keep the contents exact (including no trailing newline).
@@ -4145,12 +4183,12 @@ if MODE == "app":
     async def robots_txt():
         return Response(
             "User-agent: *\n"
-            "Allow: /web\n"
+            "Allow: /\n"
             "Disallow: /api/\n"
             "Disallow: /web/api/\n"
             "Disallow: /health\n"
             "Disallow: /build\n"
-            "Sitemap: " + seo_site_url().removesuffix("/web") + "/sitemap.xml\n",
+            "Sitemap: " + seo_site_url() + "sitemap.xml\n",
             media_type="text/plain; charset=utf-8",
         )
 
@@ -4194,11 +4232,21 @@ if MODE == "app":
 <p>Подписка на информационный канал Still VPN добровольная.</p>
 <p>Пользователь обязан соблюдать применимое законодательство. Пробный доступ может быть ограничен и отозван при злоупотреблении.</p>
 <p>Покупка подписок на этом веб-сайте не реализована. Для платного коммерческого запуска требуются отдельные юридические документы с данными владельца сервиса, условиями возврата и контактами.</p>
-<a style='color:#c3a1d5' href='/web'>Вернуться в Still VPN</a></body></html>""")
+<a style='color:#c3a1d5' href='/'>Вернуться в Still VPN</a></body></html>""")
 
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
+        """Public homepage for Google and ordinary visitors."""
+        return HTMLResponse(seo_public_html(), headers={
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "X-Still-Release": RELEASE,
+        })
+
+    @app.get("/app", response_class=HTMLResponse)
+    @app.get("/app/", response_class=HTMLResponse)
+    async def telegram_mini_app():
+        """Protected-from-indexing Telegram Mini App, same APIs and SQLite."""
         return HTMLResponse(MINI_APP_HTML, headers={
             "Cache-Control": "no-store, max-age=0, must-revalidate",
             "X-Still-Release": RELEASE,
@@ -4534,7 +4582,8 @@ STILL_WEB_HTML = r"""<!doctype html>
 <meta property="og:description" content="VPN через Telegram и личный кабинет. Нидерланды, Android, iPhone и компьютер.">
 <meta property="og:url" content="__STILL_CANONICAL__">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"Still VPN","url":"__STILL_CANONICAL__","inLanguage":"ru"}</script>
-<meta name="still-release" content="13.0.0">
+<meta name="still-release" content="13.0.1">
+<script id="telegram-entry">__STILL_TG_REDIRECT__</script>
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
 *{box-sizing:border-box}html{scroll-behavior:smooth}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink)}
@@ -4759,7 +4808,7 @@ footer{padding:27px 0;color:#746D71;border-top:1px solid #E5DBD7;font-size:12px}
 
 </style></head>
 <body>
-<header><a class="logotype" href="/web" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL</a><nav class="topnav"><a href="#about-still" class="hide-mobile">Возможности</a><a href="#how-it-works" class="hide-mobile">Как подключиться</a><a href="#tariffs" class="hide-mobile">Тарифы</a><a href="#authorization" class="header-login">Кабинет</a><a href="https://t.me/StillVPNapp_bot" id="bot-link" class="pill-link" target="_blank" rel="noopener noreferrer">Открыть в Telegram ↗</a></nav></header>
+<header><a class="logotype" href="/" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL</a><nav class="topnav"><a href="#about-still" class="hide-mobile">Возможности</a><a href="#how-it-works" class="hide-mobile">Как подключиться</a><a href="#tariffs" class="hide-mobile">Тарифы</a><a href="#authorization" class="header-login">Кабинет</a><a href="https://t.me/StillVPNapp_bot" id="bot-link" class="pill-link" target="_blank" rel="noopener noreferrer">Открыть в Telegram ↗</a></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
 <section class="intro" id="about-still">
@@ -4901,7 +4950,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.0"><meta name="robots" content="">
+<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.1"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
