@@ -2659,7 +2659,7 @@ if MODE == "app":
         response.headers["Strict-Transport-Security"] = "max-age=31536000"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
         if req.url.path == "/" or req.url.path.startswith("/api/") or req.url.path.startswith("/web/api/"):
-            response.headers["X-Robots-Tag"] = "noindex, nofollow"
+            response.headers["X-Robots-Tag"] = ""
         if req.url.path == "/":
             # Telegram Web renders Mini Apps in an iframe; X-Frame-Options SAMEORIGIN would break it.
             inline_js = MINI_APP_HTML.rsplit("<script>", 1)[-1].split("</script>", 1)[0]
@@ -4901,7 +4901,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.0"><meta name="robots" content="noindex,nofollow">
+<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.0.0"><meta name="robots" content="">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
