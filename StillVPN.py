@@ -271,7 +271,7 @@ except ValueError as exc:
     raise RuntimeError("XUI_MAX_DEVICES must be a number from 1 to 10") from exc
 if not 1 <= XUI_MAX_DEVICES <= 10:
     raise RuntimeError("XUI_MAX_DEVICES must be 1..10")
-RELEASE = "13.4.4"
+RELEASE = "13.5.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Германия" if XUI_ENABLED else "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -5506,16 +5506,16 @@ else:
 # All data comes from the authenticated API; no fake subscriptions or statistics.
 STILL_WEB_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#F3EFEA">
-<title>Still VPN — VPN для Android, iPhone и компьютера | WireGuard</title>
-<meta name="description" content="Still VPN — VPN на WireGuard с сервером в Нидерландах. Подключение через Telegram, тарифы и личный кабинет для Android, iPhone, Windows и macOS.">
+<title>Still VPN — VLESS VPN через Happ для телефона и компьютера</title>
+<meta name="description" content="Still VPN — VPN на базе VLESS и Xray с подключением через Happ. Сервер в Германии, Telegram Mini App и личный кабинет Still VPN.">
 <meta name="robots" content="index,follow,max-image-preview:large">
 <link rel="canonical" href="__STILL_CANONICAL__">
 <meta property="og:type" content="website"><meta property="og:site_name" content="Still VPN">
-<meta property="og:title" content="Still VPN — защищённое VPN-подключение на WireGuard">
-<meta property="og:description" content="VPN через Telegram и личный кабинет. Нидерланды, Android, iPhone и компьютер.">
+<meta property="og:title" content="Still VPN — VLESS VPN через Happ и Telegram">
+<meta property="og:description" content="VPN через Happ, Telegram и личный кабинет. Сервер в Германии.">
 <meta property="og:url" content="__STILL_CANONICAL__">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"Still VPN","url":"__STILL_CANONICAL__","inLanguage":"ru"}</script>
-<meta name="still-release" content="13.1.0">
+<meta name="still-release" content="13.5.0">
 <script id="telegram-entry">__STILL_TG_REDIRECT__</script>
 <style>
 :root{--bg:#100D11;--panel:#191217;--red:#681A29;--red2:#42131F;--violet:#76558D;--ink:#F3EEF0;--muted:#A99DA4;--line:rgba(243,238,240,.12);--green:#96c8af}
@@ -5739,38 +5739,130 @@ footer{padding:27px 0;color:#746D71;border-top:1px solid #E5DBD7;font-size:12px}
 .studio-steps>div{min-height:175px}
 @media(max-width:700px){.studio-steps>div{min-height:0}}
 
+
+/* STILL 13.5 / typography system, readable light surfaces, stable navigation.
+   Editorial SaaS layout: content over ornament, consistent rhythm and contrast. */
+:root{--bg:#F8F6F3;--paper:#FFFFFF;--ink:#201F22;--muted:#58525A;--line:#D8D2D1;--brand:#A85072;--brand-ink:#71344B;--soft:#F4ECEF}
+html{scroll-padding-top:104px}html,body{overflow-x:clip}
+body{font-size:16px;line-height:1.55;letter-spacing:-.011em;color:var(--ink)}
+#guest,#member{min-width:0}button,input,select,textarea{font-family:inherit}
+button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid #9D5572;outline-offset:3px}
+header{position:sticky;top:0;z-index:90;background:rgba(248,246,243,.97);border-bottom:1px solid var(--line);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.topnav{display:flex;align-items:center;gap:0;color:#363239;font-size:14px;font-weight:620}
+#site-nav-links{display:flex;align-items:center;gap:25px}
+#site-nav-links>a:not(.pill-link){color:#383138;padding:9px 0}
+#site-nav-links>a:not(.pill-link):hover{color:var(--brand-ink)}
+#site-menu-toggle{display:none;border:1px solid #CABFC1;background:#FFF;color:#35272F;border-radius:9px;padding:10px 12px;font-size:14px;font-weight:680}
+.shell{max-width:1180px;margin:auto;padding:22px 32px 64px}
+.kicker,.micro{color:#81435E;font-weight:750;letter-spacing:.11em}
+h1,h2,h3{color:var(--ink);text-wrap:balance}
+#guest .lead,#member .lead{color:#514C54;font-size:16px;line-height:1.65}
+#guest .muted,#member .muted{color:#59545B!important}
+#guest .hint,#member .hint{color:#59515A}
+#guest .notice,#member .notice{background:#F7F0F2;border:1px solid #DDC3CE;color:#513144;padding:17px 18px;line-height:1.6;font-size:14px}
+#guest .notice.bad,#member .notice.bad{background:#FFF2F4;border-color:#CE8094;color:#7B263C}
+#guest .notice.good,#member .notice.good{background:#EFF7F0;border-color:#A3C4AE;color:#29563B}
+#guest .empty,#member .empty{color:#605861}
+#guest .section,#member .section{margin:31px 0}
+#guest .cta,#member .cta{min-height:46px;box-shadow:none}
+#guest .cta.tiny,#member .cta.tiny{min-height:40px;font-size:13px}
+#member{padding-top:25px}
+#member .subnav{margin:0 0 33px;border-color:var(--line);gap:7px;padding-bottom:15px}
+#member .subnav button{color:#504A52;font-size:14px;font-weight:630;padding:10px 13px;min-height:44px}
+#member .subnav button.active{color:#65364B;background:#F2DFE7;border:1px solid #C49AAC}
+#member .layout{grid-template-columns:minmax(0,1fr) 250px;gap:52px}
+#member .side .note{border-color:var(--line)}
+#member .side b{font-size:14px;color:#2D262C}
+#member .side p{font-size:13px;line-height:1.6;color:#56515A}
+#member .side .kicker{color:#81435E}
+#member .panel,#member .overview,#guest .auth-shell{background:#FFF;border:1px solid #E0D9D8;border-radius:16px;box-shadow:0 5px 22px rgba(53,36,46,.035)}
+#member .overview{padding:26px 28px}
+#member .overview .eyebrow{color:#5B4853;border-color:#D3B9C3}
+#member .big-info{color:#241C23}
+#member .listrow{font-size:15px;color:#312D32;border-color:#DCD5D4}
+#member .listrow strong{color:#282229}
+#member .planline{background:#fff;border:1px solid #E0D8D7;border-radius:15px;margin:12px 0;padding:22px 21px;align-items:flex-start;box-shadow:0 4px 16px rgba(51,34,42,.026)}
+#member .planline strong{font-size:20px;color:#231F23;letter-spacing:-.035em}
+#member .planline p{margin:7px 0 0;color:#514C52!important;font-size:14px}
+#member .planline .price{color:#2B2128;font-weight:790;font-size:26px}
+#member .planline .price small{display:block;text-align:right;font-size:12px;color:#625860}
+#member .field span{font-size:14px;color:#433D44;font-weight:600}
+#member .field input,#member .field select,#member textarea,#guest .field input,#guest .field select{color:#282227;background:#fff;border:1px solid #BDB3B7;border-radius:10px;font-size:16px;min-height:49px}
+#member textarea{width:100%!important;background:#FFF!important;color:#29232A!important;border:1px solid #BDB3B7!important;font-size:15px}
+#guest input::placeholder,#member input::placeholder{color:#736C73}
+#member .chip{color:#574B54;border-color:#C9BEC5}
+#member .progress{background:#E8DEE3}
+#guest .studio-features strong{color:#292529;font-size:14px}#guest .studio-features p{color:#545054;font-size:13px;line-height:1.55}
+#guest .studio-steps strong{color:#29242A;font-size:16px}#guest .studio-steps p{color:#555058;font-size:14px;line-height:1.6}
+#guest .studio-how-title>p:last-child{font-size:14px;color:#565059}
+#guest .still-pricing-header>p,#guest .still-pricing-note{color:#5A5058;font-size:14px}
+#guest .still-plan{border-color:#D8D0D0;background:#FFF;padding:25px;gap:13px;box-shadow:0 3px 18px rgba(41,30,38,.04)}
+#guest .still-plan.featured{background:#F7EEF1;border-color:#BF8FA2}
+#guest .still-plan-top strong{font-size:20px;color:#211A20}
+#guest .still-plan-meta{font-size:14px;color:#4E4850;line-height:1.55}
+#guest .still-plan-cost{font-variant-numeric:tabular-nums;color:#241B21}
+#guest .still-plan-cost small{font-size:14px;color:#5B525A}
+#guest .still-plan a{font-size:14px;min-height:44px;display:grid;place-items:center}
+#guest .studio-community p{font-size:14px;color:#514B51;line-height:1.6}
+#guest .seo-landing{font-size:14px;line-height:1.7;color:#4B454C}#guest .seo-landing a{text-decoration:underline;color:#71344B}
+#guest .auth-shell{padding:29px 30px;max-width:540px;scroll-margin-top:102px}
+#guest .auth-tabs button{color:#514850;font-size:15px}#guest .auth-tabs button.active{color:#5F2D43}
+#guest .auth-tabs{border-color:#DBD1D3}
+body.member-preview #authorization,body.member-preview #intro-create{display:none!important}
+body.member-preview #intro-login{display:inline-flex!important}
+#about-still,#features,#how-it-works,#tariffs,#authorization{scroll-margin-top:105px}
+@media(max-width:900px){#member .layout{grid-template-columns:minmax(0,1fr);gap:30px}#member .side{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.side .note{padding:12px 0}#site-nav-links{gap:15px}}
+@media(max-width:700px){
+ header{height:68px;padding:0 18px} .shell{padding:12px 17px 45px}
+ #site-menu-toggle{display:inline-flex;align-items:center;gap:8px}
+ #site-nav-links{display:none;position:absolute;top:calc(100% + 6px);left:14px;right:14px;background:#FFF;border:1px solid #DCD3D3;box-shadow:0 16px 35px #1C11142b;border-radius:13px;padding:10px;flex-direction:column;align-items:stretch;gap:0;z-index:100}
+ #site-nav-links.is-open{display:flex}
+ .topnav #site-nav-links a,.topnav #site-nav-links a:not(.pill-link){display:block!important;padding:13px 13px!important;color:#302830;font-size:15px;border-radius:7px;white-space:normal}
+ .topnav #site-nav-links .pill-link{display:block!important;margin-top:7px;text-align:center;color:#fff!important;background:#A85072}
+ #member .subnav{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:2px;padding-bottom:10px;overflow:visible}
+ #member .subnav button{font-size:12px;padding:10px 4px;min-height:42px;white-space:normal}
+ #member .side{grid-template-columns:1fr;gap:0}
+ #member .layout{gap:10px}
+ #member .overview{padding:21px}
+ #member .planline{padding:18px;gap:10px}
+ #member .planline .price{font-size:22px}
+ #guest .auth-shell{padding:23px 18px}
+ #guest .still-plan{min-height:0}
+}
+@media(max-width:360px){#member .subnav button{font-size:11px}#member .planline{flex-direction:column}#member .planline .price small{text-align:left}}
+
 </style></head>
 <body>
-<header><a class="logotype" href="/" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL</a><nav class="topnav"><a href="#about-still" class="hide-mobile">Возможности</a><a href="#how-it-works" class="hide-mobile">Как подключиться</a><a href="#tariffs" class="hide-mobile">Тарифы</a><a href="#authorization" class="header-login">Кабинет</a><a href="https://t.me/StillVPNapp_bot" id="bot-link" class="pill-link" target="_blank" rel="noopener noreferrer">Открыть в Telegram ↗</a></nav></header>
+<header><a class="logotype" href="/" aria-label="Still VPN — главная"><i class="iconmark" aria-hidden="true"></i>STILL</a><nav class="topnav" aria-label="Основная навигация"><button type="button" id="site-menu-toggle" aria-expanded="false" aria-controls="site-nav-links">Меню <span aria-hidden="true">☰</span></button><span id="site-nav-links"><a href="#features" class="hide-mobile">Возможности</a><a href="#how-it-works" class="hide-mobile">Как подключиться</a><a href="#tariffs" class="hide-mobile">Тарифы</a><a href="#authorization" class="header-login">Кабинет</a><a href="https://t.me/StillVPNapp_bot" id="bot-link" class="pill-link" target="_blank" rel="noopener noreferrer">Открыть в Telegram ↗</a></span></nav></header>
 <div id="toast" role="status" aria-live="polite"></div>
 <main class="shell"><div id="guest">
 <section class="intro" id="about-still">
-<div class="intro-copy"><span class="studio-label"><i class="studio-dot"></i> STILL VPN · WIREGUARD</span>
+<div class="intro-copy"><span class="studio-label"><i class="studio-dot"></i> STILL VPN · VLESS / HAPP</span>
 <h1>Интернет<br>на твоих условиях.</h1>
-<p class="lead">VPN на WireGuard с управлением через Telegram. Подключай телефон или компьютер — без сложных настроек и непонятных условий.</p>
+<p class="lead">Защищённое подключение через Happ с управлением в Telegram. Телефон или компьютер — одна подписка, понятные условия.</p>
 <div class="buttons"><a class="cta" id="intro-trial" href="https://t.me/StillVPNapp_bot" target="_blank" rel="noopener noreferrer">↗ &nbsp;Попробовать бесплатно</a><button class="cta outline" id="intro-create" type="button">Создать аккаунт</button><button class="cta outline hidden" id="intro-login" type="button">Войти</button></div>
-<p class="studio-footnote">24 часа и 1 ГБ для новых пользователей · Сервер в Нидерландах</p>
+<p class="studio-footnote">Пробный доступ при наличии · VPN-сервер в Германии</p>
 </div>
 <div class="intro-art" aria-label="Пример интерфейса Still VPN, данные демонстрационные">
 <div class="product-showcase">
 <div class="product-art-brand"><i class="iconmark" aria-hidden="true"></i><b>STILL</b><span>ПРИМЕР ПРИЛОЖЕНИЯ</span></div>
 <div class="product-art-status"><i class="studio-led"></i> Подписка активна</div>
 <div class="product-art-heading">Всё готово<br>к подключению.</div>
-<div class="product-art-node"><span aria-hidden="true">🇳🇱</span><div><strong>Нидерланды</strong><small>WireGuard · EU / NL</small></div><span aria-hidden="true">›</span></div>
+<div class="product-art-node"><span aria-hidden="true">🇩🇪</span><div><strong>Германия</strong><small>VLESS · Xray / Happ</small></div><span aria-hidden="true">›</span></div>
 <div class="product-demo-row"><span>Подписка</span><strong>Доступ активен</strong></div>
 <div class="product-demo-row"><span>Профиль</span><strong>Подготовлен</strong></div>
 <div class="product-demo-meter"><i></i></div>
 <div class="product-art-caption">Пример интерфейса · данные демонстрационные</div>
 </div></div>
 </section>
-<section class="studio-features" aria-label="Возможности Still VPN">
-<div><span class="feature-icon" aria-hidden="true">ϟ</span><strong>WireGuard</strong><p>Быстрое и понятное подключение.</p></div>
-<div><span class="feature-icon" aria-hidden="true">◎</span><strong>Нидерланды</strong><p>Европейский VPN-сервер.</p></div>
+<section class="studio-features" id="features" aria-label="Возможности Still VPN">
+<div><span class="feature-icon" aria-hidden="true">ϟ</span><strong>VLESS + Xray</strong><p>Современный протокол подключения.</p></div>
+<div><span class="feature-icon" aria-hidden="true">◎</span><strong>Германия</strong><p>VPN-сервер в Европе.</p></div>
 <div><span class="feature-icon" aria-hidden="true">▣</span><strong>Твои устройства</strong><p>Телефон и компьютер в одном кабинете.</p></div>
 <div><span class="feature-icon" aria-hidden="true">◇</span><strong>Защита соединения</strong><p>Шифрование между устройством и сервером.</p></div>
 </section>
 <section class="studio-how" id="how-it-works"><div class="studio-how-title"><p class="kicker">КАК НАЧАТЬ</p><h2>Как<br>подключиться</h2><p>Три простых шага, чтобы начать.</p></div>
-<div class="studio-steps"><div><span>01</span><strong>Открой Still VPN</strong><p>Войди через сайт или Telegram-бота.</p></div><div><span>02</span><strong>Получи профиль</strong><p>Сохрани конфигурацию WireGuard или получи её в Telegram.</p></div><div><span>03</span><strong>Включи VPN</strong><p>Импортируй профиль в WireGuard и включи соединение.</p></div></div></section>
+<div class="studio-steps"><div><span>01</span><strong>Открой Still VPN</strong><p>Войди через сайт или Telegram-бота.</p></div><div><span>02</span><strong>Получи профиль</strong><p>Создай устройство и скопируй персональную HTTPS-подписку.</p></div><div><span>03</span><strong>Включи VPN</strong><p>Импортируй подписку в Happ и включи подключение.</p></div></div></section>
 <section class="still-pricing" id="tariffs" aria-labelledby="pricing-title">
   <div class="still-pricing-header"><div><p class="kicker">ВЫБЕРИ СВОЙ ДОСТУП</p><h2 id="pricing-title">Тарифы Still VPN</h2></div><p>Цена и объём трафика прозрачны. Оплата цифровой подписки — через Telegram Stars.</p></div>
   <div class="still-pricing-cards" id="public-pricing" aria-live="polite"><p class="muted">Загружаем актуальные тарифы…</p></div>
@@ -5778,9 +5870,9 @@ footer{padding:27px 0;color:#746D71;border-top:1px solid #E5DBD7;font-size:12px}
 </section>
 <section class="studio-community"><div><span class="studio-label">STILL / COMMUNITY</span><h2>Мы на связи.</h2><p>Не получилось подключиться? Поддержка Still VPN поможет разобраться. Новости и инструкции — в нашем канале.</p></div><div class="studio-community-actions"><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал ↗</a><button id="share-site" type="button">Поделиться Still VPN</button></div></section>
 <section class="auth-shell" id="authorization" ><p class="kicker">ВАШ КАБИНЕТ</p><h2 id="auth-title">Вход в Still VPN</h2><div class="auth-tabs"><button data-auth="login" class="active">Вход</button><button data-auth="register">Регистрация</button><button data-auth="recover">Восстановление</button></div><form id="auth-form"><label class="field"><span>Логин</span><input id="login" name="username" minlength="3" maxlength="32" autocomplete="username" required placeholder="например, still_user"></label><label class="field hidden" id="email-field"><span>Email для подтверждения (необязательно)</span><input id="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com"></label><label class="field" id="password-field"><span id="password-label">Пароль</span><input id="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required placeholder="Не менее 12 символов"></label><label class="field hidden" id="recovery-field"><span>Одноразовый код восстановления</span><input id="recovery" type="text" autocomplete="off" maxlength="120" placeholder="STILL-..."></label><label class="center small hidden" id="agree-field" style="margin:17px 0"><input type="checkbox" id="agree"> <span>Принимаю <a href="/web/terms" style="text-decoration:underline">условия тестирования</a></span></label><div class="buttons"><button class="cta" id="auth-submit" type="submit">Войти в аккаунт</button></div></form><p class="hint" id="auth-hint" style="margin-top:15px">Доступ к кабинету не требует Telegram.</p><div id="auth-error" aria-live="polite"></div></section>
-<section class="seo-landing" aria-label="Информация о Still VPN"><h2>VPN на WireGuard для телефона и компьютера</h2><p>Still VPN помогает настроить защищённое соединение на Android, iPhone, Windows и macOS. Управляйте подпиской, пробным доступом и устройствами в Telegram Mini App или через личный кабинет сайта. Основной VPN-сервер расположен в Нидерландах.</p><p>После создания устройства скачайте файл WireGuard (.conf) или запросите его в личном чате Telegram. Для включения VPN импортируйте файл в приложение WireGuard. Лимиты трафика, срок и количество устройств зависят от выбранного тарифа.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a> · <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал Still VPN ↗</a></section>
+<section class="seo-landing" aria-label="Информация о Still VPN"><h2>VPN через Happ для телефона и компьютера</h2><p>Still VPN позволяет управлять VLESS-подключениями на сервере в Германии через Telegram Mini App. Срок, объём трафика и число устройств зависят от подписки.</p><p>Для подключения создайте устройство в Mini App, скопируйте персональную HTTPS-ссылку и добавьте её в клиент Happ. Продление сохраняет прежнюю подписку.</p> · <a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Канал Still VPN ↗</a></section>
 </div>
-<div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Приватный ключ устройства генерируется в браузере. Сохраните конфигурацию сразу после создания.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
+<div id="member" class="hidden"><div class="subnav" id="member-nav"><button data-page="home" class="active">Обзор</button><button data-page="plans">Подписка</button><button data-page="devices">Устройства</button><button data-page="profile">Профиль</button></div><div class="layout"><section id="content" aria-live="polite"></section><aside class="side"><div class="note"><p class="kicker">STILL VPN</p><b>Кабинет без Telegram</b><p>Устройства и подписки обслуживаются тем же VPN-сервером, что и в Mini App.</p></div><div class="note"><b>Безопасность</b><p>Не публикуйте HTTPS-ссылку Happ: она открывает доступ к вашему VPN-профилю.</p></div><div class="note"><b>Поддержка</b><p>Если Telegram недоступен, обратитесь по альтернативному контакту, указанному в условиях сервиса.</p></div></aside></div></div>
 
 <footer><span>© Still VPN · 2026 · Интернет на твоих условиях</span><span><a href="https://t.me/StillVPN_official" target="_blank" rel="noopener noreferrer">Наш канал</a> · <a href="/web/terms">Условия и данные</a> · <span id="footer-bot"></span></span></footer>
 </main>
@@ -5790,12 +5882,13 @@ const $=q=>document.querySelector(q), $$=q=>Array.from(document.querySelectorAll
 let me=null,config=null,page='home',authMode='login',csrf='',devices=[],plans=[],lastConfig=null;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const date=v=>v?new Date(v).toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'}):'—';
-const bytes=v=>v===null||v===undefined?'Без лимита':(v/1073741824).toFixed(2)+' ГБ';
+const bytes=v=>v===null||v===undefined?'Без лимита':(v/1073741824).toLocaleString('ru-RU',{maximumFractionDigits:2})+' ГБ';
+const devicesWord=n=>{n=Number(n)||0;return n%10===1&&n%100!==11?'устройство':n%10>=2&&n%10<=4&&(n%100<12||n%100>14)?'устройства':'устройств'};
 function toast(t,bad=false){const el=$('#toast');el.textContent=t;el.style.background=bad?'#681A29':'#321e2b';el.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.style.display='none',4600)}
 async function api(path,options={}){const method=options.method||'GET';const r=await fetch('/web/api/'+path,{credentials:'same-origin',...options,headers:{'Content-Type':'application/json',...(method==='GET'?{}:{'X-CSRF-Token':csrf}),...(options.headers||{})}});let data;try{data=await r.json()}catch{throw Error('Сервер вернул непонятный ответ')};if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Ошибка '+r.status);return data}
 async function guestApi(path,body){const r=await fetch('/web/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let d;try{d=await r.json()}catch{throw Error('Не удалось прочитать ответ сервера')};if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Ошибка '+r.status);return d}
 function showAuth(mode='login'){authMode=mode;$('#authorization').scrollIntoView({behavior:'smooth'});$$('[data-auth]').forEach(b=>b.classList.toggle('active',b.dataset.auth===mode));$('#auth-title').textContent=({login:'Вход в Still VPN',register:'Создать аккаунт',recover:'Восстановление доступа'})[mode];$('#email-field').classList.toggle('hidden',mode!=='register');$('#recovery-field').classList.toggle('hidden',mode!=='recover');$('#agree-field').classList.toggle('hidden',mode!=='register');$('#password-label').textContent=mode==='login'?'Пароль':mode==='recover'?'Новый пароль':'Придумайте пароль';$('#password').minLength=mode==='login'?1:12;$('#password').autocomplete=mode==='login'?'current-password':'new-password';$('#auth-submit').textContent=({login:'Войти в аккаунт',register:'Зарегистрироваться',recover:'Восстановить пароль'})[mode];$('#auth-error').innerHTML='';$('#auth-hint').textContent=mode==='register'?'Используйте уникальный пароль от 12 символов. Email нужен для подтверждения пробного доступа.':'Никаких обязательных входов через Telegram.'}
-$$('[data-auth]').forEach(b=>b.onclick=()=>showAuth(b.dataset.auth));$('#intro-create').onclick=()=>showAuth('register');$('#intro-login').onclick=()=>showAuth('login');
+$$('[data-auth]').forEach(b=>b.onclick=()=>showAuth(b.dataset.auth));$('#intro-create').onclick=()=>showAuth('register');$('#intro-login').onclick=()=>{if(me)revealAccount();else showAuth('login')};
 $('#share-site').onclick=async()=>{const url=location.origin+'/web';try{if(navigator.share){await navigator.share({title:'Still VPN',text:'VPN для повседневного интернета',url});return}await navigator.clipboard.writeText(url);toast('Ссылка на Still VPN скопирована')}catch(e){if(e?.name!=='AbortError')toast('Ссылка: '+url)}};
 function showMemberRecovery(code){
 const modal=document.createElement('div');modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);display:grid;place-items:center;z-index:1000;padding:22px';
@@ -5808,7 +5901,28 @@ if(authMode==='register'){d=await guestApi('register',{login,password,email:$('#
 if(authMode==='login'){d=await guestApi('login',{login,password});csrf=d.csrf;await loadMe(true);return}
 d=await guestApi('password/recover',{login,recovery_code:$('#recovery').value.trim(),new_password:password});showRecovery(d.recovery_code);toast('Пароль заменён. Войдите с новым паролем.');return;
 }catch(err){$('#auth-error').innerHTML=`<div class="notice bad">${esc(err.message)}</div>`}finally{btn.disabled=false}};
-async function loadMe(activate=false){try{me=await api('me');csrf=me.csrf;$('#guest').classList.add('hidden');$('#member').classList.remove('hidden');if(activate)page='home';render();}catch(e){if(e.message.includes('Войдите')||e.message.includes('Сессия')){me=null;$('#member').classList.add('hidden');$('#guest').classList.remove('hidden')}else toast(e.message,true)}}
+async function loadMe(activate=false){try{me=await api('me');csrf=me.csrf;document.body.classList.remove('member-preview');$('#guest').classList.add('hidden');$('#member').classList.remove('hidden');if(activate)page='home';render();}catch(e){if(e.message.includes('Войдите')||e.message.includes('Сессия')){me=null;$('#member').classList.add('hidden');$('#guest').classList.remove('hidden')}else toast(e.message,true)}}
+
+// Public sections and the account share a page. Keep both accessible after login.
+const siteNav=$('#site-nav-links'), siteMenu=$('#site-menu-toggle');
+const siteMenuClose=()=>{siteNav.classList.remove('is-open');siteMenu.setAttribute('aria-expanded','false')};
+siteMenu.addEventListener('click',()=>{const open=siteNav.classList.toggle('is-open');siteMenu.setAttribute('aria-expanded',String(open))});
+function revealPublic(id){
+ $('#member').classList.add('hidden');$('#guest').classList.remove('hidden');
+ document.body.classList.toggle('member-preview',Boolean(me));if(me)$('#intro-login').textContent='Вернуться в кабинет';siteMenuClose();
+ requestAnimationFrame(()=>{const el=document.getElementById(id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});else window.scrollTo({top:0,behavior:'smooth'})});
+}
+function revealAccount(){
+ siteMenuClose();
+ if(me){document.body.classList.remove('member-preview');$('#guest').classList.add('hidden');$('#member').classList.remove('hidden');nav(page)}
+ else {revealPublic('authorization');}
+}
+$$('.topnav a[href^="#"]').forEach(a=>a.addEventListener('click',e=>{
+ e.preventDefault();const id=a.getAttribute('href').slice(1);
+ if(id==='authorization'){revealAccount();return}
+ revealPublic(id);if(location.hash!==('#'+id))history.replaceState(null,'','#'+id);
+}));
+$('.logotype').addEventListener('click',e=>{e.preventDefault();revealPublic('about-still');history.replaceState(null,'',location.pathname)});
 $$('[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));function nav(p){page=p;$$('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===p));render();window.scrollTo({top:0,behavior:'smooth'})}
 function subhead(k,title,desc=''){return `<p class="kicker">${esc(k)}</p><h1 style="font-size:clamp(30px,4.5vw,53px)">${esc(title)}</h1><p class="lead">${esc(desc)}</p>`}
 function render(){if(!me)return;const c=$('#content');if(page==='home')home(c);else if(page==='plans')plansPage(c);else if(page==='devices')devicesPage(c);else profilePage(c)}
@@ -5821,7 +5935,7 @@ c.innerHTML=subhead('ОБЗОР / STILL VPN',`На связи, ${me.username}.`,
 $('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}
 }
 async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
-try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} устройств · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
+try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} ${devicesWord(p.devices)} · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
 async function devicesPage(c){
  if(me?.happ_enabled){
   const target=config?.bot_url||'https://t.me/StillVPNapp_bot';
@@ -5879,7 +5993,7 @@ async function loadPublicPlans(){
    const n=list.slice(0,6);
    const priceBytes=x=>x==null?'Без лимита':Math.round(Number(x)/1073741824)+' ГБ';
    const target=config?.bot_url||'https://t.me/StillVPNapp_bot';
-   box.innerHTML=n.map((p,i)=>`<article class="still-plan ${i===Math.floor(Math.min(n.length,3)/2)?'featured':''}"><div class="still-plan-top"><strong>${esc(p.title)}</strong>${i===Math.floor(Math.min(n.length,3)/2)?`<span class="still-plan-tag">${Number(p.days)} дней</span>`:''}</div><div class="still-plan-meta">${Number(p.days)} дней · ${priceBytes(p.traffic_bytes)} · ${Number(p.devices)} устр.</div><div class="still-plan-cost">${Number(p.stars)} <small>⭐ Stars</small></div><a href="${esc(target)}" target="_blank" rel="noopener noreferrer">Выбрать в Telegram ↗</a></article>`).join('');
+   box.innerHTML=n.map((p,i)=>`<article class="still-plan ${i===Math.floor(Math.min(n.length,3)/2)?'featured':''}"><div class="still-plan-top"><strong>${esc(p.title)}</strong>${i===Math.floor(Math.min(n.length,3)/2)?`<span class="still-plan-tag">${Number(p.days)} дней</span>`:''}</div><div class="still-plan-meta">${Number(p.days)} дней · ${priceBytes(p.traffic_bytes)} · ${Number(p.devices)} устр.</div><div class="still-plan-cost">${Number(p.stars)} <small>⭐ Stars</small></div><a href="${esc(target)}" target="_blank" rel="noopener noreferrer">Подробнее в Telegram ↗</a></article>`).join('');
  }catch(e){box.innerHTML='<p class="muted">Не удалось загрузить тарифы. Посмотрите актуальные предложения в Telegram-боте.</p>';}
 }
 async function init(){loadPublicPlans();try{config=await api('config');if(config.bot_url){const b=$('#bot-link');b.href=config.bot_url;b.classList.remove('hidden');$('#intro-trial').href=config.bot_url;$('#footer-bot').innerHTML=`<a target="_blank" rel="noopener noreferrer" href="${esc(config.bot_url)}">Открыть Telegram-бота ↗</a>`}loadPublicPlans();if(!config.registration_enabled){$$('[data-auth="register"]').forEach(x=>x.disabled=true);$('#intro-create').disabled=true}await loadMe()}catch(e){toast(e.message,true)}}
@@ -5890,7 +6004,7 @@ init();
 MINI_APP_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.1.0"><meta name="robots" content="noindex,nofollow">
+<title>Still VPN — личный кабинет</title><meta name="still-release" content="13.5.0"><meta name="robots" content="noindex,nofollow">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -6161,6 +6275,53 @@ input,select,textarea,.ticket-form input,.ticket-form textarea,.ticket-form sele
 @media(min-width:700px){#app{padding-left:34px;padding-right:34px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
 
+
+/* STILL 13.5 / native mobile typography and pricing, without AI-style decoration. */
+:root{--ink:#F4EEF0;--muted:#C3B7BE;--hair:rgba(245,234,240,.17)}
+html{-webkit-text-size-adjust:100%}body{font-size:15px;line-height:1.6;letter-spacing:-.012em}
+#app{padding-left:clamp(17px,5vw,26px);padding-right:clamp(17px,5vw,26px);padding-bottom:calc(env(safe-area-inset-bottom) + 120px);min-width:0}
+#main{min-width:0}h1{font-size:clamp(29px,7.5vw,38px);line-height:1.13;font-weight:760}h2{font-size:21px;font-weight:720;line-height:1.24}h3{font-size:16px;font-weight:680}
+.para{font-size:14px;line-height:1.65;color:#CCC0C7!important}
+.muted{color:#C1B6BD}.small{font-size:13px;line-height:1.5}.kicker{font-size:11px;letter-spacing:.105em;color:#D9A1B6}
+.button{line-height:1.3;padding:12px 15px;white-space:normal;text-wrap:balance;transition:background-color .15s ease}
+.button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid #F0B6C9;outline-offset:3px}
+input:not([type="checkbox"]):not([type="radio"]),select,textarea{font-size:16px!important;line-height:1.45;min-width:0;width:100%;color:#F4EDF0!important;border-color:#71616A!important}
+input::placeholder{color:#B4A7B0!important}
+.section>label{font-size:14px;font-weight:620;color:#E3D8DE;display:block;margin-bottom:9px}
+/* Isolate the pricing cards from the original border-left hover layout. */
+#plan-list.plans-grid{display:grid;gap:13px;margin-top:14px}
+#plan-list .plan,#plan-list .plan:hover{box-sizing:border-box;margin:0;padding:20px 19px 19px;border:1px solid #51434E;border-radius:17px;background:#211D24;box-shadow:none;transform:none}
+#plan-list .plan.plan-recommended{border-color:#9A6378;background:#272027}
+#plan-list .plan-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;min-width:0}
+#plan-list .plan-title{min-width:0;flex:1}
+#plan-list .plan-title h2{margin:0 0 7px;font-size:22px;letter-spacing:-.047em;line-height:1.14;color:#FBF4F6;font-weight:770;overflow-wrap:anywhere}
+#plan-list .plan-period{font-size:13px;color:#C6B9C1;line-height:1.45}
+#plan-list .plan-price{text-align:right;flex:none;white-space:nowrap;font-variant-numeric:tabular-nums}
+#plan-list .plan-price strong{display:block;font-size:29px;line-height:1.1;font-weight:790;letter-spacing:-.06em;color:#FAF5F7}
+#plan-list .plan-price strong span{color:#F4BE61;font-size:22px;vertical-align:2px;letter-spacing:0}
+#plan-list .plan-price small{display:block;color:#BAAEB6;font-size:10px;letter-spacing:.01em;margin-top:6px}
+#plan-list .plan-benefits{display:flex;gap:7px;flex-wrap:wrap;margin-top:17px;padding:14px 0 16px;border-top:1px solid #493D47;border-bottom:1px solid #493D47}
+#plan-list .plan-benefits span{padding:6px 9px;background:#312931;border-radius:7px;font-size:12px;line-height:1.4;color:#E6DBE1}
+#plan-list .plan-benefits b{color:#FFF7FA;font-weight:740}
+#plan-list .plan-actions{display:grid;grid-template-columns:1.2fr .8fr;gap:9px;margin-top:17px}
+#plan-list .plan-actions button{min-width:0;width:100%;font-size:13px;font-weight:750;min-height:47px;border-radius:11px;padding:11px 8px}
+#plan-list .plan-actions button.secondary{background:transparent;border:1px solid #76616B;color:#F2E5EB}
+#plan-list .plan-actions button:disabled{opacity:1;cursor:not-allowed;background:#674C59;color:#F9ECF2;border:1px solid #7B5E6A}
+#plan-list .plan-actions button.secondary:disabled{background:#29242C;color:#D5C7CF;border-color:#63555D}
+.plans-intro{margin:23px 0 0}
+.plans-promo{border:1px solid #51434D;background:#211E24;padding:16px;border-radius:14px}
+.plans-promo label{display:flex;align-items:baseline;justify-content:space-between;gap:12px;color:#F1E8ED;font-size:14px;font-weight:660;margin-bottom:11px}
+.plans-promo label span{font-size:12px;color:#BAADB7;font-weight:460}
+.plans-promo input{display:block;background:#17151A;border:1px solid #6D5A65;border-radius:10px;padding:13px 14px;min-height:48px}
+.plans-paused{padding:12px 14px;margin:13px 0 0;background:#33282C;border:1px solid #715459;color:#E8D5D8;border-radius:10px;font-size:13px;line-height:1.55}
+.plan-history{padding-top:19px;border-top:1px solid #4A3D45;margin-top:30px}
+.plan-history h2{font-size:20px;margin-bottom:15px}
+.tabs button{font-size:11px;min-height:48px;color:#C0B3BB}.tabs button.active{color:#F0A8C1}
+.top-profile{min-width:44px;min-height:44px}
+@media(max-width:360px){#plan-list .plan,#plan-list .plan:hover{padding:17px 15px}#plan-list .plan-title h2{font-size:20px}#plan-list .plan-price strong{font-size:26px}#plan-list .plan-actions{grid-template-columns:1fr 1fr}#plan-list .plan-actions button{font-size:12px}}
+@media(min-width:560px){#plan-list .plan{padding:24px 26px}#plan-list .plan-title h2{font-size:24px}}
+@media(prefers-reduced-motion:reduce){.button{transition:none}}
+
 </style></head>
 <body><div id="toast" role="status" aria-live="polite"></div>
 <div id="app"><div class="top"><div class="wordmark"><i class="mark" aria-hidden="true"></i>STILL</div><button id="open-profile-top" class="top-profile" type="button" aria-label="Открыть профиль"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3-6 8-6s8 2 8 6"/></svg></button></div><main id="main"><p class="muted">Подключаем Still VPN…</p></main></div>
@@ -6173,7 +6334,8 @@ const $=s=>document.querySelector(s), main=$('#main'), tabs=$('#tabs');
 let page='home', me=null, plans=[], devices=[], payments=[], gifts=[], currentConfig=null;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const day=x=>new Date(x).toLocaleDateString('ru-RU',{day:'2-digit',month:'long',year:'numeric'});
-const gb=x=>x===null||x===undefined?'Без лимита':(x/(1024**3)).toFixed(x?2:0)+' ГБ';
+const gb=x=>x===null||x===undefined?'Без лимита':(Number(x)/(1024**3)).toLocaleString('ru-RU',{maximumFractionDigits:2})+' ГБ';
+const deviceUnit=n=>{n=Number(n)||0;return n%10===1&&n%100!==11?'устройство':n%10>=2&&n%10<=4&&(n%100<12||n%100>14)?'устройства':'устройств'};
 const bytes=x=>{
   if(x===null||x===undefined)return 'Без лимита';
   const n=Math.max(0,Number(x)||0);
@@ -6247,12 +6409,19 @@ $('#invite-share').onclick=()=>shareTelegram('https://t.me/StillVPNapp_bot');
 if($('#trial'))$('#trial').onclick=async()=>{try{await api('trial',{method:'POST'});toast('Пробный доступ активирован');await reload();nav('home')}catch(e){toast(e.message,true)}};
 miniServers();dashboardDevices();miniReferrals();
 }
-function planPage(){main.innerHTML=section('Подписка','Выберите свой ритм.','Никаких скрытых параметров: цену и ограничения задаёт администратор.')+
-'<div class="section"><label>Скидочный промокод (если есть)</label><input id="discount-code" maxlength="80" placeholder="Необязательно"></div><div id="plan-list"></div><div class="section"><h2>История платежей</h2><div id="history"><p class="muted small">Загрузка…</p></div></div>';
-const box=$('#plan-list');if(!plans.length)box.innerHTML='<div class="notice">Тарифы пока не опубликованы администратором.</div>';
-else box.innerHTML=plans.map(p=>`<div class="plan"><div class="row"><div><h2 style="margin:0 0 7px">${esc(p.title)}</h2><span class="small muted">${p.days} дней · ${p.devices} устр. · ${gb(p.traffic_bytes)}</span></div><span class="price">${p.stars} <small>⭐</small></span></div><div class="row" style="margin-top:16px"><button class="button compact" data-buy="${p.id}">Купить</button><button class="button secondary compact" data-gift="${p.id}">В подарок</button></div></div>`).join('');
-box.querySelectorAll('[data-buy],[data-gift]').forEach(b=>b.onclick=()=>buy(Number(b.dataset.buy||b.dataset.gift),Boolean(b.dataset.gift)));
-loadPayments();}
+function planPage(){
+ main.innerHTML=section('ПОДПИСКА','Выберите тариф.','Стоимость и лимиты берутся из Still VPN. Подключение и продление — через Telegram.')+
+ `<div class="plans-intro"><div class="plans-promo"><label for="discount-code">Промокод <span>необязательно</span></label><input id="discount-code" maxlength="80" autocomplete="off" placeholder="Введите код скидки"></div>${!me.payments_enabled?'<p class="plans-paused" role="status">Оплата временно выключена. Тарифы можно посмотреть, но купить сейчас нельзя.</p>':''}</div><div id="plan-list" class="plans-grid" aria-live="polite"></div><section class="plan-history section"><h2>История платежей</h2><div id="history"><p class="muted small">Загрузка…</p></div></section>`;
+ const box=$('#plan-list');
+ if(!plans.length)box.innerHTML='<div class="notice">Тарифы пока не опубликованы администратором.</div>';
+ else box.innerHTML=plans.map((p,i)=>`<article class="plan ${i===1?'plan-recommended':''}">
+   <div class="plan-head"><div class="plan-title"><h2>${esc(p.title)}</h2><span class="plan-period">${Number(p.days)} дней доступа</span></div><div class="plan-price"><strong>${Number(p.stars)} <span aria-label="Telegram Stars">★</span></strong><small>Telegram Stars</small></div></div>
+   <div class="plan-benefits"><span><b>${Number(p.devices)}</b> ${deviceUnit(p.devices)}</span><span><b>${gb(p.traffic_bytes)}</b> трафика</span></div>
+   <div class="plan-actions"><button class="button compact" data-buy="${Number(p.id)}" ${!me.payments_enabled?'disabled':''}>Выбрать тариф</button><button class="button secondary compact" data-gift="${Number(p.id)}" ${!me.payments_enabled?'disabled':''}>Подарить</button></div>
+ </article>`).join('');
+ box.querySelectorAll('[data-buy],[data-gift]').forEach(b=>b.onclick=()=>buy(Number(b.dataset.buy||b.dataset.gift),Boolean(b.dataset.gift)));
+ loadPayments();
+}
 async function buy(planId,isGift){if(!me.payments_enabled){toast('Оплата пока не подключена. Обратитесь к администратору.',true);return}
  try{const promoCode=($('#discount-code')?.value||'').trim();const inv=await api('invoice',{method:'POST',body:JSON.stringify({plan_id:planId,kind:isGift?'gift':'subscription',promo_code:promoCode||null})});
  if(!tg.openInvoice)throw new Error('Оплата доступна только в Telegram');
