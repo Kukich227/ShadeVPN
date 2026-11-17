@@ -202,6 +202,8 @@ from pydantic import BaseModel, Field
 
 LOG = logging.getLogger("shade")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# Hide full 3x-ui administrative URLs (including private webBasePath) in HTTP logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MODE = os.getenv("SHADE_MODE", "app")
 if MODE not in ("app", "agent"):
@@ -269,7 +271,7 @@ except ValueError as exc:
     raise RuntimeError("XUI_MAX_DEVICES must be a number from 1 to 10") from exc
 if not 1 <= XUI_MAX_DEVICES <= 10:
     raise RuntimeError("XUI_MAX_DEVICES must be 1..10")
-RELEASE = "13.4.3"
+RELEASE = "13.4.4"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Германия" if XUI_ENABLED else "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -826,7 +828,7 @@ if MODE == "app":
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from aiogram import Bot, Dispatcher, Router, F
     from aiogram.filters import Command, CommandStart
-    from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+    from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError, TelegramForbiddenError, TelegramBadRequest
     from aiogram.types import (
         Message, CallbackQuery, PreCheckoutQuery, WebAppInfo,
         InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
@@ -989,9 +991,13 @@ if MODE == "app":
                     if (int(current.get("expiryTime", 0)) != expires or
                             int(current.get("totalGB", 0)) != quota or
                             bool(current.get("enable")) != enabled):
-                        await self._request("POST", "clients/update/" + quote(access.email, safe=""), {
-                            "expiryTime": expires, "totalGB": quota, "enable": enabled
-                        })
+                        # 3x-ui 3.11.0 requires the FULL client object on update.
+                        # Preserve UUID, subId, flow, protocol and other attributes.
+                        # Only this bot-owned client is modified.
+                        payload = dict(current)
+                        payload.update({"email": access.email, "expiryTime": expires,
+                                        "totalGB": quota, "enable": enabled})
+                        await self._request("POST", "clients/update/" + quote(access.email, safe=""), payload)
                 updated = await self.lookup(access.email)
                 if not isinstance(updated, dict) or not updated.get("subId"):
                     raise XuiError("3x-ui did not confirm subscription ID")
@@ -1001,7 +1007,12 @@ if MODE == "app":
             current = await self.lookup(email)
             if current is None or not current.get("enable"):
                 return True
-            await self._request("POST", "clients/update/" + quote(email, safe=""), {"enable": False})
+            # Full replacement is required here too. Do not erase client UUID
+            # or stable subscription link when suspending or revoking access.
+            payload = dict(current)
+            payload["email"] = email
+            payload["enable"] = False
+            await self._request("POST", "clients/update/" + quote(email, safe=""), payload)
             confirmed = await self.lookup(email)
             return confirmed is not None and not confirmed.get("enable")
 
@@ -1574,7 +1585,8 @@ if MODE == "app":
                         d.sub_id = result["sub_id"]
                         d.synced_at = now()
                 except Exception as e:
-                    LOG.warning("XUI reconcile failed (device %s): %s", d.id[:8], type(e).__name__)
+                    LOG.warning("XUI reconcile failed (device %s): %s", d.id[:8],
+                                str(e) if isinstance(e, XuiError) else type(e).__name__)
             await s.commit()
 
     async def upsert_user(s: AsyncSession, tg: Any) -> User:
@@ -1948,7 +1960,8 @@ if MODE == "app":
             except Exception as exc:
                 # A temporary API failure must not falsely show 0 GB or crash
                 # expiry/revoke reconciliation. Keep the previously stored usage.
-                LOG.warning("XUI traffic sync unavailable: %s", type(exc).__name__)
+                LOG.warning("XUI traffic sync unavailable: %s",
+                            str(exc) if isinstance(exc, XuiError) else type(exc).__name__)
         async with Session() as s:
             nodes = [] if XUI_ENABLED else (await s.scalars(select(ServerNode))).all()
             for node in nodes:
@@ -2023,8 +2036,22 @@ if MODE == "app":
                     await bot.send_message(n.user_id, notice_msg, parse_mode="HTML")
                     n.sent = True
                     await s.commit()
-                except Exception:
-                    LOG.warning("Failed to send notification %s", n.id)
+                except TelegramForbiddenError:
+                    # Recipient blocked the bot or otherwise cannot receive
+                    # messages. A notification from this period is not retriable.
+                    n.sent = True
+                    await s.commit()
+                    LOG.info("Notification %s undeliverable (recipient unavailable)", n.id)
+                except TelegramBadRequest as exc:
+                    detail = str(exc).lower()
+                    if "chat not found" in detail or "user is deactivated" in detail:
+                        n.sent = True
+                        await s.commit()
+                        LOG.info("Notification %s undeliverable (chat unavailable)", n.id)
+                    else:
+                        LOG.warning("Failed to send notification %s: TelegramBadRequest", n.id)
+                except Exception as exc:
+                    LOG.warning("Failed to send notification %s: %s", n.id, type(exc).__name__)
 
     sqlite_background_lock = asyncio.Lock()
 
@@ -3638,7 +3665,7 @@ if MODE == "app":
             if not ent: bad(403, "Нужна активная подписка")
             count = await s.scalar(select(func.count()).select_from(XuiDevice).where(
                 XuiDevice.user_id == u.id, XuiDevice.enabled.is_(True)))
-            # Until cross-device traffic accounting is verified, issue one link per account.
+            # Two-layer device limit: tariff entitlement and configured safety ceiling.
             if count >= min(XUI_MAX_DEVICES, int(ent["devices"])):
                 bad(409, "Достигнут лимит устройств вашего тарифа")
             device_id = str(uuid.uuid4())
@@ -3658,7 +3685,8 @@ if MODE == "app":
                     row.synced_at = now()
             return {"id": d.id, "ready": True}
         except Exception as e:
-            LOG.warning("Happ provision deferred for %s: %s", d.id[:8], type(e).__name__)
+            LOG.warning("Happ provision deferred for %s: %s", d.id[:8],
+                        str(e) if isinstance(e, XuiError) else type(e).__name__)
             return {"id": d.id, "ready": False, "message": "Выдача ожидает синхронизации"}
 
     @app.get("/api/happ/devices/{device_id}/link")
@@ -6146,6 +6174,13 @@ let page='home', me=null, plans=[], devices=[], payments=[], gifts=[], currentCo
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const day=x=>new Date(x).toLocaleDateString('ru-RU',{day:'2-digit',month:'long',year:'numeric'});
 const gb=x=>x===null||x===undefined?'Без лимита':(x/(1024**3)).toFixed(x?2:0)+' ГБ';
+const bytes=x=>{
+  if(x===null||x===undefined)return 'Без лимита';
+  const n=Math.max(0,Number(x)||0);
+  if(n<1048576)return (n/1024).toFixed(n===0?0:1)+' КБ';
+  if(n<1073741824)return (n/1048576).toFixed(1)+' МБ';
+  return (n/1073741824).toFixed(2)+' ГБ';
+};
 function toast(text,err=false){const el=$('#toast');el.textContent=text;el.style.background=err?'#681A29':'#31252f';el.style.display='block';clearTimeout(toast._t);toast._t=setTimeout(()=>el.style.display='none',3900)}
 async function api(path,opts={}){
  if(!tg?.initData)throw new Error('Откройте Mini App через Telegram-бота');
