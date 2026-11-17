@@ -257,9 +257,14 @@ try:
     WG_CLIENT_DNS = str(ipaddress.IPv4Address(os.getenv("WG_CLIENT_DNS", "1.1.1.1")))
 except ipaddress.AddressValueError as exc:
     raise RuntimeError("WG_CLIENT_DNS must be a single valid IPv4 DNS resolver") from exc
-RELEASE = "13.3.0"
+# 3x-ui/Happ migration is opt-in. Old WireGuard code is not used when enabled.
+# Payments additionally require a separate opt-in after live client/expiry tests.
+XUI_ENABLED = os.getenv("XUI_ENABLED", "0") == "1"
+XUI_ENABLE_PAYMENTS = os.getenv("XUI_ENABLE_PAYMENTS", "0") == "1"
+XUI_MAX_DEVICES = 1  # Beta: enforce a single client until cross-device traffic accounting is verified.
+RELEASE = "13.4.2"
 CHANNEL_URL = "https://t.me/StillVPN_official"
-PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
+PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Германия" if XUI_ENABLED else "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
 try:
     LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "-1004452182801"))
@@ -825,6 +830,189 @@ if MODE == "app":
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     from html import escape as html_escape
     import httpx
+    # 3x-ui integration uses the existing, restricted node-sync API token.
+    import asyncio
+    import os
+    import re
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+    from typing import Any
+    from urllib.parse import quote, urlsplit
+
+    import httpx
+
+    XUI_EMAIL_RE = re.compile(r"^svpn_[0-9]{1,19}_[a-f0-9]{12,32}$")
+
+
+    class XuiError(RuntimeError):
+        """Sanitized integration error; no tokens or subscription URLs in messages."""
+
+
+    @dataclass(frozen=True)
+    class XuiSettings:
+        base_url: str
+        token: str
+        inbound_id: int
+        subscription_template: str
+
+        def __post_init__(self):
+            url = urlsplit(self.base_url)
+            if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
+                raise ValueError("XUI_BASE_URL must be a complete HTTPS panel base address")
+            if not self.token or any(c.isspace() for c in self.token):
+                raise ValueError("Missing or invalid XUI_API_TOKEN")
+            if not isinstance(self.inbound_id, int) or self.inbound_id < 1:
+                raise ValueError("XUI_INBOUND_ID must be a positive number")
+            t = urlsplit(self.subscription_template)
+            if t.scheme != "https" or not t.netloc or t.username or t.password or t.fragment or self.subscription_template.count("{sub_id}") != 1:
+                raise ValueError("XUI_SUBSCRIPTION_TEMPLATE must be HTTPS with exactly one {sub_id}")
+            if "{" in self.subscription_template.replace("{sub_id}", "") or "}" in self.subscription_template.replace("{sub_id}", ""):
+                raise ValueError("Unexpected placeholder in subscription template")
+
+        @classmethod
+        def from_env(cls):
+            return cls(
+                base_url=os.environ.get("XUI_BASE_URL", "").rstrip("/"),
+                token=os.environ.get("XUI_API_TOKEN", ""),
+                inbound_id=int(os.environ.get("XUI_INBOUND_ID", "1")),
+                subscription_template=os.environ.get("XUI_SUBSCRIPTION_TEMPLATE", ""),
+            )
+
+
+    @dataclass(frozen=True)
+    class Access:
+        telegram_id: int
+        stable_device_id: str  # bot-generated hex UUID (12..32 chars), never a user-entered name
+        expiry: datetime
+        quota_bytes: int | None = None  # None = no limit, use carefully for multi-device plans
+        enabled: bool = True
+
+        def __post_init__(self):
+            if self.telegram_id <= 0 or not re.fullmatch(r"[a-f0-9]{12,32}", self.stable_device_id):
+                raise ValueError("Invalid Telegram ID or device identifier")
+            if self.expiry.tzinfo is None or self.expiry.utcoffset() is None:
+                raise ValueError("Expiry must be timezone-aware")
+            if self.quota_bytes is not None and self.quota_bytes < 0:
+                raise ValueError("Negative traffic limit")
+
+        @property
+        def email(self):
+            return f"svpn_{self.telegram_id}_{self.stable_device_id}"
+
+        @property
+        def expiry_ms(self):
+            return max(1, int(self.expiry.astimezone(timezone.utc).timestamp() * 1000))
+
+
+    class NodeSyncBridge:
+        def __init__(self, settings: XuiSettings, client: httpx.AsyncClient | None = None):
+            self.config = settings
+            self._owned = client is None
+            self.client = client or httpx.AsyncClient(timeout=12, follow_redirects=False, verify=True)
+            self._locks: dict[str, asyncio.Lock] = {}
+
+        async def close(self):
+            if self._owned:
+                await self.client.aclose()
+
+        async def _request(self, method: str, path: str, payload=None):
+            # Appends only fixed API path and validated URL-safe email strings.
+            url = self.config.base_url + "/panel/api/" + path
+            try:
+                r = await self.client.request(method, url,
+                    headers={"Authorization": "Bearer " + self.config.token,
+                             "Accept": "application/json", "Content-Type": "application/json"},
+                    json=payload)
+                if r.status_code in (401, 403):
+                    raise XuiError("Token is not authorized for this 3x-ui API operation")
+                if r.status_code != 200:
+                    raise XuiError("3x-ui HTTP error: " + str(r.status_code))
+                data = r.json()
+            except XuiError:
+                raise
+            except (httpx.HTTPError, ValueError) as e:
+                raise XuiError("3x-ui HTTPS/API request failed") from e
+            if not isinstance(data, dict) or data.get("success") is not True:
+                raise XuiError("3x-ui API rejected the request")
+            return data.get("obj")
+
+        async def _get_inbound_clients(self):
+            raw = await self._request("GET", "inbounds/list")
+            if not isinstance(raw, list):
+                raise XuiError("Invalid 3x-ui inbound list")
+            inbound = next((x for x in raw if x.get("id") == self.config.inbound_id), None)
+            if inbound is None:
+                raise XuiError("Configured inbound ID was not found")
+            if inbound.get("protocol") != "vless":
+                raise XuiError("Configured inbound is not VLESS")
+            settings = inbound.get("settings") or {}
+            if isinstance(settings, str):
+                import json
+                try:
+                    settings = json.loads(settings)
+                except ValueError as exc:
+                    raise XuiError("Invalid inbound settings JSON") from exc
+            clients = settings.get("clients") if isinstance(settings, dict) else None
+            if not isinstance(clients, list):
+                raise XuiError("No inbound client list")
+            return clients
+
+        async def lookup(self, email: str):
+            if not XUI_EMAIL_RE.fullmatch(email):
+                raise ValueError("Invalid bot-owned email identifier")
+            clients = await self._get_inbound_clients()
+            return next((x for x in clients if x.get("email") == email), None)
+
+        async def ensure(self, access: Access):
+            """Idempotent upsert; assumes authorization was checked by StillVPN first."""
+            lock = self._locks.setdefault(access.email, asyncio.Lock())
+            async with lock:
+                current = await self.lookup(access.email)
+                expires = access.expiry_ms
+                enabled = bool(access.enabled and access.expiry > datetime.now(timezone.utc) and
+                               (access.quota_bytes is None or access.quota_bytes > 0))
+                quota = access.quota_bytes if access.quota_bytes is not None else 0
+                if current is None:
+                    await self._request("POST", "clients/add", {
+                        "client": {"email": access.email, "tgId": access.telegram_id,
+                                   "expiryTime": expires, "totalGB": quota, "enable": enabled},
+                        "inboundIds": [self.config.inbound_id],
+                    })
+                else:
+                    if (int(current.get("expiryTime", 0)) != expires or
+                            int(current.get("totalGB", 0)) != quota or
+                            bool(current.get("enable")) != enabled):
+                        await self._request("POST", "clients/update/" + quote(access.email, safe=""), {
+                            "expiryTime": expires, "totalGB": quota, "enable": enabled
+                        })
+                updated = await self.lookup(access.email)
+                if not isinstance(updated, dict) or not updated.get("subId"):
+                    raise XuiError("3x-ui did not confirm subscription ID")
+                return {"email": access.email, "sub_id": updated["subId"], "enabled": bool(updated.get("enable"))}
+
+        async def suspend(self, email: str):
+            current = await self.lookup(email)
+            if current is None or not current.get("enable"):
+                return True
+            await self._request("POST", "clients/update/" + quote(email, safe=""), {"enable": False})
+            confirmed = await self.lookup(email)
+            return confirmed is not None and not confirmed.get("enable")
+
+        def subscription(self, sub_id: str):
+            if not isinstance(sub_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{6,128}", sub_id):
+                raise XuiError("Invalid subscription identifier")
+            https_url = self.config.subscription_template.replace("{sub_id}", quote(sub_id, safe=""))
+            return {"https_url": https_url, "happ_deeplink": "happ://add/" + https_url}
+
+
+    # Safe integration example (not public API):
+    # bridge = NodeSyncBridge(XuiSettings.from_env())
+    # try:
+    #     result = await bridge.ensure(Access(uid, device_uuid.hex, access_ends_at))
+    #     link = bridge.subscription(result["sub_id"])
+    # finally:
+    #     await bridge.close()
+    # Return links ONLY to the authorized owner, and NEVER log them.
 
     def _read_bot_meta_state() -> dict[str, Any]:
         try:
@@ -849,7 +1037,7 @@ if MODE == "app":
             "short_description": "Still VPN — управление подпиской и VPN-подключениями в Telegram.",
             "description": (
                 "Still VPN: личный кабинет, подписки, устройства и безопасные "
-                "WireGuard-подключения. Откройте Mini App через /start. "
+                "VPN-подключения. Откройте Mini App через /start. "
                 "Поддержка: /support."
             ),
         }
@@ -1006,6 +1194,19 @@ if MODE == "app":
         last_handshake: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
         peer_rx: Mapped[int] = mapped_column(BigInteger, default=0)
         peer_tx: Mapped[int] = mapped_column(BigInteger, default=0)
+
+    class XuiDevice(Base):
+        __tablename__ = "xui_devices"
+        id: Mapped[str] = mapped_column(String(36), primary_key=True)
+        user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+        email: Mapped[str] = mapped_column(String(100), unique=True)
+        sub_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+        name: Mapped[str] = mapped_column(String(60))
+        platform: Mapped[str] = mapped_column(String(24))
+        enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+        provisioned: Mapped[bool] = mapped_column(Boolean, default=False)
+        created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
+        synced_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     class Gift(Base):
         __tablename__ = "gifts"
@@ -1217,11 +1418,64 @@ if MODE == "app":
         # Only valid, complete payment configuration may create/accept new invoices.
         # Existing successful_payment callbacks are still processed for idempotent fulfillment.
         return bool(ENABLE_PAYMENTS and TERMS_URL.startswith("https://")
-                    and fernet is not None and len(WG_AGENT_SECRET) >= 32)
+                    and fernet is not None and (
+                    XUI_ENABLE_PAYMENTS and bool(os.getenv("XUI_SUBSCRIPTION_TEMPLATE"))
+                    and bool(os.getenv("XUI_API_TOKEN")) if XUI_ENABLED
+                    else len(WG_AGENT_SECRET) >= 32))
 
     async def db_session():
         async with Session() as s:
             yield s
+
+    def xui_bridge() -> NodeSyncBridge:
+        try:
+            return NodeSyncBridge(XuiSettings.from_env())
+        except (ValueError, KeyError) as e:
+            LOG.warning("XUI settings incomplete: %s", type(e).__name__)
+            bad(503, "Сервис Happ пока не настроен администратором")
+
+    async def xui_readiness() -> None:
+        bridge = xui_bridge()
+        try:
+            await bridge._get_inbound_clients()
+        except XuiError:
+            bad(503, "Сервер Happ временно недоступен")
+        finally:
+            await bridge.close()
+
+    def xui_access(d: XuiDevice, ent: dict | None) -> Access:
+        # Do not grant access if the StillVPN subscription is suspended/expired.
+        return Access(d.user_id, d.id.replace("-", ""), ent["end"] if ent else now()-timedelta(seconds=1),
+                      ent["limit"] if ent else None, enabled=bool(ent and d.enabled))
+
+    async def xui_sync(d: XuiDevice, ent: dict | None):
+        bridge = xui_bridge()
+        try:
+            access = xui_access(d, ent)
+            result = await bridge.ensure(access)
+            return result
+        finally:
+            await bridge.close()
+
+    async def xui_reconcile_all():
+        # Retry provisioning and enforce expiry/refunds independently of client app refresh.
+        async with Session() as s:
+            rows = (await s.scalars(select(XuiDevice).order_by(XuiDevice.created_at).limit(5000))).all()
+            users_cache = {}
+            for d in rows:
+                try:
+                    if d.user_id not in users_cache:
+                        u = await s.get(User, d.user_id)
+                        users_cache[d.user_id] = await entitlement(s, u) if u else None
+                    grant = users_cache[d.user_id]
+                    if not d.provisioned or not d.synced_at or (now()-d.synced_at).total_seconds() >= 120:
+                        result = await xui_sync(d, grant)
+                        d.provisioned = True
+                        d.sub_id = result["sub_id"]
+                        d.synced_at = now()
+                except Exception as e:
+                    LOG.warning("XUI reconcile failed (device %s): %s", d.id[:8], type(e).__name__)
+            await s.commit()
 
     async def upsert_user(s: AsyncSession, tg: Any) -> User:
         uid = int(tg.id if hasattr(tg, "id") else tg["id"])
@@ -1504,6 +1758,10 @@ if MODE == "app":
         await agent_request(node, "POST", "/agent/peer", payload)
 
     async def ensure_access(s: AsyncSession, uid: int):
+        # Historical admin/payment paths still call this helper. Never touch obsolete WG VPS
+        # after migrating to 3x-ui: the Xray reconciler enforces access independently.
+        if XUI_ENABLED:
+            return
         user = await s.get(User, uid)
         if not user:
             return
@@ -1585,7 +1843,7 @@ if MODE == "app":
 
     async def process_background():
         async with Session() as s:
-            nodes = (await s.scalars(select(ServerNode))).all()
+            nodes = [] if XUI_ENABLED else (await s.scalars(select(ServerNode))).all()
             for node in nodes:
                 try:
                     await refresh_stats(s, node)
@@ -1644,8 +1902,11 @@ if MODE == "app":
                 tr = await s.get(Trial, user.id)
                 if tr and tr.ends_at <= now() and not grant:
                     await queue_notice(s, user.id, "trial_ended", str(user.id), "Still VPN: пробный период завершён.")
-                await ensure_access(s, user.id)
+                if not XUI_ENABLED:
+                    await ensure_access(s, user.id)
             await s.commit()
+        if XUI_ENABLED:
+            await xui_reconcile_all()
         async with Session() as s:
             unsent = (await s.scalars(select(Notice).where(Notice.sent.is_(False)).order_by(Notice.id).limit(40))).all()
             for n in unsent:
@@ -2944,14 +3205,19 @@ if MODE == "app":
 
     @app.get("/api/protocols")
     async def api_protocols(user: User = Depends(current_user)):
-        return {"wireguard": True, "amneziawg": AWG_ENABLED, "amneziawg_version": "3.1" if AWG_ENABLED else None}
+        return {"wireguard": not XUI_ENABLED, "amneziawg": AWG_ENABLED and not XUI_ENABLED,
+                "vless": XUI_ENABLED, "client": "Happ" if XUI_ENABLED else None}
 
     @app.get("/build")
     async def build_info():
         return {"release": RELEASE, "site": "/", "mini_app": "/app",
-                "agent": "WireGuard + opt-in AmneziaWG 3.1 (agent v5)"}
+                "vpn_provider": "3x-ui / VLESS + Happ" if XUI_ENABLED else "WireGuard (legacy)",
+                "xui_enabled": XUI_ENABLED}
 
     async def server_public_data(s: AsyncSession) -> list[dict]:
+        if XUI_ENABLED:
+            return [{"id": 1, "location": "Germany", "country": "Германия",
+                     "provider": "3x-ui", "protocol": "VLESS / REALITY / XHTTP", "status": "checking"}]
         nodes = (await s.scalars(select(ServerNode).where(
             ServerNode.enabled.is_(True)).order_by(ServerNode.id).limit(12))).all()
         result = []
@@ -2983,19 +3249,25 @@ if MODE == "app":
     @app.get("/api/me")
     async def api_me(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
         e = await entitlement(s, user)
-        count = await s.scalar(select(func.count()).select_from(Device).where(
-            Device.user_id == user.id, Device.enabled.is_(True)))
+        count = await s.scalar(select(func.count()).select_from(XuiDevice if XUI_ENABLED else Device).where(
+            (XuiDevice.user_id if XUI_ENABLED else Device.user_id) == user.id,
+            (XuiDevice.enabled if XUI_ENABLED else Device.enabled).is_(True)))
         tr = await s.get(Trial, user.id)
         enabled_nodes = await s.scalar(select(func.count()).select_from(ServerNode).where(ServerNode.enabled.is_(True))) or 0
         responsive_nodes = await s.scalar(select(func.count()).select_from(NodeHealth).join(
             ServerNode, NodeHealth.server_id == ServerNode.id).where(
             ServerNode.enabled.is_(True), NodeHealth.last_seen >= now() - timedelta(minutes=3))) or 0
+        if XUI_ENABLED:
+            enabled_nodes = 1
+            responsive_nodes = 0  # No claim of online until a fresh API probe is performed.
         return {"service": {"enabled_nodes": enabled_nodes, "responsive_nodes": responsive_nodes},
                 "account_status": "active" if not user.blocked else "blocked",
                 "id": user.id, "username": user.username, "first_name": user.first_name,
                 "created_at": user.created_at, "traffic_total": user.traffic_bytes,
                 "device_count": count, "trial_used": tr is not None,
-                "awg_available": AWG_ENABLED,
+                "awg_available": AWG_ENABLED and not XUI_ENABLED, "happ_enabled": XUI_ENABLED,
+                "happ_max_devices": 1 if XUI_ENABLED else None,
+                "traffic_tracking_available": not XUI_ENABLED,
                 "subscription": e and {**e, "end": e["end"].isoformat()},
                 "payments_enabled": payments_ready(),
                 "admin_role": await role_of(s, user.id), "release": RELEASE,
@@ -3005,16 +3277,20 @@ if MODE == "app":
     async def api_plans(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
         plans = (await s.scalars(select(Plan).where(Plan.enabled.is_(True)).order_by(Plan.days))).all()
         return [{"id": p.id, "title": p.title, "days": p.days, "stars": p.stars,
-                 "devices": p.devices, "traffic_bytes": p.traffic_bytes} for p in plans]
+                 "devices": min(p.devices, XUI_MAX_DEVICES) if XUI_ENABLED else p.devices,
+                 "traffic_bytes": p.traffic_bytes} for p in plans]
 
     @app.post("/api/trial")
     async def api_trial(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
-        node = await s.scalar(select(ServerNode).where(ServerNode.enabled.is_(True)).limit(1))
-        if not node: bad(503, "VPN-сервер пока не настроен")
-        try:
-            await agent_request(node, "GET", "/agent/stats")
-        except Exception:
-            bad(503, "VPN-сервер временно недоступен; пробный период не активирован")
+        if XUI_ENABLED:
+            await xui_readiness()
+        else:
+            node = await s.scalar(select(ServerNode).where(ServerNode.enabled.is_(True)).limit(1))
+            if not node: bad(503, "VPN-сервер пока не настроен")
+            try:
+                await agent_request(node, "GET", "/agent/stats")
+            except Exception:
+                bad(503, "VPN-сервер временно недоступен; пробный период не активирован")
         await s.commit()
         async with s.begin():
             u = await s.get(User, user.id, with_for_update=True)
@@ -3044,17 +3320,24 @@ if MODE == "app":
             bad(503, "Оплата ещё не настроена администратором")
         if data.kind not in ("subscription", "gift"):
             bad(422, "Неизвестный тип покупки")
-        node = await s.scalar(select(ServerNode).where(ServerNode.enabled.is_(True)).limit(1))
-        if not node: bad(503, "VPN-сервер не настроен; оплата недоступна")
-        try:
-            await agent_request(node, "GET", "/agent/stats")
-        except Exception:
-            bad(503, "VPN-сервер временно недоступен; оплата отключена")
+        if XUI_ENABLED:
+            await xui_readiness()
+        else:
+            node = await s.scalar(select(ServerNode).where(ServerNode.enabled.is_(True)).limit(1))
+            if not node: bad(503, "VPN-сервер не настроен; оплата недоступна")
+            try:
+                await agent_request(node, "GET", "/agent/stats")
+            except Exception:
+                bad(503, "VPN-сервер временно недоступен; оплата отключена")
         await s.commit()
         pid = str(uuid.uuid4())
         async with s.begin():
             plan = await s.scalar(select(Plan).where(Plan.id == data.plan_id).with_for_update(read=True))
             if not plan or not plan.enabled: bad(404, "Тариф не найден")
+            if XUI_ENABLED and plan.devices > XUI_MAX_DEVICES:
+                bad(409, "Этот тариф пока не совместим с ограничением устройств Happ")
+            if XUI_ENABLED and plan.traffic_bytes is not None:
+                bad(409, "Тарифы с лимитом трафика пока требуют проверки учёта Xray")
             promo_id = None
             amount = plan.stars
             if data.promo_code:
@@ -3159,12 +3442,100 @@ if MODE == "app":
 
     @app.get("/api/devices")
     async def api_devices(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        if XUI_ENABLED: return await happ_devices(user, s)
         rows = (await s.scalars(select(Device).where(Device.user_id == user.id)
                                                        .order_by(Device.created_at.desc()).limit(100))).all()
         return [{"id": d.id, "name": d.name, "platform": d.platform,
                  "protocol": device_protocol(d),
                  "created_at": d.created_at, "last_handshake": d.last_handshake,
                  "provisioned": d.provisioned, "enabled": d.enabled} for d in rows]
+
+    class HappDeviceIn(BaseModel):
+        name: str = Field(min_length=1, max_length=60)
+        platform: str
+
+    @app.get("/api/happ/devices")
+    async def happ_devices(user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        if not XUI_ENABLED: bad(404, "Happ не включён")
+        rows = (await s.scalars(select(XuiDevice).where(XuiDevice.user_id == user.id)
+                              .order_by(XuiDevice.created_at.desc()).limit(100))).all()
+        return [{"id": d.id, "name": d.name, "platform": d.platform,
+                 "enabled": d.enabled, "ready": d.provisioned,
+                 "created_at": d.created_at} for d in rows]
+
+    @app.post("/api/happ/devices")
+    async def happ_create(data: HappDeviceIn, user: User = Depends(current_user),
+                          s: AsyncSession = Depends(db_session)):
+        if not XUI_ENABLED: bad(404, "Happ не включён")
+        if data.platform not in ("android", "ios", "windows", "macos", "linux"):
+            bad(422, "Некорректная платформа")
+        if not re.fullmatch(r"[\w\- .А-Яа-яЁё]{1,60}", data.name, re.UNICODE):
+            bad(422, "Некорректное имя")
+        async with s.begin():
+            u = await s.get(User, user.id, with_for_update=True)
+            ent = await entitlement(s, u)
+            if not ent: bad(403, "Нужна активная подписка")
+            count = await s.scalar(select(func.count()).select_from(XuiDevice).where(
+                XuiDevice.user_id == u.id, XuiDevice.enabled.is_(True)))
+            # Until cross-device traffic accounting is verified, issue one link per account.
+            if count >= min(XUI_MAX_DEVICES, int(ent["devices"])):
+                bad(409, "Сейчас доступно одно подключение Happ на аккаунт")
+            device_id = str(uuid.uuid4())
+            email = f"svpn_{u.id}_{device_id.replace('-', '')}"
+            d = XuiDevice(id=device_id, user_id=u.id, name=data.name.strip(),
+                          platform=data.platform, email=email, enabled=True, provisioned=False)
+            s.add(d)
+            record_event(s, "happ_device_created", u.id, f"Устройство Happ {device_id[:8]}")
+        # Provision after DB commit: retriable if 3x-ui responds with a temporary error.
+        try:
+            result = await xui_sync(d, ent)
+            async with Session.begin() as s2:
+                row = await s2.get(XuiDevice, d.id)
+                if row:
+                    row.sub_id = result["sub_id"]
+                    row.provisioned = True
+                    row.synced_at = now()
+            return {"id": d.id, "ready": True}
+        except Exception as e:
+            LOG.warning("Happ provision deferred for %s: %s", d.id[:8], type(e).__name__)
+            return {"id": d.id, "ready": False, "message": "Выдача ожидает синхронизации"}
+
+    @app.get("/api/happ/devices/{device_id}/link")
+    async def happ_link(device_id: str, user: User = Depends(current_user),
+                        s: AsyncSession = Depends(db_session)):
+        if not XUI_ENABLED: bad(404, "Happ не включён")
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", device_id): bad(404, "Устройство не найдено")
+        d = await s.get(XuiDevice, device_id)
+        if not d or d.user_id != user.id or not d.enabled: bad(404, "Устройство не найдено")
+        grant = await entitlement(s, user)
+        if not grant: bad(403, "Подписка неактивна")
+        if not d.provisioned or not d.sub_id: bad(409, "Устройство ещё создаётся")
+        bridge = xui_bridge()
+        try:
+            # Return the HTTPS subscription and opt-in Happ deep-link; both are credentials.
+            return JSONResponse(bridge.subscription(d.sub_id), headers={"Cache-Control": "no-store"})
+        finally:
+            await bridge.close()
+
+    @app.delete("/api/happ/devices/{device_id}")
+    async def happ_revoke(device_id: str, user: User = Depends(current_user),
+                          s: AsyncSession = Depends(db_session)):
+        if not XUI_ENABLED: bad(404, "Happ не включён")
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", device_id): bad(404, "Устройство не найдено")
+        async with s.begin():
+            d = await s.get(XuiDevice, device_id)
+            if not d or d.user_id != user.id: bad(404, "Устройство не найдено")
+            d.enabled = False
+            record_event(s, "happ_device_revoked", user.id, f"Устройство Happ {d.id[:8]}")
+        try:
+            bridge = xui_bridge()
+            try:
+                revoked = await bridge.suspend(d.email)
+            finally:
+                await bridge.close()
+        except Exception:
+            revoked = False
+        return {"ok": True, "revoked": revoked, "background_retry": not revoked}
 
     class DeviceIn(BaseModel):
         name: str = Field(min_length=1, max_length=60)
@@ -3174,6 +3545,7 @@ if MODE == "app":
 
     @app.post("/api/devices")
     async def api_add_device(data: DeviceIn, user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        if XUI_ENABLED: bad(409, "Подключения теперь создаются через Happ")
         if data.protocol not in ("wireguard", "amneziawg"):
             bad(422, "Неподдерживаемый VPN-протокол")
         if data.protocol == "amneziawg":
@@ -3334,10 +3706,12 @@ if MODE == "app":
     async def api_send_conf(device_id: str, data: ConfToTelegramIn,
                             user: User = Depends(current_user),
                             session: AsyncSession = Depends(db_session)):
+        if XUI_ENABLED: bad(409, "Новые профили доступны в Happ")
         return await deliver_conf_to_telegram(device_id, data, user, session)
 
     @app.delete("/api/devices/{device_id}")
     async def api_delete_device(device_id: str, user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        if XUI_ENABLED: return await happ_revoke(device_id, user, s)
         async with s.begin():
             d = await s.get(Device, device_id)
             if not d or d.user_id != user.id: bad(404, "Устройство не найдено")
@@ -3556,7 +3930,15 @@ if MODE == "app":
     @app.post("/api/admin/devices/{device_id}/revoke")
     async def admin_device_revoke(device_id: str, data: AdminReason, actor=Depends(admin_scope("users"))):
         admin_id, role = actor
-        if role not in WRITERS: bad(403, "Отзыв Peer разрешён только управляющим")
+        if role not in WRITERS: bad(403, "Отзыв доступа разрешён только управляющим")
+        if XUI_ENABLED:
+            async with Session.begin() as s:
+                d = await s.get(XuiDevice, device_id, with_for_update=True)
+                if not d: bad(404, "Устройство Happ не найдено")
+                d.enabled = False
+                audit(s, admin_id, "happ_revoke", device_id, data.reason)
+            await xui_reconcile_all()
+            return {"ok": True}
         async with Session.begin() as s:
             d = await s.get(Device, device_id, with_for_update=True)
             if not d: bad(404, "Устройство не найдено")
@@ -3569,12 +3951,17 @@ if MODE == "app":
     @app.post("/api/admin/users/{user_id}/revoke")
     async def admin_revoke_all(user_id: int, data: AdminReason, actor=Depends(admin_scope("users"))):
         admin_id, role = actor
-        if role not in WRITERS: bad(403, "Отзыв Peer разрешён только управляющим")
+        if role not in WRITERS: bad(403, "Отзыв доступа разрешён только управляющим")
         async with Session.begin() as s:
             if not await s.get(User, user_id): bad(404, "Пользователь не найден")
-            await s.execute(update(Device).where(Device.user_id == user_id).values(enabled=False))
+            if XUI_ENABLED:
+                await s.execute(update(XuiDevice).where(XuiDevice.user_id == user_id).values(enabled=False))
+            else:
+                await s.execute(update(Device).where(Device.user_id == user_id).values(enabled=False))
             audit(s, admin_id, "revoke_all_peers", user_id, data.reason)
         async with Session.begin() as s: await ensure_access(s, user_id)
+        if XUI_ENABLED:
+            await xui_reconcile_all()
         return {"ok": True}
 
     @app.get("/api/admin/plans")
@@ -3585,6 +3972,8 @@ if MODE == "app":
     @app.post("/api/admin/plans")
     async def admin_plan_create(data: AdminPlanData, actor=Depends(admin_scope("plans"))):
         if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
+        if XUI_ENABLED and (data.devices > XUI_MAX_DEVICES or data.traffic_gb > 0):
+            bad(409, "Пока создавайте для Happ только тарифы на 1 устройство без лимита ГБ")
         async with Session.begin() as s:
             p = Plan(title=data.title.strip(),days=data.days,stars=data.stars,devices=data.devices,
                      traffic_bytes=data.traffic_gb*1024**3 if data.traffic_gb else None,enabled=data.enabled)
@@ -3597,6 +3986,8 @@ if MODE == "app":
     @app.put("/api/admin/plans/{plan_id}")
     async def admin_plan_update(plan_id: int, data: AdminPlanData, actor=Depends(admin_scope("plans"))):
         if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
+        if XUI_ENABLED and (data.devices > XUI_MAX_DEVICES or data.traffic_gb > 0):
+            bad(409, "Пока для Happ доступен тариф на 1 устройство без лимита ГБ")
         async with Session.begin() as s:
             p = await s.get(Plan, plan_id, with_for_update=True)
             if not p: bad(404, "Тариф не найден")
@@ -3646,6 +4037,22 @@ if MODE == "app":
 
     @app.get("/api/admin/servers")
     async def admin_servers(actor=Depends(admin_scope("servers")), s: AsyncSession = Depends(db_session)):
+        if XUI_ENABLED:
+            bridge = xui_bridge()
+            try:
+                clients = await bridge._get_inbound_clients()
+                return [{"id": 1, "location": "Германия", "enabled": True, "online": True,
+                         "endpoint": "3x-ui · VLESS / XHTTP / REALITY", "peer_count": len(clients),
+                         "cpu": None, "ram_used": None, "ram_total": None, "disk_free": None,
+                         "network_rx": None, "network_tx": None, "last_seen": now().isoformat(), "error": ""}]
+            except XuiError:
+                return [{"id": 1, "location": "Германия", "enabled": True, "online": False,
+                         "endpoint": "3x-ui · VLESS / XHTTP / REALITY", "peer_count": None,
+                         "cpu": None, "ram_used": None, "ram_total": None, "disk_free": None,
+                         "network_rx": None, "network_tx": None, "last_seen": None,
+                         "error": "Не удалось получить данные 3x-ui"}]
+            finally:
+                await bridge.close()
         nodes = (await s.scalars(select(ServerNode).order_by(ServerNode.id))).all()
         out=[]
         for n in nodes:
@@ -3662,6 +4069,7 @@ if MODE == "app":
 
     @app.post("/api/admin/servers/{server_id}/state")
     async def admin_server_state(server_id:int, data:AdminServerState, actor=Depends(admin_scope("servers"))):
+        if XUI_ENABLED: bad(409, "Управление сервером выполняется в панели 3x-ui")
         if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
         async with Session.begin() as s:
             node=await s.get(ServerNode,server_id,with_for_update=True)
@@ -4020,13 +4428,15 @@ if MODE == "app":
     async def web_public_config():
         username = BOT_USERNAME["value"]
         return {"bot_url": "https://t.me/" + username if username else None,
+                "happ_enabled": XUI_ENABLED,
                 "registration_enabled": WEB_REGISTRATION_ENABLED,
                 "trial_enabled": WEB_TRIAL_ENABLED,
                 "email_enabled": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")),
                 "terms_url": TERMS_URL if TERMS_URL.startswith("https://") else "/web/terms",
                 "channel_url": CHANNEL_URL, "release": RELEASE,
                 "servers": [{"country": PUBLIC_SERVER_COUNTRY,
-                             "provider": PUBLIC_SERVER_PROVIDER, "protocol": "WireGuard"}]}
+                             "provider": PUBLIC_SERVER_PROVIDER,
+                             "protocol": "VLESS / REALITY / XHTTP" if XUI_ENABLED else "WireGuard"}]}
 
     @app.post("/web/api/register")
     async def web_register(data: WebRegistration, req: Request):
@@ -4135,10 +4545,14 @@ if MODE == "app":
 
     @app.get("/web/api/devices")
     async def web_devices(identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        if XUI_ENABLED:
+            # Browser portal has not been migrated; never present Xray devices as WireGuard.
+            return []
         return await api_devices(identity[0], s)
 
     @app.post("/web/api/devices")
     async def web_create_device(data:DeviceIn, req:Request, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        if XUI_ENABLED: bad(409, "Создайте подключение Happ через Telegram Mini App")
         site_rate(req,"device-create",subject=str(identity[1].id),limit=12,window=3600)
         return await api_add_device(data, identity[0], s)
 
@@ -4146,11 +4560,13 @@ if MODE == "app":
     async def web_send_conf(device_id: str, data: ConfToTelegramIn, req: Request,
                             identity=Depends(web_authorized),
                             session: AsyncSession=Depends(db_session)):
+        if XUI_ENABLED: bad(409, "Профили WireGuard больше не выдаются; используйте Happ в Mini App")
         site_rate(req, "config-to-tg", subject=str(identity[1].id), limit=6, window=3600)
         return await deliver_conf_to_telegram(device_id, data, identity[0], session)
 
     @app.patch("/web/api/devices/{device_id}")
     async def web_rename_device(device_id:str, data:RenameIn, identity=Depends(web_authorized), s:AsyncSession=Depends(db_session)):
+        if XUI_ENABLED: bad(409, "Управляйте Happ через Telegram Mini App")
         return await api_rename(device_id, data, identity[0], s)
 
     @app.delete("/web/api/devices/{device_id}")
@@ -4420,9 +4836,23 @@ if MODE == "app":
 
     def seo_public_html() -> str:
         # Static server response exposes real headings/links even when JS is not executed.
-        return (STILL_WEB_HTML
+        page = (STILL_WEB_HTML
                 .replace("__STILL_CANONICAL__", html_escape(seo_site_url(), quote=True))
                 .replace("__STILL_TG_REDIRECT__", TELEGRAM_ENTRY_REDIRECT_JS))
+        if XUI_ENABLED:
+            page = (page
+                .replace('VPN на WireGuard', 'VPN на VLESS и REALITY')
+                .replace('WireGuard · EU / NL', 'VLESS · REALITY')
+                .replace('🇳🇱', '🇩🇪')
+                .replace('Нидерландах', 'Германии')
+                .replace('Нидерланды', 'Германия')
+                .replace('Импортируй профиль в WireGuard', 'Добавь подписку в Happ')
+                .replace('конфигурацию WireGuard', 'HTTPS-подписку Happ')
+                .replace('файл WireGuard (.conf)', 'HTTPS-ссылку подписки Happ')
+                .replace('в приложение WireGuard', 'в приложение Happ')
+                .replace('https://www.wireguard.com/install/', 'https://www.happ.su/')
+            )
+        return page
 
     # Public Google Search Console verification endpoint, from the original HTML file.
     # Keep the contents exact (including no trailing newline).
@@ -4480,7 +4910,7 @@ if MODE == "app":
 <body style='font:16px/1.7 system-ui;background:#100D11;color:#F3EEF0;max-width:680px;margin:32px auto;padding:0 20px'>
 <h1>Still VPN — условия тестирования</h1>
 <p>Сервис находится на этапе тестирования. VPN не гарантирует абсолютную анонимность, доступность всех сайтов или непрерывность соединения.</p>
-<p>Для работы сайта хранятся логин, хеш пароля, случайный идентификатор сессии, параметры подписки, устройства и счётчики трафика WireGuard. Содержание пользовательского трафика этим приложением не сохраняется.</p>
+<p>Для работы сайта хранятся логин, хеш пароля, случайный идентификатор сессии, параметры подписки и устройства. В режиме Happ управление VPN-клиентами и учёт трафика выполняет 3x-ui.</p>
 <p>При выборе функции «Получить .conf в личный Telegram-чат» приватный ключ однократно передаётся на сервер Still VPN по HTTPS и в Telegram. Still VPN не сохраняет приватный ключ в своей базе или логах, однако копия остаётся в личной переписке Telegram до её удаления.</p>
 <p>Для технического учёта владельцам в закрытой служебной группе Telegram могут отправляться уведомления о регистрации, подключениях устройств, оплатах и действиях администраторов с именем, @username и Telegram ID пользователя. Приватные VPN-ключи, пароли и тексты пользовательского трафика в группу не передаются.</p>
 <p>Подписка на информационный канал Still VPN добровольная.</p>
@@ -4593,6 +5023,10 @@ if MODE == "app":
 
     @asynccontextmanager
     async def lifespan_app(a: FastAPI):
+        LOG.info("Still VPN release %s started: backend=%s", RELEASE,
+                 "3x-ui/Happ" if XUI_ENABLED else "Legacy WG")
+        if XUI_ENABLED and not os.getenv("XUI_SUBSCRIPTION_TEMPLATE"):
+            LOG.warning("Happ subscription template not configured; provisioning will be unavailable")
         if not BOT_TOKEN or not WEBAPP_URL.startswith("https://") or not engine or not OWNER_IDS or len(CODE_PEPPER) < 32:
             raise RuntimeError("Нужны BOT_TOKEN, HTTPS WEBAPP_URL, база SQLite/PostgreSQL, OWNER_IDS и CODE_PEPPER (>=32)")
         if ENABLE_PAYMENTS and not payments_ready():
@@ -5190,16 +5624,23 @@ $$('[data-page]').forEach(b=>b.onclick=()=>nav(b.dataset.page));function nav(p){
 function subhead(k,title,desc=''){return `<p class="kicker">${esc(k)}</p><h1 style="font-size:clamp(30px,4.5vw,53px)">${esc(title)}</h1><p class="lead">${esc(desc)}</p>`}
 function render(){if(!me)return;const c=$('#content');if(page==='home')home(c);else if(page==='plans')plansPage(c);else if(page==='devices')devicesPage(c);else profilePage(c)}
 function home(c){const s=me.subscription;
-const pct=(s&&s.limit!==null&&s.limit>0)?Math.min(100,Math.max(0,s.used/s.limit*100)):null;
-const network=(me.service&&me.service.responsive_nodes>0)?'Сервер отвечает':'Статус уточняется';
+const pct=(!me.happ_enabled&&s&&s.limit!==null&&s.limit>0)?Math.min(100,Math.max(0,s.used/s.limit*100)):null;
+const network=me.happ_enabled?'Проверяйте в Mini App':(me.service&&me.service.responsive_nodes>0)?'Сервер отвечает':'Статус уточняется';
 c.innerHTML=subhead('ОБЗОР / STILL VPN',`На связи, ${me.username}.`,'Ваша сеть, устройства и срок доступа — без лишних меню.')+
-`<div class="overview"><div class="splithead"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><span class="micro">АККАУНТ / ${me.id>0?'TG':'WEB'}</span></div><div class="big-info">${s?esc(s.name):'Управляйте подключением'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Выберите подписку, чтобы добавить WireGuard-устройство.'}</p>${pct!==null?`<div class="progress" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div>`:''}</div>
-<div class="listrow"><span class="muted">Израсходовано за период</span><strong>${s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?s.devices:'—'}</strong></div><div class="listrow"><span class="muted">VPN-инфраструктура</span><strong>${network}</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Перейти к устройствам':'Посмотреть тарифы'} <span aria-hidden="true">↗</span></button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Активировать пробный доступ</button>':''}</div>`;
+`<div class="overview"><div class="splithead"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><span class="micro">АККАУНТ / ${me.id>0?'TG':'WEB'}</span></div><div class="big-info">${s?esc(s.name):'Управляйте подключением'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Выберите подписку, чтобы подключить VPN.'}</p>${pct!==null?`<div class="progress" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div>`:''}</div>
+<div class="listrow"><span class="muted">Израсходовано за период</span><strong>${me.happ_enabled?'Смотрите в Happ':s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?(me.happ_enabled?1:s.devices):'—'}</strong></div><div class="listrow"><span class="muted">VPN-инфраструктура</span><strong>${network}</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Перейти к устройствам':'Посмотреть тарифы'} <span aria-hidden="true">↗</span></button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Активировать пробный доступ</button>':''}</div>`;
 $('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}
 }
 async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
 try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} устройств · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
-async function devicesPage(c){c.innerHTML=subhead('STILL VPN','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><label class="field"><span>Протокол</span><select id="device-protocol"><option value="wireguard">WireGuard · скорость</option>${me.awg_available?'<option value="amneziawg">AmneziaWG 3.1 · защита от DPI</option>':''}</select></label><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
+async function devicesPage(c){
+ if(me?.happ_enabled){
+  const target=config?.bot_url||'https://t.me/StillVPNapp_bot';
+  c.innerHTML=subhead('STILL / HAPP','Подключения через Happ.','Настраивайте VLESS в Telegram Mini App; существующие аккаунты и поддержка сайта сохранены.')+
+    `<div class="panel"><h3>Подключиться через Happ</h3><p>Создание, продление и отзыв VPN-профилей доступны в Telegram Mini App.</p><a class="cta" href="${esc(target)}" target="_blank" rel="noopener noreferrer">Открыть Still VPN в Telegram</a><p class="small muted">Пароли и VPN-ссылки никому не передавайте.</p></div>`;
+  return;
+ }
+ c.innerHTML=subhead('STILL VPN','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><label class="field"><span>Протокол</span><select id="device-protocol"><option value="wireguard">WireGuard · скорость</option>${me.awg_available?'<option value="amneziawg">AmneziaWG 3.1 · защита от DPI</option>':''}</select></label><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
 $('#device-create').onsubmit=createDevice;$('#reload-devices').onclick=loadDevices;loadDevices()}
 async function loadDevices(){try{devices=await api('devices');if(page!=='devices')return;const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="devicehead"><div><h3>${esc(d.name)}</h3><p class="muted small">${esc(d.protocol==='amneziawg'?'AmneziaWG 3.1':'WireGuard')} · ${esc(d.platform)} · добавлено ${date(d.created_at)}<br>${d.last_handshake?'Последний handshake: '+date(d.last_handshake):'Нет данных о подключении'}</p></div><span class="chip">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div>${d.enabled?`<div class="buttons"><button class="cta outline tiny" data-rename="${esc(d.id)}">Переименовать</button><button class="cta danger tiny" data-revoke="${esc(d.id)}">Отозвать</button></div>`:''}</div>`).join(''):'<div class="empty">Подключений пока нет.</div>';
 $$('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id===b.dataset.rename),name=prompt('Новое имя',d.name);if(!name)return;try{await api('devices/'+d.id,{method:'PATCH',body:JSON.stringify({name:name.trim()})});toast('Переименовано');await loadDevices()}catch(e){toast(e.message,true)}});
@@ -5567,7 +6008,8 @@ async function miniServers(){try{const list=await api('servers/public');const bo
 async function dashboardDevices(){
  try{const rows=await api('devices');if(page!=='home')return;
    const profile=$('#dashboard-profile-status'),last=$('#dashboard-handshake');if(!profile||!last)return;
-   const valid=rows.filter(d=>d.enabled&&d.provisioned);profile.textContent=valid.length?'Готов · '+valid.length+' устр.':'Не создан';profile.className=valid.length?'status-ready':'status-idle';
+   const valid=rows.filter(d=>d.enabled&&(me.happ_enabled?d.ready:d.provisioned));
+   if(me.happ_enabled){profile.textContent=valid.length?'Готов · '+valid.length+' устр.':'Не создан';profile.className=valid.length?'status-ready':'status-idle';last.textContent='Проверяйте в Happ';last.className='status-idle';return;}profile.textContent=valid.length?'Готов · '+valid.length+' устр.':'Не создан';profile.className=valid.length?'status-ready':'status-idle';
    const timestamps=valid.map(d=>d.last_handshake?new Date(d.last_handshake).getTime():0).filter(t=>Number.isFinite(t)&&t>0);
    const latest=timestamps.length?Math.max(...timestamps):0;const fresh=latest&&Date.now()-latest>=0&&Date.now()-latest<180000;
    last.textContent=!latest?'Ещё не подключались':fresh?'Недавнее соединение':new Date(latest).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
@@ -5575,25 +6017,25 @@ async function dashboardDevices(){
  }catch(e){const profile=$('#dashboard-profile-status');if(profile&&page==='home')profile.textContent='Не удалось проверить'}}
 async function miniReferrals(){try{const r=await api('referrals');const box=$('#ref-count');if(box&&page==='home')box.textContent=`${r.registered} приглашено · ${r.paid} купили`;const btn=$('#invite-share');if(btn&&r.link){btn.onclick=()=>shareTelegram(r.link)}}catch(e){}}
 function home(){const s=me.subscription;
-const remaining=s&&s.limit!==null?Math.max(0,s.limit-s.used):null;
-const trafficPct=s&&s.limit!==null&&s.limit>0?Math.min(100,Math.max(0,s.used/s.limit*100)):0;
+const remaining=s&&s.limit!==null&&!me.happ_enabled?Math.max(0,s.limit-s.used):null;
+const trafficPct=s&&s.limit!==null&&s.limit>0&&!me.happ_enabled?Math.min(100,Math.max(0,s.used/s.limit*100)):0;
 main.innerHTML=`<section class="studio-home">
   <div class="studio-home-intro"><span class="studio-status ${s?'active':'inactive'}"><i></i>${s?'Ваш доступ активен':'Нет активного доступа'}</span>
     <h1>${s?'Всё готово к подключению.':'Добро пожаловать в Still.'}</h1>
     <p>${s?`${esc(s.name)} · ${activeText()}`:'Начните с бесплатного пробного доступа или выберите тариф.'}</p>
   </div>
   <div class="studio-node">
-    <div class="studio-node-row"><div class="studio-flag" aria-hidden="true">🇳🇱</div><div class="studio-node-title"><strong>Нидерланды</strong><span>WireGuard · Europe NL</span></div><span class="studio-arrow" aria-hidden="true">›</span></div>
+    <div class="studio-node-row"><div class="studio-flag" aria-hidden="true">${me.happ_enabled?'🇩🇪':'🇳🇱'}</div><div class="studio-node-title"><strong>${me.happ_enabled?'Германия':'Нидерланды'}</strong><span>${me.happ_enabled?'VLESS · XHTTP · REALITY':'WireGuard · Europe NL'}</span></div><span class="studio-arrow" aria-hidden="true">›</span></div>
     <div class="studio-node-details"><div class="studio-mini-stat"><span>VPN-профиль</span><strong id="dashboard-profile-status">Проверяем…</strong></div>
        <div id="server-signal"><div class="studio-mini-stat"><span>Сервер</span><strong>Проверяем…</strong></div></div>
        <div class="studio-mini-stat"><span>Последнее соединение</span><strong id="dashboard-handshake">Проверяем…</strong></div>
     </div>
     <button class="button studio-main-action" id="quick-connect">${s?'Получить VPN-профиль':'Настроить VPN'} <span aria-hidden="true">↗</span></button>
-    <p class="studio-hint">Подключение включается в WireGuard на устройстве.</p>
+    <p class="studio-hint">VPN включается в Happ на устройстве.</p>
   </div>
-  <div class="studio-numbers"><div><span>Осталось трафика</span><strong>${!s?'—':remaining===null?'Без лимита':gb(remaining)}</strong><small>${s&&s.limit!==null?`из ${gb(s.limit)} на период`:s?'Без ограничения по объёму':'Выберите подписку'}</small></div>
-  <div><span>Устройства</span><strong>${Number(me.device_count)||0} / ${s?Number(s.devices):'—'}</strong><small>Добавлено в кабинет</small></div></div>
-  ${s&&s.limit!==null&&s.limit>0?`<div class="usage-track studio-usage" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(trafficPct)}"><span style="width:${trafficPct.toFixed(1)}%"></span></div>`:''}
+  <div class="studio-numbers"><div><span>Осталось трафика</span><strong>${me.happ_enabled?'См. в Happ':!s?'—':remaining===null?'Без лимита':gb(remaining)}</strong><small>${me.happ_enabled?'Статистика Xray пока не синхронизирована с Mini App':s&&s.limit!==null?`из ${gb(s.limit)} на период`:s?'Без ограничения по объёму':'Выберите подписку'}</small></div>
+  <div><span>Устройства</span><strong>${Number(me.device_count)||0} / ${s?(me.happ_enabled?1:Number(s.devices)):'—'}</strong><small>Добавлено в кабинет</small></div></div>
+  ${!me.happ_enabled&&s&&s.limit!==null&&s.limit>0?`<div class="usage-track studio-usage" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(trafficPct)}"><span style="width:${trafficPct.toFixed(1)}%"></span></div>`:''}
   <button class="studio-ticket-link" id="studio-support"><span class="studio-ticket-icon" aria-hidden="true">✉</span><span><b>Поддержка</b><small>Обращения, ответы и статус тикетов</small></span><span aria-hidden="true">›</span></button>
   ${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать пробный доступ</button><p class="small muted">Один пробный период на аккаунт. Срок и трафик указаны в тарифах.</p></div>':''}
   <div class="studio-extra-head"><strong>Ваш Still VPN</strong><button id="quick-plans">Тарифы ↗</button></div>
@@ -5622,7 +6064,66 @@ async function buy(planId,isGift){if(!me.payments_enabled){toast('Оплата �
 async function loadPayments(){try{payments=await api('payments');if(page!=='plans')return;
 $('#history').innerHTML=payments.length?payments.map(p=>`<div class="statrow" style="align-items:flex-start"><span><b>${esc(p.plan)}</b><br><span class="small muted">${day(p.date)} · ${p.kind==='gift'?'Подарок':'Подписка'}<br>ID ${esc(p.id)}</span></span><span><b>${p.amount} ⭐</b><br><span class="small muted">${esc(p.status)}</span></span></div>`).join(''):'<p class="muted small">Пока нет платежей.</p>';
 }catch(e){toast(e.message,true)}}
-function connectPage(){const e=me.subscription;
+async function copyHappSubscription(url, field){
+  try {if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(url);return true}}catch(e){}
+  // Android WebView may deny clipboard writes after an asynchronous fetch.
+  // The input remains visible and selected when both copy APIs are blocked.
+  try {
+    field.focus();field.select();field.setSelectionRange(0,field.value.length);
+    if(document.execCommand('copy'))return true;
+  } catch(e) {}
+  return false;
+}
+async function showHappImport(deviceId, copyNow){
+  const guide=$('#happ-import-guide');
+  if(!guide)return;
+  guide.textContent='Готовим ссылку подписки…';
+  try {
+    const x=await api('happ/devices/'+encodeURIComponent(deviceId)+'/link');
+    const url=x?.https_url;
+    if(typeof url!=='string'||!url.startsWith('https://'))throw new Error('HTTPS-ссылка не готова');
+    if(!$('#happ-import-guide'))return;
+    guide.innerHTML=`<div class="panel" style="margin-top:14px">
+      <h3 style="margin-top:0">Подписка готова</h3>
+      <p class="small muted">1. Откройте Happ на телефоне.<br>2. Нажмите «+» и выберите «Из буфера обмена».<br>3. Если этого пункта нет — выберите добавление подписки по URL и вставьте ссылку.</p>
+      <label for="happ-sub-url">Ваша личная HTTPS-ссылка (не публикуйте её)</label>
+      <input id="happ-sub-url" type="text" readonly autocomplete="off" spellcheck="false" aria-label="Личная ссылка Happ">
+      <div style="height:10px"></div><button id="happ-copy-again" class="button secondary compact" type="button">Копировать ссылку</button>
+    </div>`;
+    const field=$('#happ-sub-url');field.value=url;
+    $('#happ-copy-again').onclick=async()=>{
+      const ok=await copyHappSubscription(url,field);
+      toast(ok?'Ссылка скопирована. Откройте Happ → «+» → импорт из буфера.':'Выделите ссылку в поле и скопируйте вручную.',!ok);
+    };
+    if(copyNow){
+      const ok=await copyHappSubscription(url,field);
+      toast(ok?'Ссылка скопирована! Откройте Happ и добавьте её из буфера.':'Скопируйте выделенную ссылку вручную и откройте Happ.',!ok);
+    } else toast('Ссылка показана ниже. Её можно скопировать.');
+    guide.scrollIntoView({behavior:'smooth',block:'nearest'});
+  } catch(e){guide.textContent='';toast(e.message,true)}
+}
+async function happConnectPage(){
+main.innerHTML=section('STILL / HAPP','Подключение через Happ.','VLESS · XHTTP · REALITY — Германия. Подключение управляется подпиской Still VPN.')+
+(!me.subscription?'<div class="notice error">Для подключения нужен тариф или пробный период.</div>':'')+
+`<div class="panel"><h3>Новое устройство</h3><p class="small muted">Одна постоянная HTTPS-подписка. При продлении менять её не нужно. На этапе тестирования доступно одно устройство; общий лимит трафика между устройствами ещё не поддерживается.</p>
+<label>Название</label><input id="happ-name" maxlength="60" placeholder="Мой телефон" value="Мой телефон" autocomplete="off"><label>Платформа</label>
+<select id="happ-platform"><option value="android">Android</option><option value="ios">iPhone</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select>
+<div style="height:14px"></div><button id="happ-new" class="button" ${!me.subscription?'disabled':''}>Создать подключение</button></div>
+<div class="section"><h2>Мои подключения Happ</h2><p class="small muted">Telegram не всегда открывает Happ напрямую. Скопируйте HTTPS-ссылку и добавьте её в приложении Happ через «+».</p><div id="happ-devices">Загружаем…</div><div id="happ-import-guide" aria-live="polite"></div></div>`;
+$('#happ-new').onclick=async()=>{const btn=$('#happ-new');btn.disabled=true;
+try{const d=await api('happ/devices',{method:'POST',body:JSON.stringify({name:$('#happ-name').value.trim(),platform:$('#happ-platform').value})});
+toast(d.ready?'Подключение создано':'Подключение ожидает синхронизации');await reload();happConnectPage();}catch(e){toast(e.message,true);btn.disabled=false}};
+try{const devs=await api('happ/devices');if(page!=='connect')return;
+$('#happ-devices').innerHTML=devs.length?devs.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.platform)} · ${d.enabled?'Активно':'Отозвано'}</span></div><span class="pill">${d.ready?'Готово':'Ожидает'}</span></div>
+${d.enabled?`<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px"><button class="button compact" data-happ-link="${d.id}" ${!d.ready?'disabled':''}>Скопировать для Happ</button><button class="button secondary compact" data-happ-copy="${d.id}" ${!d.ready?'disabled':''}>Показать ссылку</button><button class="button ghost compact" data-happ-remove="${d.id}">Отозвать</button></div>`:''}</div>`).join(''):'<p class="small muted">Устройств пока нет.</p>';
+// Telegram Android WebView cannot reliably navigate to happ://. Keep the
+// Mini App open and give the user a real HTTPS subscription to import in Happ.
+$('#happ-devices').querySelectorAll('[data-happ-link]').forEach(b=>b.onclick=()=>showHappImport(b.dataset.happLink,true));
+$('#happ-devices').querySelectorAll('[data-happ-copy]').forEach(b=>b.onclick=()=>showHappImport(b.dataset.happCopy,false));
+$('#happ-devices').querySelectorAll('[data-happ-remove]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать доступ для этого устройства?'))return;try{await api('happ/devices/'+b.dataset.happRemove,{method:'DELETE'});toast('Доступ отозван');happConnectPage()}catch(e){toast(e.message,true)}});
+}catch(e){toast(e.message,true);if($('#happ-devices'))$('#happ-devices').textContent='Не удалось загрузить подключения'}
+}
+function connectPage(){if(me?.happ_enabled){happConnectPage();return}const e=me.subscription;
 main.innerHTML=section('VPN','Ваши устройства.','Выбирайте WireGuard или AmneziaWG. Туннель включается в соответствующем приложении на устройстве.')+
 `<div class="vpn-control" id="vpn-control"><div class="vpn-control-head"><span class="kicker">STILL / СТАТУС ПОДКЛЮЧЕНИЯ</span><span id="vpn-activity" class="pill">Проверяем устройства…</span></div><div class="vpn-control-main"><div class="vpn-power" aria-hidden="true">⏻</div><div><h2>VPN под вашим контролем</h2><p class="small muted">Mini App показывает данные сервера, но не может включать системный VPN без приложения.</p></div></div><button id="vpn-how-toggle" class="button secondary compact">Как включать / выключать быстро ↗</button><div id="vpn-how" class="vpn-how" hidden><p><b>Android:</b> для WireGuard откройте WireGuard, для AmneziaWG 3.1 — AmneziaVPN и активируйте профиль. Для быстрого доступа добавьте VPN в быстрые настройки или используйте совместимый виджет.</p><p><b>iPhone:</b> откройте настройки iOS → VPN или приложение WireGuard и включите конфигурацию.</p><p class="small muted">Это управление в системе устройства. Кнопка в Mini App не имитирует включение VPN.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a></div></div>`+
 (!e?'<div class="notice error">Для создания конфигурации активируйте тариф или пробный период.</div>':'')+
