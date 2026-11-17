@@ -261,8 +261,15 @@ except ipaddress.AddressValueError as exc:
 # Payments additionally require a separate opt-in after live client/expiry tests.
 XUI_ENABLED = os.getenv("XUI_ENABLED", "0") == "1"
 XUI_ENABLE_PAYMENTS = os.getenv("XUI_ENABLE_PAYMENTS", "0") == "1"
-XUI_MAX_DEVICES = 1  # Beta: enforce a single client until cross-device traffic accounting is verified.
-RELEASE = "13.4.2"
+# Safety ceiling, independent of the device allowance in a user's tariff.
+# Per-user device count is min(XUI_MAX_DEVICES, entitlement.devices).
+try:
+    XUI_MAX_DEVICES = int(os.getenv("XUI_MAX_DEVICES", "5"))
+except ValueError as exc:
+    raise RuntimeError("XUI_MAX_DEVICES must be a number from 1 to 10") from exc
+if not 1 <= XUI_MAX_DEVICES <= 10:
+    raise RuntimeError("XUI_MAX_DEVICES must be 1..10")
+RELEASE = "13.4.3"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Германия" if XUI_ENABLED else "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -1207,6 +1214,13 @@ if MODE == "app":
         provisioned: Mapped[bool] = mapped_column(Boolean, default=False)
         created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=now)
         synced_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+        # Durable absolute counters from 3x-ui. Never subtract on a disappearing
+        # API response; user.traffic_bytes stores the monotonic cumulative total.
+        xui_up: Mapped[int] = mapped_column(BigInteger, default=0)
+        xui_down: Mapped[int] = mapped_column(BigInteger, default=0)
+        xui_reset_count: Mapped[int] = mapped_column(Integer, default=0)
+        traffic_total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+        traffic_synced_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     class Gift(Base):
         __tablename__ = "gifts"
@@ -1444,9 +1458,17 @@ if MODE == "app":
             await bridge.close()
 
     def xui_access(d: XuiDevice, ent: dict | None) -> Access:
-        # Do not grant access if the StillVPN subscription is suspended/expired.
+        # Keep the quota attached to the CURRENT subscription period, not the
+        # lifetime client counter. This prevents immediate exhaustion after
+        # renewal when 3x-ui still holds traffic from the previous period.
+        # All devices share ent["used"] in StillVPN; the 3x-ui native cap is an
+        # additional approximate per-device safety net, not a strict shared cap.
+        quota = None
+        if ent and ent["limit"] is not None:
+            remaining = max(0, int(ent["limit"]) - int(ent["used"]))
+            quota = (d.xui_up or 0) + (d.xui_down or 0) + remaining
         return Access(d.user_id, d.id.replace("-", ""), ent["end"] if ent else now()-timedelta(seconds=1),
-                      ent["limit"] if ent else None, enabled=bool(ent and d.enabled))
+                      quota, enabled=bool(ent and d.enabled))
 
     async def xui_sync(d: XuiDevice, ent: dict | None):
         bridge = xui_bridge()
@@ -1456,6 +1478,84 @@ if MODE == "app":
             return result
         finally:
             await bridge.close()
+
+    def xui_counter_increment(current: int, previous: int, reset_count: int | None,
+                              previous_resets: int) -> tuple[int, int]:
+        """Return (nonnegative new bytes, new high-water mark).
+
+        3x-ui counters are normally monotonic. If the panel reports a resetCount
+        increase, start a new epoch. Otherwise a sudden counter regression can
+        be a transient partial snapshot: keep the old high-water mark rather than
+        counting the same bytes twice. Manual resets without resetCount updates
+        require administrator reconciliation.
+        """
+        if reset_count is not None and reset_count > previous_resets:
+            return current, current
+        if current >= previous:
+            return current - previous, current
+        return 0, previous
+
+    async def xui_refresh_traffic():
+        """Account-wide traffic sum from ONE inbound/list call, no admin token.
+
+        Never store or log UUIDs, subIds or returned subscription links. A missing
+        clientStats array is a stale/unsupported snapshot, not a zero reading.
+        """
+        bridge = xui_bridge()
+        try:
+            inbounds = await bridge._request("GET", "inbounds/list")
+        finally:
+            await bridge.close()
+        if not isinstance(inbounds, list):
+            raise XuiError("Invalid inbound traffic snapshot")
+        inbound = next((x for x in inbounds if x.get("id") == int(os.environ.get("XUI_INBOUND_ID", "1"))), None)
+        if not isinstance(inbound, dict):
+            raise XuiError("Missing inbound for traffic snapshot")
+        stats = inbound.get("clientStats")
+        if not isinstance(stats, list):
+            raise XuiError("3x-ui did not return clientStats; keeping previous usage")
+        snapshot = {}
+        for entry in stats:
+            if not isinstance(entry, dict):
+                continue
+            email = entry.get("email")
+            if not isinstance(email, str) or not XUI_EMAIL_RE.fullmatch(email):
+                continue
+            up, down = entry.get("up"), entry.get("down")
+            if type(up) is not int or type(down) is not int or up < 0 or down < 0:
+                continue
+            resets = entry.get("resetCount")
+            resets = resets if type(resets) is int and resets >= 0 else None
+            snapshot[email] = (up, down, resets)
+        if not snapshot:
+            return 0
+        updated = 0
+        async with Session.begin() as s:
+            rows = (await s.scalars(select(XuiDevice).order_by(XuiDevice.created_at).limit(5000))).all()
+            user_cache = {}
+            for d in rows:
+                record = snapshot.get(d.email)
+                if record is None:
+                    continue
+                up, down, resets = record
+                old_resets = d.xui_reset_count or 0
+                delta_up, high_up = xui_counter_increment(up, d.xui_up or 0, resets, old_resets)
+                delta_down, high_down = xui_counter_increment(down, d.xui_down or 0, resets, old_resets)
+                delta = delta_up + delta_down
+                d.xui_up = high_up
+                d.xui_down = high_down
+                if resets is not None:
+                    d.xui_reset_count = max(old_resets, resets)
+                d.traffic_synced_at = now()
+                if delta:
+                    d.traffic_total_bytes = (d.traffic_total_bytes or 0) + delta
+                    if d.user_id not in user_cache:
+                        user_cache[d.user_id] = await s.get(User, d.user_id)
+                    user = user_cache[d.user_id]
+                    if user is not None:
+                        user.traffic_bytes = (user.traffic_bytes or 0) + delta
+                updated += 1
+        return updated
 
     async def xui_reconcile_all():
         # Retry provisioning and enforce expiry/refunds independently of client app refresh.
@@ -1842,6 +1942,13 @@ if MODE == "app":
         return result
 
     async def process_background():
+        if XUI_ENABLED:
+            try:
+                await xui_refresh_traffic()
+            except Exception as exc:
+                # A temporary API failure must not falsely show 0 GB or crash
+                # expiry/revoke reconciliation. Keep the previously stored usage.
+                LOG.warning("XUI traffic sync unavailable: %s", type(exc).__name__)
         async with Session() as s:
             nodes = [] if XUI_ENABLED else (await s.scalars(select(ServerNode))).all()
             for node in nodes:
@@ -1973,6 +2080,13 @@ if MODE == "app":
                             "closed_at": "TIMESTAMP"},
                 "ticket_messages": {"staff_id": "BIGINT"},
                 "audit": {"result": "VARCHAR(20) NOT NULL DEFAULT 'ok'"},
+                "xui_devices": {
+                    "xui_up": "BIGINT NOT NULL DEFAULT 0",
+                    "xui_down": "BIGINT NOT NULL DEFAULT 0",
+                    "xui_reset_count": "INTEGER NOT NULL DEFAULT 0",
+                    "traffic_total_bytes": "BIGINT NOT NULL DEFAULT 0",
+                    "traffic_synced_at": "TIMESTAMP",
+                },
             }
             if DATABASE_IS_SQLITE:
                 for table, cols in migration_columns.items():
@@ -2519,7 +2633,7 @@ if MODE == "app":
         try:
             _, days, price, devices, gb, *title = message.text.split()
             days, price, devices, gb = map(int, (days, price, devices, gb))
-            assert 1 <= days <= 730 and 1 <= price <= 250000 and 1 <= devices <= 20 and 0 <= gb <= 100000
+            assert 1 <= days <= 730 and 1 <= price <= 250000 and 1 <= devices <= (XUI_MAX_DEVICES if XUI_ENABLED else 20) and 0 <= gb <= 100000
             assert title
         except (ValueError, AssertionError):
             await message.answer("Формат: /adm_plan 30 100 2 0 Месяц"); return
@@ -2537,7 +2651,7 @@ if MODE == "app":
         try:
             _, pid, days, stars, devices, gb, *title = message.text.split()
             pid, days, stars, devices, gb = map(int, (pid, days, stars, devices, gb))
-            assert 1 <= days <= 730 and 1 <= stars <= 250000 and 1 <= devices <= 20 and 0 <= gb <= 100000 and title
+            assert 1 <= days <= 730 and 1 <= stars <= 250000 and 1 <= devices <= (XUI_MAX_DEVICES if XUI_ENABLED else 20) and 0 <= gb <= 100000 and title
         except (ValueError, AssertionError):
             await message.answer("/adm_plan_edit ID 30 100 2 0 Название"); return
         async with Session.begin() as s:
@@ -2569,6 +2683,45 @@ if MODE == "app":
         async with Session() as s:
             rows = (await s.scalars(select(User).where(User.username.ilike("%" + query + "%")).limit(15))).all()
         await message.answer("Поиск:\n" + "\n".join(f"{x.id} @{x.username}" for x in rows))
+
+    @router.message(Command("adm_devices"))
+    async def adm_devices(message: Message):
+        # Owner-only; setting does not create additional time or traffic quota.
+        if message.from_user.id not in OWNER_IDS:
+            return
+        try:
+            args = (message.text or "").split()
+            if len(args) == 2:
+                uid, seats = message.from_user.id, int(args[1])
+            elif len(args) == 3:
+                uid, seats = int(args[1]), int(args[2])
+            else:
+                raise ValueError("args")
+            if uid <= 0 or not 1 <= seats <= (XUI_MAX_DEVICES if XUI_ENABLED else 20):
+                raise ValueError("limit")
+        except (ValueError, IndexError):
+            await message.answer(f"Формат: /adm_devices 3 (себе) или /adm_devices ID 3. Лимит: {XUI_MAX_DEVICES}.")
+            return
+        async with Session.begin() as s:
+            user = await s.get(User, uid, with_for_update=True)
+            if not user:
+                await message.answer("Аккаунт не найден")
+                return
+            current = now()
+            active = await s.scalar(select(Subscription).where(
+                Subscription.user_id == uid, Subscription.revoked.is_(False),
+                Subscription.starts_at <= current, Subscription.ends_at > current
+            ).order_by(Subscription.starts_at.desc()).limit(1))
+            if active:
+                active.devices = seats
+            else:
+                trial = await s.get(Trial, uid)
+                if not trial or trial.ends_at <= current:
+                    await message.answer("У пользователя нет активного тарифа или пробного доступа")
+                    return
+                trial.devices = seats
+            audit(s, message.from_user.id, "xui_device_seats", str(uid), f"Установлено {seats} устройств")
+        await message.answer(f"Для пользователя {uid} установлено {seats} устройств. Срок и трафик не изменены.")
 
     @router.message(Command("adm_give"))
     async def adm_give(message: Message):
@@ -3257,17 +3410,25 @@ if MODE == "app":
         responsive_nodes = await s.scalar(select(func.count()).select_from(NodeHealth).join(
             ServerNode, NodeHealth.server_id == ServerNode.id).where(
             ServerNode.enabled.is_(True), NodeHealth.last_seen >= now() - timedelta(minutes=3))) or 0
+        traffic_fresh = False
         if XUI_ENABLED:
             enabled_nodes = 1
             responsive_nodes = 0  # No claim of online until a fresh API probe is performed.
+            active_devices = (await s.scalars(select(XuiDevice).where(
+                XuiDevice.user_id == user.id, XuiDevice.enabled.is_(True)))).all()
+            traffic_fresh = bool(active_devices) and all(
+                d.traffic_synced_at is not None and
+                0 <= (now() - d.traffic_synced_at).total_seconds() <= 180
+                for d in active_devices
+            )
         return {"service": {"enabled_nodes": enabled_nodes, "responsive_nodes": responsive_nodes},
                 "account_status": "active" if not user.blocked else "blocked",
                 "id": user.id, "username": user.username, "first_name": user.first_name,
                 "created_at": user.created_at, "traffic_total": user.traffic_bytes,
                 "device_count": count, "trial_used": tr is not None,
                 "awg_available": AWG_ENABLED and not XUI_ENABLED, "happ_enabled": XUI_ENABLED,
-                "happ_max_devices": 1 if XUI_ENABLED else None,
-                "traffic_tracking_available": not XUI_ENABLED,
+                "happ_max_devices": (min(XUI_MAX_DEVICES, int(e["devices"])) if e else 0) if XUI_ENABLED else None,
+                "traffic_tracking_available": traffic_fresh if XUI_ENABLED else True,
                 "subscription": e and {**e, "end": e["end"].isoformat()},
                 "payments_enabled": payments_ready(),
                 "admin_role": await role_of(s, user.id), "release": RELEASE,
@@ -3336,8 +3497,6 @@ if MODE == "app":
             if not plan or not plan.enabled: bad(404, "Тариф не найден")
             if XUI_ENABLED and plan.devices > XUI_MAX_DEVICES:
                 bad(409, "Этот тариф пока не совместим с ограничением устройств Happ")
-            if XUI_ENABLED and plan.traffic_bytes is not None:
-                bad(409, "Тарифы с лимитом трафика пока требуют проверки учёта Xray")
             promo_id = None
             amount = plan.stars
             if data.promo_code:
@@ -3461,6 +3620,8 @@ if MODE == "app":
                               .order_by(XuiDevice.created_at.desc()).limit(100))).all()
         return [{"id": d.id, "name": d.name, "platform": d.platform,
                  "enabled": d.enabled, "ready": d.provisioned,
+                 "traffic_used": d.traffic_total_bytes or 0,
+                 "traffic_updated_at": d.traffic_synced_at,
                  "created_at": d.created_at} for d in rows]
 
     @app.post("/api/happ/devices")
@@ -3479,7 +3640,7 @@ if MODE == "app":
                 XuiDevice.user_id == u.id, XuiDevice.enabled.is_(True)))
             # Until cross-device traffic accounting is verified, issue one link per account.
             if count >= min(XUI_MAX_DEVICES, int(ent["devices"])):
-                bad(409, "Сейчас доступно одно подключение Happ на аккаунт")
+                bad(409, "Достигнут лимит устройств вашего тарифа")
             device_id = str(uuid.uuid4())
             email = f"svpn_{u.id}_{device_id.replace('-', '')}"
             d = XuiDevice(id=device_id, user_id=u.id, name=data.name.strip(),
@@ -3972,8 +4133,8 @@ if MODE == "app":
     @app.post("/api/admin/plans")
     async def admin_plan_create(data: AdminPlanData, actor=Depends(admin_scope("plans"))):
         if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
-        if XUI_ENABLED and (data.devices > XUI_MAX_DEVICES or data.traffic_gb > 0):
-            bad(409, "Пока создавайте для Happ только тарифы на 1 устройство без лимита ГБ")
+        if XUI_ENABLED and data.devices > XUI_MAX_DEVICES:
+            bad(409, f"Для Happ можно указать максимум {XUI_MAX_DEVICES} устройств")
         async with Session.begin() as s:
             p = Plan(title=data.title.strip(),days=data.days,stars=data.stars,devices=data.devices,
                      traffic_bytes=data.traffic_gb*1024**3 if data.traffic_gb else None,enabled=data.enabled)
@@ -3986,8 +4147,8 @@ if MODE == "app":
     @app.put("/api/admin/plans/{plan_id}")
     async def admin_plan_update(plan_id: int, data: AdminPlanData, actor=Depends(admin_scope("plans"))):
         if actor[1] not in WRITERS: bad(403, "Недостаточно прав")
-        if XUI_ENABLED and (data.devices > XUI_MAX_DEVICES or data.traffic_gb > 0):
-            bad(409, "Пока для Happ доступен тариф на 1 устройство без лимита ГБ")
+        if XUI_ENABLED and data.devices > XUI_MAX_DEVICES:
+            bad(409, f"Для Happ можно указать максимум {XUI_MAX_DEVICES} устройств")
         async with Session.begin() as s:
             p = await s.get(Plan, plan_id, with_for_update=True)
             if not p: bad(404, "Тариф не найден")
@@ -5625,10 +5786,10 @@ function subhead(k,title,desc=''){return `<p class="kicker">${esc(k)}</p><h1 sty
 function render(){if(!me)return;const c=$('#content');if(page==='home')home(c);else if(page==='plans')plansPage(c);else if(page==='devices')devicesPage(c);else profilePage(c)}
 function home(c){const s=me.subscription;
 const pct=(!me.happ_enabled&&s&&s.limit!==null&&s.limit>0)?Math.min(100,Math.max(0,s.used/s.limit*100)):null;
-const network=me.happ_enabled?'Проверяйте в Mini App':(me.service&&me.service.responsive_nodes>0)?'Сервер отвечает':'Статус уточняется';
+const network=me.happ_enabled?'Сервер 3x-ui':(me.service&&me.service.responsive_nodes>0)?'Сервер отвечает':'Статус уточняется';
 c.innerHTML=subhead('ОБЗОР / STILL VPN',`На связи, ${me.username}.`,'Ваша сеть, устройства и срок доступа — без лишних меню.')+
 `<div class="overview"><div class="splithead"><span class="eyebrow"><i class="status-dot"></i>${s?'Доступ активен':'Нет активного доступа'}</span><span class="micro">АККАУНТ / ${me.id>0?'TG':'WEB'}</span></div><div class="big-info">${s?esc(s.name):'Управляйте подключением'}</div><p class="small muted">${s?'Доступ до '+date(s.end):'Выберите подписку, чтобы подключить VPN.'}</p>${pct!==null?`<div class="progress" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div>`:''}</div>
-<div class="listrow"><span class="muted">Израсходовано за период</span><strong>${me.happ_enabled?'Смотрите в Happ':s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?(me.happ_enabled?1:s.devices):'—'}</strong></div><div class="listrow"><span class="muted">VPN-инфраструктура</span><strong>${network}</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Перейти к устройствам':'Посмотреть тарифы'} <span aria-hidden="true">↗</span></button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Активировать пробный доступ</button>':''}</div>`;
+<div class="listrow"><span class="muted">Израсходовано за период</span><strong>${me.happ_enabled&&!me.traffic_tracking_available?'Обновляем статистику':s?bytes(s.used)+' / '+bytes(s.limit):'—'}</strong></div><div class="listrow"><span class="muted">Устройства</span><strong>${me.device_count} / ${s?(me.happ_enabled?me.happ_max_devices:s.devices):'—'}</strong></div><div class="listrow"><span class="muted">VPN-инфраструктура</span><strong>${network}</strong></div><div class="buttons"><button class="cta" id="go-connect">${s?'Перейти к устройствам':'Посмотреть тарифы'} <span aria-hidden="true">↗</span></button>${!s&&!me.trial_used&&me.can_trial?'<button class="cta outline" id="trial">Активировать пробный доступ</button>':''}</div>`;
 $('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial').onclick=async()=>{if(!confirm('Активировать единственный пробный период сейчас?'))return;try{await api('trial',{method:'POST',body:'{}'});toast('Пробный период активирован');await loadMe()}catch(e){toast(e.message,true)}}
 }
 async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
@@ -6017,8 +6178,9 @@ async function dashboardDevices(){
  }catch(e){const profile=$('#dashboard-profile-status');if(profile&&page==='home')profile.textContent='Не удалось проверить'}}
 async function miniReferrals(){try{const r=await api('referrals');const box=$('#ref-count');if(box&&page==='home')box.textContent=`${r.registered} приглашено · ${r.paid} купили`;const btn=$('#invite-share');if(btn&&r.link){btn.onclick=()=>shareTelegram(r.link)}}catch(e){}}
 function home(){const s=me.subscription;
-const remaining=s&&s.limit!==null&&!me.happ_enabled?Math.max(0,s.limit-s.used):null;
-const trafficPct=s&&s.limit!==null&&s.limit>0&&!me.happ_enabled?Math.min(100,Math.max(0,s.used/s.limit*100)):0;
+const trafficReady= !me.happ_enabled || !!me.traffic_tracking_available;
+const remaining=s&&s.limit!==null&&trafficReady?Math.max(0,s.limit-s.used):null;
+const trafficPct=s&&s.limit!==null&&s.limit>0&&trafficReady?Math.min(100,Math.max(0,s.used/s.limit*100)):0;
 main.innerHTML=`<section class="studio-home">
   <div class="studio-home-intro"><span class="studio-status ${s?'active':'inactive'}"><i></i>${s?'Ваш доступ активен':'Нет активного доступа'}</span>
     <h1>${s?'Всё готово к подключению.':'Добро пожаловать в Still.'}</h1>
@@ -6033,9 +6195,9 @@ main.innerHTML=`<section class="studio-home">
     <button class="button studio-main-action" id="quick-connect">${s?'Получить VPN-профиль':'Настроить VPN'} <span aria-hidden="true">↗</span></button>
     <p class="studio-hint">VPN включается в Happ на устройстве.</p>
   </div>
-  <div class="studio-numbers"><div><span>Осталось трафика</span><strong>${me.happ_enabled?'См. в Happ':!s?'—':remaining===null?'Без лимита':gb(remaining)}</strong><small>${me.happ_enabled?'Статистика Xray пока не синхронизирована с Mini App':s&&s.limit!==null?`из ${gb(s.limit)} на период`:s?'Без ограничения по объёму':'Выберите подписку'}</small></div>
-  <div><span>Устройства</span><strong>${Number(me.device_count)||0} / ${s?(me.happ_enabled?1:Number(s.devices)):'—'}</strong><small>Добавлено в кабинет</small></div></div>
-  ${!me.happ_enabled&&s&&s.limit!==null&&s.limit>0?`<div class="usage-track studio-usage" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(trafficPct)}"><span style="width:${trafficPct.toFixed(1)}%"></span></div>`:''}
+  <div class="studio-numbers"><div><span>Осталось трафика</span><strong>${!s?'—':!trafficReady?'Обновляем…':remaining===null?'Без лимита':gb(remaining)}</strong><small>${!s?'Выберите подписку':!trafficReady?'Статистика Xray временно недоступна':s.limit!==null?`Использовано ${bytes(s.used)} из ${gb(s.limit)}`:`Использовано ${bytes(s.used)} · без ограничения по объёму`}</small></div>
+  <div><span>Устройства</span><strong>${Number(me.device_count)||0} / ${s?(me.happ_enabled?me.happ_max_devices:Number(s.devices)):'—'}</strong><small>Добавлено в кабинет</small></div></div>
+  ${trafficReady&&s&&s.limit!==null&&s.limit>0?`<div class="usage-track studio-usage" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(trafficPct)}"><span style="width:${trafficPct.toFixed(1)}%"></span></div>`:''}
   <button class="studio-ticket-link" id="studio-support"><span class="studio-ticket-icon" aria-hidden="true">✉</span><span><b>Поддержка</b><small>Обращения, ответы и статус тикетов</small></span><span aria-hidden="true">›</span></button>
   ${!s&&!me.trial_used?'<div class="section"><button class="button" id="trial">Активировать пробный доступ</button><p class="small muted">Один пробный период на аккаунт. Срок и трафик указаны в тарифах.</p></div>':''}
   <div class="studio-extra-head"><strong>Ваш Still VPN</strong><button id="quick-plans">Тарифы ↗</button></div>
@@ -6105,16 +6267,16 @@ async function showHappImport(deviceId, copyNow){
 async function happConnectPage(){
 main.innerHTML=section('STILL / HAPP','Подключение через Happ.','VLESS · XHTTP · REALITY — Германия. Подключение управляется подпиской Still VPN.')+
 (!me.subscription?'<div class="notice error">Для подключения нужен тариф или пробный период.</div>':'')+
-`<div class="panel"><h3>Новое устройство</h3><p class="small muted">Одна постоянная HTTPS-подписка. При продлении менять её не нужно. На этапе тестирования доступно одно устройство; общий лимит трафика между устройствами ещё не поддерживается.</p>
+`<div class="panel"><h3>Новое устройство</h3><p class="small muted">Доступно подключений: ${Number(me.device_count)||0} из ${me.happ_max_devices||0}. Для каждого устройства создаётся отдельная постоянная HTTPS-подписка. Трафик суммируется по аккаунту приблизительно раз в минуту; при одновременной работе нескольких устройств возможен небольшой перерасход лимита.</p>
 <label>Название</label><input id="happ-name" maxlength="60" placeholder="Мой телефон" value="Мой телефон" autocomplete="off"><label>Платформа</label>
 <select id="happ-platform"><option value="android">Android</option><option value="ios">iPhone</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select>
-<div style="height:14px"></div><button id="happ-new" class="button" ${!me.subscription?'disabled':''}>Создать подключение</button></div>
+<div style="height:14px"></div><button id="happ-new" class="button" ${(!me.subscription||Number(me.device_count)>=Number(me.happ_max_devices))?'disabled':''}>${Number(me.device_count)>=Number(me.happ_max_devices)&&me.subscription?'Лимит устройств достигнут':'Создать подключение'}</button></div>
 <div class="section"><h2>Мои подключения Happ</h2><p class="small muted">Telegram не всегда открывает Happ напрямую. Скопируйте HTTPS-ссылку и добавьте её в приложении Happ через «+».</p><div id="happ-devices">Загружаем…</div><div id="happ-import-guide" aria-live="polite"></div></div>`;
 $('#happ-new').onclick=async()=>{const btn=$('#happ-new');btn.disabled=true;
 try{const d=await api('happ/devices',{method:'POST',body:JSON.stringify({name:$('#happ-name').value.trim(),platform:$('#happ-platform').value})});
 toast(d.ready?'Подключение создано':'Подключение ожидает синхронизации');await reload();happConnectPage();}catch(e){toast(e.message,true);btn.disabled=false}};
 try{const devs=await api('happ/devices');if(page!=='connect')return;
-$('#happ-devices').innerHTML=devs.length?devs.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.platform)} · ${d.enabled?'Активно':'Отозвано'}</span></div><span class="pill">${d.ready?'Готово':'Ожидает'}</span></div>
+$('#happ-devices').innerHTML=devs.length?devs.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.platform)} · ${d.enabled?'Активно':'Отозвано'} · ${d.traffic_updated_at?'Трафик: '+bytes(d.traffic_used||0):'Счётчик ожидает синхронизации'}</span></div><span class="pill">${d.ready?'Готово':'Ожидает'}</span></div>
 ${d.enabled?`<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px"><button class="button compact" data-happ-link="${d.id}" ${!d.ready?'disabled':''}>Скопировать для Happ</button><button class="button secondary compact" data-happ-copy="${d.id}" ${!d.ready?'disabled':''}>Показать ссылку</button><button class="button ghost compact" data-happ-remove="${d.id}">Отозвать</button></div>`:''}</div>`).join(''):'<p class="small muted">Устройств пока нет.</p>';
 // Telegram Android WebView cannot reliably navigate to happ://. Keep the
 // Mini App open and give the user a real HTTPS subscription to import in Happ.
