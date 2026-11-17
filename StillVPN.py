@@ -132,6 +132,22 @@ failover и восстановления бэкапа необходимы до 
 SQLite поддерживает только ОДИН экземпляр приложения и не подходит для
 горизонтального масштабирования; резервные копии /app/data обязательны.
 
+
+STILL VPN v13.3 — ПОДГОТОВКА ДВУХ ПРОТОКОЛОВ (ПО УМОЛЧАНИЮ AWG ОТКЛЮЧЁН):
+  - AWG_ENABLED=0 (по умолчанию) оставляет всех старых клиентов WireGuard без изменений.
+  - AWG_ENABLED=1 включать на VPS и BotHost только после установки и тестирования awg0.
+  - На VPS: AWG_INTERFACE=awg0, AWG_SERVER_CIDR=10.14.0.0/24.
+  - На BotHost: AWG_SERVER_ENDPOINT=PUBLIC_IP:AWG_UDP_PORT, AWG_SERVER_PUBLIC_KEY=...,
+    AWG_SERVER_CIDR=10.14.0.0/24, AWG_CLIENT_PARAMS_JSON={...} (параметры ПРОВЕРЕННОГО конфига AWG 3.1).
+  - Старые устройства автоматически получают protocol=wireguard, новые устройства выбирают протокол.
+  - Новая служба AWG и lease-файл /etc/stillvpn/awg_peer_leases.json независимы от wg0.
+  - Для AmneziaWG требуется awg / awg-quick (версия 3.1), отдельный интерфейс, NAT и правило UFW.
+  - ВАЖНО: сначала развернуть агент с AWG_ENABLED=0, затем AWG-сервер; включение поэтапное.
+  - AmneziaWG Android: выдавать клиенту Jc=0 (сервер остаётся на Jc=5); именно так прошёл реальный тест.
+  - Новые AWG-клиенты получают адреса с 10.14.0.10, чтобы не занять ручной тестовый 10.14.0.2.
+  - Клиентский AllowedIPs для AWG: 0.0.0.0/0, ::/0 (IPv6 в сервере не маршрутизируется).
+  - IPv6/DNS проверены на одном Android, но гарантировать отсутствие утечек на всех клиентах нельзя.
+
 БЕЗОПАСНОСТЬ / ПРОВЕРКА VPS (v13.1):
     SHADE_MODE=agent python shade.py audit-vps  # команды только чтения, подходит для Termius
     Профили WireGuard: WG_CLIENT_MTU=1280 и WG_CLIENT_DNS=1.1.1.1 (новые .conf).
@@ -241,7 +257,7 @@ try:
     WG_CLIENT_DNS = str(ipaddress.IPv4Address(os.getenv("WG_CLIENT_DNS", "1.1.1.1")))
 except ipaddress.AddressValueError as exc:
     raise RuntimeError("WG_CLIENT_DNS must be a single valid IPv4 DNS resolver") from exc
-RELEASE = "13.1.0"
+RELEASE = "13.3.0"
 CHANNEL_URL = "https://t.me/StillVPN_official"
 PUBLIC_SERVER_COUNTRY = os.getenv("PUBLIC_SERVER_COUNTRY", "Нидерланды")[:64]
 PUBLIC_SERVER_PROVIDER = os.getenv("PUBLIC_SERVER_PROVIDER", "SKRIME")[:64]
@@ -255,6 +271,59 @@ SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@support")
 TERMS_URL = os.getenv("TERMS_URL", "")
 WG_PEER_LEASE_SECONDS = min(900, max(120, int(os.getenv("WG_PEER_LEASE_SECONDS", "300"))))
 WG_AGENT_LEASE_PATH = pathlib.Path(os.getenv("WG_AGENT_LEASE_PATH", "/etc/stillvpn/peer_leases.json"))
+# AWG 3.1 remains disabled until both the interface and integration are verified.
+# Deliberately use a separate subnet, UDP port, keys and lease file.
+AWG_ENABLED = os.getenv("AWG_ENABLED", "0") == "1"
+AWG_INTERFACE = os.getenv("AWG_INTERFACE", "awg0")
+AWG_AGENT_LEASE_PATH = pathlib.Path(os.getenv("AWG_AGENT_LEASE_PATH", "/etc/stillvpn/awg_peer_leases.json"))
+AWG_SERVER_CIDR = os.getenv("AWG_SERVER_CIDR", "10.14.0.0/24")
+AWG_SERVER_ENDPOINT = os.getenv("AWG_SERVER_ENDPOINT", "")
+AWG_SERVER_PUBLIC_KEY = os.getenv("AWG_SERVER_PUBLIC_KEY", "")
+# JSON object of 3.1 [Interface] options from the tested AWG server configuration.
+# Never place this secret-bearing setting in logs or public API responses.
+AWG_CLIENT_PARAMS_JSON = os.getenv("AWG_CLIENT_PARAMS_JSON", "{}")
+AWG_PARAM_NAMES = frozenset(("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
+                            "I1", "I2", "I3", "I4", "I5", "HeaderProtectionKey", "ContentPaddingAddition",
+                            "RandomTrailers", "DisableCookies", "RekeyAfterTime", "RekeyTimeout",
+                            "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts"))
+
+def checked_awg_params() -> dict[str, str]:
+    if not AWG_ENABLED or MODE != "app":
+        return {}
+    try:
+        obj = json.loads(AWG_CLIENT_PARAMS_JSON)
+        if not isinstance(obj, dict) or not 1 <= len(obj) <= len(AWG_PARAM_NAMES):
+            raise ValueError("invalid AWG parameter object")
+        params: dict[str, str] = {}
+        for key, value in obj.items():
+            if key not in AWG_PARAM_NAMES or not isinstance(value, (str, int, bool)):
+                raise ValueError("invalid AWG parameter name/value")
+            val = ("on" if value else "off") if isinstance(value, bool) else str(value)
+            if not 1 <= len(val) <= 1500 or "\r" in val or "\n" in val or ("=" in val and key != "HeaderProtectionKey"):
+                raise ValueError("invalid AWG parameter format")
+            params[key] = val
+        if not all(k in params for k in ("HeaderProtectionKey", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4")):
+            raise ValueError("AmneziaWG 3.1 requires HeaderProtectionKey, S1-S4 and H1-H4")
+        if not validate_wg_key(params["HeaderProtectionKey"]):
+            raise ValueError("invalid HeaderProtectionKey")
+        if not all(int(params[x]) >= 12 for x in ("S1", "S2", "S3", "S4")):
+            raise ValueError("AWG header protection requires S1-S4 >= 12")
+        if not (AWG_SERVER_ENDPOINT and validate_wg_key(AWG_SERVER_PUBLIC_KEY)):
+            raise ValueError("AWG server endpoint/public key missing")
+        # Tested with AmneziaVPN on Android: Jc=0 on CLIENT only. The server
+        # can keep Jc=5; junk packet generation is per endpoint. Do not
+        # silently copy the server Jc=5 into a new client config.
+        params["Jc"] = "0"
+        return params
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("AWG_ENABLED=1 requires valid AWG_SERVER_ENDPOINT, AWG_SERVER_PUBLIC_KEY, AWG_CLIENT_PARAMS_JSON") from exc
+
+def awg_profile_options() -> str:
+    if not AWG_ENABLED or MODE != "app":
+        return ""
+    return "".join(f"{k} = {v}\n" for k, v in checked_awg_params().items())
+
+
 UTC = timezone.utc
 
 def now() -> datetime:
@@ -918,6 +987,7 @@ if MODE == "app":
         cidr: Mapped[str] = mapped_column(String(36))
         agent_url: Mapped[str] = mapped_column(String(255))
         next_host: Mapped[int] = mapped_column(Integer, default=2)
+        next_awg_host: Mapped[int] = mapped_column(Integer, default=10)
         enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     class Device(Base):
@@ -927,6 +997,7 @@ if MODE == "app":
         server_id: Mapped[int] = mapped_column(ForeignKey("server_nodes.id"))
         name: Mapped[str] = mapped_column(String(60))
         platform: Mapped[str] = mapped_column(String(24))
+        protocol: Mapped[str] = mapped_column(String(16), default="wireguard")
         public_key: Mapped[str] = mapped_column(String(44), unique=True)
         peer_ip: Mapped[str] = mapped_column(String(46), unique=True)
         enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -1408,9 +1479,21 @@ if MODE == "app":
             response.raise_for_status()
             return response.json()
 
+    def device_protocol(dev: Device) -> str:
+        return dev.protocol if dev.protocol in ("wireguard", "amneziawg") else "wireguard"
+
+    def profile_server(node: ServerNode, protocol: str) -> tuple[str, str, str]:
+        if protocol == "wireguard":
+            return node.endpoint, node.public_key, node.cidr
+        if protocol != "amneziawg" or not AWG_ENABLED or node.id != 1:
+            bad(503, "AmneziaWG пока недоступен")
+        checked_awg_params()  # validates feature configuration, never logs secret values
+        return AWG_SERVER_ENDPOINT, AWG_SERVER_PUBLIC_KEY, AWG_SERVER_CIDR
+
     async def apply_peer(device: Device, node: ServerNode, allow: bool,
                          valid_until: datetime | None = None) -> None:
-        payload = {"public_key": device.public_key, "ip": device.peer_ip, "allow": allow}
+        payload = {"public_key": device.public_key, "ip": device.peer_ip, "allow": allow,
+                   "protocol": device_protocol(device)}
         if allow:
             # Lease renewal is sent every minute; if BotHost goes offline, the VPS
             # automatically removes access after at most WG_PEER_LEASE_SECONDS.
@@ -1447,10 +1530,10 @@ if MODE == "app":
 
     async def refresh_stats(s: AsyncSession, node: ServerNode):
         result = await agent_request(node, "GET", "/agent/stats")
-        remote = {x["public_key"]: x for x in result["peers"]}
+        remote = {(x.get("protocol", "wireguard"), x["public_key"]): x for x in result["peers"]}
         devices = (await s.scalars(select(Device).where(Device.server_id == node.id))).all()
         for dev in devices:
-            p = remote.get(dev.public_key)
+            p = remote.get((device_protocol(dev), dev.public_key))
             if p:
                 rx, tx = int(p["rx"]), int(p["tx"])
                 delta = max(0, rx - dev.peer_rx) + max(0, tx - dev.peer_tx)
@@ -1614,6 +1697,8 @@ if MODE == "app":
             # add only missing columns, with the appropriate syntax per SQL dialect.
             migration_columns = {
                 "users": {"last_name": "VARCHAR(200) NOT NULL DEFAULT ''"},
+                "server_nodes": {"next_awg_host": "INTEGER NOT NULL DEFAULT 10"},
+                "devices": {"protocol": "VARCHAR(16) NOT NULL DEFAULT 'wireguard'"},
                 "payments": {
                     "promo_id": "INTEGER REFERENCES promos(id)",
                     "refunded_at": "TIMESTAMP",
@@ -1641,6 +1726,11 @@ if MODE == "app":
                     for col, column_type in cols.items():
                         await connection.execute(text(
                             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {column_type}"))
+        # Reserve low AWG addresses for manual recovery/testing. This never decreases
+        # an already-used allocation counter, and does not modify WG allocations.
+        async with engine.begin() as connection:
+            await connection.execute(text(
+                "UPDATE server_nodes SET next_awg_host = 10 WHERE next_awg_host < 10"))
         # Backfill timestamps on old tickets without touching existing messages or status.
         async with Session.begin() as backfill_session:
             await backfill_session.execute(text(
@@ -2852,10 +2942,14 @@ if MODE == "app":
             await check.execute(text("SELECT 1"))
         return {"status": "ok", "component": "still-app", "database": "ok", "release": RELEASE}
 
+    @app.get("/api/protocols")
+    async def api_protocols(user: User = Depends(current_user)):
+        return {"wireguard": True, "amneziawg": AWG_ENABLED, "amneziawg_version": "3.1" if AWG_ENABLED else None}
+
     @app.get("/build")
     async def build_info():
         return {"release": RELEASE, "site": "/", "mini_app": "/app",
-                "agent": "совместимо с WireGuard-агентом v4"}
+                "agent": "WireGuard + opt-in AmneziaWG 3.1 (agent v5)"}
 
     async def server_public_data(s: AsyncSession) -> list[dict]:
         nodes = (await s.scalars(select(ServerNode).where(
@@ -2869,7 +2963,7 @@ if MODE == "app":
             result.append({"id": n.id, "location": loc,
                            "country": PUBLIC_SERVER_COUNTRY if n.id == 1 else loc,
                            "provider": PUBLIC_SERVER_PROVIDER if n.id == 1 else "VPN-узел",
-                           "protocol": "WireGuard", "status": "online" if healthy else "checking"})
+                           "protocol": "WireGuard" + (" / AmneziaWG 3.1" if AWG_ENABLED and n.id == 1 else ""), "status": "online" if healthy else "checking"})
         return result
 
     @app.get("/api/servers/public")
@@ -2901,6 +2995,7 @@ if MODE == "app":
                 "id": user.id, "username": user.username, "first_name": user.first_name,
                 "created_at": user.created_at, "traffic_total": user.traffic_bytes,
                 "device_count": count, "trial_used": tr is not None,
+                "awg_available": AWG_ENABLED,
                 "subscription": e and {**e, "end": e["end"].isoformat()},
                 "payments_enabled": payments_ready(),
                 "admin_role": await role_of(s, user.id), "release": RELEASE,
@@ -3067,6 +3162,7 @@ if MODE == "app":
         rows = (await s.scalars(select(Device).where(Device.user_id == user.id)
                                                        .order_by(Device.created_at.desc()).limit(100))).all()
         return [{"id": d.id, "name": d.name, "platform": d.platform,
+                 "protocol": device_protocol(d),
                  "created_at": d.created_at, "last_handshake": d.last_handshake,
                  "provisioned": d.provisioned, "enabled": d.enabled} for d in rows]
 
@@ -3074,9 +3170,29 @@ if MODE == "app":
         name: str = Field(min_length=1, max_length=60)
         platform: str
         public_key: str
+        protocol: str = "wireguard"
 
     @app.post("/api/devices")
     async def api_add_device(data: DeviceIn, user: User = Depends(current_user), s: AsyncSession = Depends(db_session)):
+        if data.protocol not in ("wireguard", "amneziawg"):
+            bad(422, "Неподдерживаемый VPN-протокол")
+        if data.protocol == "amneziawg":
+            if not AWG_ENABLED:
+                bad(503, "AmneziaWG пока недоступен")
+            checked_awg_params()
+            # Only create user devices after the agent confirms the AWG interface.
+            async with Session() as health_session:
+                primary = await health_session.get(ServerNode, 1)
+                if not primary or not primary.enabled:
+                    bad(503, "Сервер AmneziaWG не настроен")
+                try:
+                    state = await agent_request(primary, "GET", "/agent/stats")
+                    if state.get("interfaces", {}).get("amneziawg") != "up":
+                        bad(503, "AmneziaWG на VPS ещё не запущен")
+                except HTTPException:
+                    raise
+                except Exception:
+                    bad(503, "AmneziaWG на VPS временно недоступен")
         if data.platform not in ("android", "ios", "windows", "macos", "linux"):
             bad(422, "Некорректная платформа")
         if not validate_wg_key(data.public_key): bad(422, "Некорректный публичный WireGuard-ключ")
@@ -3094,19 +3210,31 @@ if MODE == "app":
             if existing: bad(409, "Этот ключ уже зарегистрирован")
             node = await s.scalar(select(ServerNode).where(ServerNode.enabled.is_(True)).order_by(ServerNode.id).with_for_update())
             if not node: bad(503, "VPN-сервер пока не настроен")
-            subnet = ipaddress.ip_network(node.cidr)
-            next_ip = int(subnet.network_address) + node.next_host
+            if data.protocol == "amneziawg" and node.id != 1:
+                node = await s.get(ServerNode, 1, with_for_update=True)
+                if not node or not node.enabled:
+                    bad(503, "Сервер AmneziaWG пока не настроен")
+            endpoint, server_key, cidr = profile_server(node, data.protocol)
+            subnet = ipaddress.ip_network(cidr)
+            if subnet.version != 4:
+                bad(503, "VPN-подсеть должна использовать IPv4")
+            host_num = node.next_awg_host if data.protocol == "amneziawg" else node.next_host
+            next_ip = int(subnet.network_address) + host_num
             if next_ip >= int(subnet.broadcast_address): bad(503, "Адреса VPN закончились")
             peer_ip = str(ipaddress.ip_address(next_ip))
-            node.next_host += 1
+            if data.protocol == "amneziawg":
+                node.next_awg_host += 1
+            else:
+                node.next_host += 1
             d = Device(id=str(uuid.uuid4()), user_id=u.id, server_id=node.id, name=data.name,
-                       platform=data.platform, public_key=data.public_key, peer_ip=peer_ip)
+                       platform=data.platform, protocol=data.protocol, public_key=data.public_key, peer_ip=peer_ip)
             s.add(d)
             record_event(s, "device_created", u.id,
                          f"{d.name} · {d.platform} · {peer_ip} · сервер #{node.id}")
             await s.flush()
             response = {"id": d.id, "address": peer_ip + "/32", "dns": WG_CLIENT_DNS, "mtu": WG_CLIENT_MTU,
-                        "server_key": node.public_key, "endpoint": node.endpoint,
+                        "server_key": server_key, "endpoint": endpoint, "protocol": data.protocol,
+                        "extra_interface": awg_profile_options() if data.protocol == "amneziawg" else "",
                         "status": "provisioning"}
         try:
             await apply_peer(d, node, True, entitlement_data["end"])
@@ -3163,26 +3291,30 @@ if MODE == "app":
         if len(recent) >= 6:
             bad(429, "Лимит отправок: максимум 6 профилей в час")
         conf_send_rate[user.id] = recent + [tick]
+        endpoint, server_key, _ = profile_server(node, device_protocol(dev))
         config = (
             "[Interface]\n"
             f"PrivateKey = {data.private_key}\n"
             f"Address = {dev.peer_ip}/32\n"
             f"DNS = {WG_CLIENT_DNS}\n"
-            f"MTU = {WG_CLIENT_MTU}\n\n"
+            f"MTU = {WG_CLIENT_MTU}\n"
+            + (awg_profile_options() if device_protocol(dev) == "amneziawg" else "") + "\n"
             "[Peer]\n"
-            f"PublicKey = {node.public_key}\n"
-            f"Endpoint = {node.endpoint}\n"
-            "AllowedIPs = 0.0.0.0/0\n"
-            "PersistentKeepalive = 25\n"
+            f"PublicKey = {server_key}\n"
+            f"Endpoint = {endpoint}\n"
+            + ("AllowedIPs = 0.0.0.0/0, ::/0\n" if device_protocol(dev) == "amneziawg" else "AllowedIPs = 0.0.0.0/0\n")
+            + "PersistentKeepalive = 25\n"
         )
-        filename = "still-" + dev.id[:8] + ".conf"
+        filename = ("sawg-" if device_protocol(dev) == "amneziawg" else "swg-") + dev.id[:8] + ".conf"
         try:
             await bot.send_document(
                 chat_id=user.id,
                 document=BufferedInputFile(config.encode("utf-8"), filename=filename),
                 caption=("🔐 <b>Still VPN · конфигурация</b>\n"
-                         "Откройте файл в WireGuard и включите туннель.\n"
-                         "⚠️ Файл содержит приватный ключ: не пересылайте его другим.\n⚠️ Только IPv4: IPv6-трафик может обходить VPN; проверьте устройство."),
+                         + ("Импортируйте файл в AmneziaVPN с поддержкой AWG 3.1 и включите туннель.\n"
+                          if device_protocol(dev) == "amneziawg"
+                          else "Откройте файл в WireGuard и включите туннель.\n") +
+                         "⚠️ Файл содержит приватный ключ: не пересылайте его другим.\n⚠️ Сервер предоставляет только IPv4; проверьте IPv6 и DNS на устройстве."),
                 parse_mode="HTML",
                 # Keep downloading enabled: protected Telegram messages can prevent file saving.
                 protect_content=False,
@@ -4516,14 +4648,16 @@ else:
     lease_lock = asyncio.Lock()
     peer_leases: dict[str, dict[str, Any]] = {}
     SAFE_WG_IFACE = re.compile(r"[a-zA-Z0-9_.\-]{1,15}$")
-    if not SAFE_WG_IFACE.fullmatch(WG_INTERFACE):
-        raise RuntimeError("Invalid WG_INTERFACE")
+    if not SAFE_WG_IFACE.fullmatch(WG_INTERFACE) or (AWG_ENABLED and (not SAFE_WG_IFACE.fullmatch(AWG_INTERFACE) or AWG_INTERFACE == WG_INTERFACE)):
+        raise RuntimeError("Invalid VPN interface name")
+    awg_peer_leases: dict[str, dict[str, Any]] = {}
 
     class PeerChange(BaseModel):
         public_key: str
         ip: str
         allow: bool
         expires_at: int | None = None
+        protocol: str = "wireguard"
 
     async def require_agent(request: Request) -> None:
         if len(WG_AGENT_SECRET) < 32: bad(503, "Secret not configured")
@@ -4550,20 +4684,36 @@ else:
         if nonce in used_nonces: bad(403, "Replay")
         used_nonces[nonce] = t
 
-    def wg(*args: str) -> str:
+    def vpn_exec(protocol: str, *args: str) -> str:
+        if protocol not in ("wireguard", "amneziawg"):
+            bad(422, "Unknown VPN protocol")
+        if protocol == "amneziawg" and not AWG_ENABLED:
+            bad(503, "AmneziaWG disabled")
+        binary = "awg" if protocol == "amneziawg" else "wg"
         try:
-            p = subprocess.run(["wg", *args], check=True, capture_output=True, text=True,
-                               timeout=10)
+            p = subprocess.run([binary, *args], check=True, capture_output=True,
+                               text=True, timeout=10)
             return p.stdout
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            LOG.exception("WireGuard command failed")
-            bad(503, "WireGuard unavailable")
+            LOG.exception("VPN tool %s failed", binary)
+            bad(503, "VPN interface unavailable")
 
-    def read_peer_leases() -> dict[str, dict[str, Any]]:
-        if not WG_AGENT_LEASE_PATH.exists():
+    def wg(*args: str) -> str:
+        return vpn_exec("wireguard", *args)
+
+    def protocol_params(proto: str) -> tuple[str, pathlib.Path, str, dict[str, dict[str, Any]]]:
+        if proto == "wireguard":
+            return WG_INTERFACE, WG_AGENT_LEASE_PATH, WG_SERVER_CIDR, peer_leases
+        if proto == "amneziawg" and AWG_ENABLED:
+            return AWG_INTERFACE, AWG_AGENT_LEASE_PATH, AWG_SERVER_CIDR, awg_peer_leases
+        bad(503, "VPN protocol disabled")
+
+    def read_peer_leases(proto: str = "wireguard") -> dict[str, dict[str, Any]]:
+        _, path, _, _ = protocol_params(proto)
+        if not path.exists():
             return {}
         try:
-            raw = json.loads(WG_AGENT_LEASE_PATH.read_text())
+            raw = json.loads(path.read_text())
             if not isinstance(raw, dict):
                 raise ValueError("lease file is not an object")
             result = {}
@@ -4578,46 +4728,49 @@ else:
             LOG.error("Agent lease file invalid. Failing closed: %s", exc)
             return {}
 
-    def save_peer_leases() -> None:
-        WG_AGENT_LEASE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = WG_AGENT_LEASE_PATH.with_name(WG_AGENT_LEASE_PATH.name + ".tmp")
+    def save_peer_leases(proto: str = "wireguard") -> None:
+        _, path, _, leases = protocol_params(proto)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tmp")
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         fd = os.open(tmp, flags, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(peer_leases, handle, separators=(",", ":"))
+                json.dump(leases, handle, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, WG_AGENT_LEASE_PATH)
-            os.chmod(WG_AGENT_LEASE_PATH, 0o600)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
         finally:
             if tmp.exists():
                 tmp.unlink()
 
-    async def sweep_peer_leases() -> None:
-        # Only use a DEDICATED managed wg0 interface. Peers not present in the
-        # authorized lease file are removed on startup or expiry.
+    async def sweep_peer_leases(proto: str = "wireguard") -> None:
+        # Manage only the given dedicated interface and its OWN lease file.
+        iface, _, _, leases = protocol_params(proto)
         async with lease_lock:
-            current = set(wg("show", WG_INTERFACE, "peers").split())
+            current = set(vpn_exec(proto, "show", iface, "peers").split())
             ts = int(time.time())
             changed = False
             for pub in current:
-                lease = peer_leases.get(pub)
+                lease = leases.get(pub)
                 if not lease or lease["expires_at"] <= ts:
-                    wg("set", WG_INTERFACE, "peer", pub, "remove")
-                    if peer_leases.pop(pub, None) is not None:
+                    vpn_exec(proto, "set", iface, "peer", pub, "remove")
+                    if leases.pop(pub, None) is not None:
                         changed = True
-            for pub, lease in list(peer_leases.items()):
+            for pub, lease in list(leases.items()):
                 if lease["expires_at"] <= ts:
-                    peer_leases.pop(pub, None)
+                    leases.pop(pub, None)
                     changed = True
             if changed:
-                save_peer_leases()
+                save_peer_leases(proto)
 
     async def peer_lease_worker() -> None:
         while True:
             try:
-                await sweep_peer_leases()
+                await sweep_peer_leases("wireguard")
+                if AWG_ENABLED:
+                    await sweep_peer_leases("amneziawg")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -4627,9 +4780,10 @@ else:
     @app.post("/agent/peer", dependencies=[Depends(require_agent)])
     async def agent_peer(change: PeerChange):
         if not validate_wg_key(change.public_key): bad(422, "Invalid public key")
+        iface, _, cidr, leases = protocol_params(change.protocol)
         try:
             ip = ipaddress.ip_address(change.ip)
-            network = ipaddress.ip_network(WG_SERVER_CIDR, strict=False)
+            network = ipaddress.ip_network(cidr, strict=False)
             if (ip.version != 4 or network.version != 4 or ip not in network
                     or ip in (network.network_address, network.broadcast_address,
                               network.network_address + 1)):
@@ -4643,30 +4797,39 @@ else:
                               ts + WG_PEER_LEASE_SECONDS)
                 if expires <= ts:
                     bad(409, "Access already expired")
-                wg("set", WG_INTERFACE, "peer", change.public_key, "allowed-ips", str(ip) + "/32")
-                peer_leases[change.public_key] = {"ip": str(ip), "expires_at": expires}
+                vpn_exec(change.protocol, "set", iface, "peer", change.public_key, "allowed-ips", str(ip) + "/32")
+                leases[change.public_key] = {"ip": str(ip), "expires_at": expires}
                 try:
-                    save_peer_leases()
+                    save_peer_leases(change.protocol)
                 except Exception:
                     # Never keep an active peer whose expiry cannot be persisted.
-                    wg("set", WG_INTERFACE, "peer", change.public_key, "remove")
-                    peer_leases.pop(change.public_key, None)
+                    vpn_exec(change.protocol, "set", iface, "peer", change.public_key, "remove")
+                    leases.pop(change.public_key, None)
                     raise
             else:
-                wg("set", WG_INTERFACE, "peer", change.public_key, "remove")
-                peer_leases.pop(change.public_key, None)
-                save_peer_leases()
+                vpn_exec(change.protocol, "set", iface, "peer", change.public_key, "remove")
+                leases.pop(change.public_key, None)
+                save_peer_leases(change.protocol)
         return {"ok": True}
 
     @app.get("/agent/stats", dependencies=[Depends(require_agent)])
     async def agent_stats():
-        rows = wg("show", WG_INTERFACE, "dump").splitlines()
         peers = []
-        for line in rows[1:]:
-            columns = line.split("\t")
-            if len(columns) >= 8:
-                peers.append({"public_key": columns[0], "handshake": int(columns[4]),
-                              "rx": int(columns[5]), "tx": int(columns[6])})
+        interface_status = {"wireguard": "up", "amneziawg": "disabled" if not AWG_ENABLED else "up"}
+        for proto in (("wireguard", "amneziawg") if AWG_ENABLED else ("wireguard",)):
+            iface, _, _, _ = protocol_params(proto)
+            try:
+                rows = vpn_exec(proto, "show", iface, "dump").splitlines()
+            except HTTPException:
+                if proto == "wireguard":
+                    raise
+                interface_status[proto] = "unavailable"
+                continue
+            for line in rows[1:]:
+                columns = line.split("\t")
+                if len(columns) >= 8:
+                    peers.append({"protocol": proto, "public_key": columns[0],
+                                  "handshake": int(columns[4]), "rx": int(columns[5]), "tx": int(columns[6])})
         mem = {}
         try:
             with open("/proc/meminfo") as f:
@@ -4685,7 +4848,8 @@ else:
             network_rx, network_tx = counters.bytes_recv, counters.bytes_sent
         except (ImportError, OSError):
             pass
-        return {"agent_version": "4", "peers": peers, "load_average": os.getloadavg()[0],
+        return {"agent_version": "5", "peers": peers, "interfaces": interface_status,
+                "load_average": os.getloadavg()[0],
                 "cpu_percent": cpu_percent, "memory": mem,
                 "network_rx": network_rx, "network_tx": network_tx,
                 "disk_free": disk.f_bavail * disk.f_frsize}
@@ -4693,14 +4857,19 @@ else:
     @app.get("/health")
     async def agent_health():
         wg("show", WG_INTERFACE, "public-key")
-        return {"status": "ok"}
+        return {"status": "ok", "interface": WG_INTERFACE}
 
     @asynccontextmanager
     async def lifespan_agent(a: FastAPI):
-        peer_leases.update(read_peer_leases())
-        # On rollout unknown existing peers are revoked once; BotHost renews
-        # authorized devices during its periodic reconciliation.
-        await sweep_peer_leases()
+        peer_leases.update(read_peer_leases("wireguard"))
+        # AWG lease file is separate; absent/expired leases are closed on startup.
+        await sweep_peer_leases("wireguard")
+        if AWG_ENABLED:
+            awg_peer_leases.update(read_peer_leases("amneziawg"))
+            try:
+                await sweep_peer_leases("amneziawg")
+            except HTTPException:
+                LOG.warning("Optional AmneziaWG interface unavailable at startup; WireGuard remains online")
         task = asyncio.create_task(peer_lease_worker())
         try:
             yield
@@ -5030,9 +5199,9 @@ $('#go-connect').onclick=()=>nav(s?'devices':'plans');if($('#trial'))$('#trial')
 }
 async function plansPage(c){c.innerHTML=subhead('ПОДПИСКА','Ваши возможности.','Тарифы и лимиты поступают из базы Still VPN.')+`<div class="notice">Оплата на отдельном сайте пока не подключена. Telegram Stars доступны только через Telegram после включения платежей. Для входа без Telegram можно использовать уже активную подписку или подарочный / промокод.</div><div id="plans-load"><p class="muted">Загрузка тарифов…</p></div><div class="section"><h3>Активировать код</h3><p class="muted small">Одноразовый подарок или промокод на дни доступа.</p><form id="redeem-form"><label class="field"><span>Ваш код</span><input id="redeem-code" maxlength="80" required placeholder="Введите код"></label><button class="cta" type="submit">Активировать</button></form></div>`;
 try{plans=await api('plans');if(page!=='plans')return;$('#plans-load').innerHTML=plans.length?plans.map(p=>`<div class="planline"><div><strong>${esc(p.title)}</strong><p class="muted small">${p.days} дней · ${p.devices} устройств · ${bytes(p.traffic_bytes)}</p></div><span class="price">${p.stars} <small>Stars</small></span></div>`).join(''):'<div class="empty">Тарифы пока не опубликованы.</div>'}catch(e){toast(e.message,true)}$('#redeem-form').onsubmit=async ev=>{ev.preventDefault();try{await api('redeem',{method:'POST',body:JSON.stringify({code:$('#redeem-code').value.trim()})});toast('Код активирован');await loadMe();nav('home')}catch(e){toast(e.message,true)}}}
-async function devicesPage(c){c.innerHTML=subhead('WIREGUARD','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
+async function devicesPage(c){c.innerHTML=subhead('STILL VPN','Ваши устройства.','Каждое подключение использует собственную пару ключей.')+(!me.subscription?'<div class="notice bad">Для подключения нужна активная подписка или пробный доступ.</div>':'')+`<div class="panel"><h3>Новое устройство</h3><p class="muted small">Ключ создаётся в браузере. Наш сервер получает только публичный ключ.</p><form id="device-create"><div class="grid2"><label class="field"><span>Название</span><input id="device-name" required maxlength="60" placeholder="Мой телефон" value="Мой телефон"></label><label class="field"><span>Платформа</span><select id="device-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label></div><label class="field"><span>Протокол</span><select id="device-protocol"><option value="wireguard">WireGuard · скорость</option>${me.awg_available?'<option value="amneziawg">AmneziaWG 3.1 · защита от DPI</option>':''}</select></label><button class="cta" ${!me.subscription?'disabled':''} id="create-button" type="submit">Создать конфигурацию</button></form></div><div id="new-config"></div><div class="section"><div class="splithead"><h3>Добавленные устройства</h3><button class="cta plain tiny" id="reload-devices">Обновить ↻</button></div><div id="device-list"><p class="muted small">Загрузка…</p></div></div>`;
 $('#device-create').onsubmit=createDevice;$('#reload-devices').onclick=loadDevices;loadDevices()}
-async function loadDevices(){try{devices=await api('devices');if(page!=='devices')return;const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="devicehead"><div><h3>${esc(d.name)}</h3><p class="muted small">${esc(d.platform)} · добавлено ${date(d.created_at)}<br>${d.last_handshake?'Последний handshake: '+date(d.last_handshake):'Нет данных о подключении'}</p></div><span class="chip">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div>${d.enabled?`<div class="buttons"><button class="cta outline tiny" data-rename="${esc(d.id)}">Переименовать</button><button class="cta danger tiny" data-revoke="${esc(d.id)}">Отозвать</button></div>`:''}</div>`).join(''):'<div class="empty">Подключений пока нет.</div>';
+async function loadDevices(){try{devices=await api('devices');if(page!=='devices')return;const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="devicehead"><div><h3>${esc(d.name)}</h3><p class="muted small">${esc(d.protocol==='amneziawg'?'AmneziaWG 3.1':'WireGuard')} · ${esc(d.platform)} · добавлено ${date(d.created_at)}<br>${d.last_handshake?'Последний handshake: '+date(d.last_handshake):'Нет данных о подключении'}</p></div><span class="chip">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div>${d.enabled?`<div class="buttons"><button class="cta outline tiny" data-rename="${esc(d.id)}">Переименовать</button><button class="cta danger tiny" data-revoke="${esc(d.id)}">Отозвать</button></div>`:''}</div>`).join(''):'<div class="empty">Подключений пока нет.</div>';
 $$('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id===b.dataset.rename),name=prompt('Новое имя',d.name);if(!name)return;try{await api('devices/'+d.id,{method:'PATCH',body:JSON.stringify({name:name.trim()})});toast('Переименовано');await loadDevices()}catch(e){toast(e.message,true)}});
 $$('[data-revoke]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать доступ устройства? Старая конфигурация перестанет работать.'))return;try{await api('devices/'+b.dataset.revoke,{method:'DELETE',body:'{}'});toast('Отзыв доступа запрошен');await loadDevices();await loadMe()}catch(e){toast(e.message,true)}})}catch(e){toast(e.message,true)}}
 function b64(a){return btoa(String.fromCharCode(...new Uint8Array(a)))}
@@ -5049,9 +5218,9 @@ async function saveConfigLocally(conf,filename){
  if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){try{await navigator.share({files:[file],title:'Still VPN WireGuard'});toast('Выберите локальное сохранение файла');return}catch(e){if(e.name==='AbortError')return}}
  saveBlobConfig(conf,filename);toast('Проверьте загрузки. Если файла нет, скопируйте текст в .conf вручную.',true);
 }
-async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = ${r.mtu}\n\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n`;
-lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Ключ создан локально. Если отправите .conf в Telegram, он однократно пройдёт через сервер по HTTPS и останется в вашем личном чате. Другие способы сохраняют файл локально.</p><p class="small muted">Важно: этот профиль направляет в туннель только IPv4; IPv6 может идти напрямую. Проверьте IPv6 и DNS-утечки перед передачей конфигурации другим пользователям.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-telegram">✉ Отправить .conf в личный чат</button><button class="cta outline tiny" id="conf-save">Сохранить локально</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Отправка в личный чат требует привязанного Telegram-аккаунта; ключ проходит через API и Telegram без сохранения в нашей базе. Приоритет приватности — локальное сохранение.</p></div>`;$('#conf-display').textContent=configText;
-const configFilename='still-vpn-'+r.id.slice(0,8)+'.conf';
+async function createDevice(e){e.preventDefault();const button=$('#create-button');button.disabled=true;button.textContent='Создаём ключ…';try{const name=$('#device-name').value.trim(),platform=$('#device-platform').value,protocol=$('#device-protocol').value;const kp=await keypair();const r=await api('devices',{method:'POST',body:JSON.stringify({name,platform,protocol,public_key:kp.pub})});const configText=`[Interface]\nPrivateKey = ${kp.priv}\nAddress = ${r.address}\nDNS = ${r.dns}\nMTU = ${r.mtu}\n${r.extra_interface||''}\n[Peer]\nPublicKey = ${r.server_key}\nEndpoint = ${r.endpoint}\nAllowedIPs = ${r.protocol==='amneziawg'?'0.0.0.0/0, ::/0':'0.0.0.0/0'}\nPersistentKeepalive = 25\n`;
+lastConfig=configText;const box=$('#new-config');box.innerHTML=`<div class="config-output"><h3>Конфигурация создана</h3><div class="notice ${r.status==='ready'?'good':'bad'}">${r.status==='ready'?'Peer подтверждён VPN-сервером.':'VPN-сервер пока не подтвердил выдачу. Проверьте состояние устройства позже.'}</div><p class="small muted">Ключ создан локально. Если отправите .conf в Telegram, он однократно пройдёт через сервер по HTTPS и останется в вашем личном чате. Другие способы сохраняют файл локально.</p><p class="small muted">Важно: сервер пока не предоставляет выход в IPv6. В профиле AmneziaWG включён маршрут ::/0 для предотвращения обхода туннеля, но IPv6-сайты могут быть недоступны. Проверьте IP и DNS на устройстве.</p><div class="codebox" id="conf-display"></div><div class="export-row"><button class="cta tiny" id="conf-telegram">✉ Отправить .conf в личный чат</button><button class="cta outline tiny" id="conf-save">Сохранить локально</button><button class="cta outline tiny" id="conf-copy">Копировать</button><button class="cta plain tiny" id="conf-download">Обычная загрузка</button></div><p class="export-copy">Отправка в личный чат требует привязанного Telegram-аккаунта; ключ проходит через API и Telegram без сохранения в нашей базе. Приоритет приватности — локальное сохранение.</p></div>`;$('#conf-display').textContent=configText;
+const configFilename=(r.protocol==='amneziawg'?'sawg-':'swg-')+r.id.slice(0,8)+'.conf';
 $('#conf-telegram').onclick=async()=>{const b=$('#conf-telegram');if(!confirm('Отправить ваш приватный ключ в Telegram? Файл останется в личном чате.'))return;b.disabled=true;b.textContent='Отправляем…';try{await api('devices/'+r.id+'/send-conf',{method:'POST',body:JSON.stringify({private_key:kp.priv})});toast('Файл отправлен в личный чат с ботом');b.textContent='✓ Отправлено в Telegram'}catch(e){toast(e.message,true);b.disabled=false;b.textContent='✉ Отправить .conf в личный чат'}};
 $('#conf-save').onclick=()=>saveConfigLocally(configText,configFilename);
 $('#conf-download').onclick=()=>saveBlobConfig(configText,configFilename);
@@ -5454,15 +5623,15 @@ async function loadPayments(){try{payments=await api('payments');if(page!=='plan
 $('#history').innerHTML=payments.length?payments.map(p=>`<div class="statrow" style="align-items:flex-start"><span><b>${esc(p.plan)}</b><br><span class="small muted">${day(p.date)} · ${p.kind==='gift'?'Подарок':'Подписка'}<br>ID ${esc(p.id)}</span></span><span><b>${p.amount} ⭐</b><br><span class="small muted">${esc(p.status)}</span></span></div>`).join(''):'<p class="muted small">Пока нет платежей.</p>';
 }catch(e){toast(e.message,true)}}
 function connectPage(){const e=me.subscription;
-main.innerHTML=section('VPN','Ваши устройства.','Создайте профиль один раз, затем включайте и выключайте туннель через настройки телефона или WireGuard.')+
-`<div class="vpn-control" id="vpn-control"><div class="vpn-control-head"><span class="kicker">STILL / СТАТУС ПОДКЛЮЧЕНИЯ</span><span id="vpn-activity" class="pill">Проверяем устройства…</span></div><div class="vpn-control-main"><div class="vpn-power" aria-hidden="true">⏻</div><div><h2>VPN под вашим контролем</h2><p class="small muted">Mini App показывает данные сервера, но не может включать системный VPN без приложения.</p></div></div><button id="vpn-how-toggle" class="button secondary compact">Как включать / выключать быстро ↗</button><div id="vpn-how" class="vpn-how" hidden><p><b>Android:</b> откройте WireGuard и активируйте профиль. Для быстрого доступа добавьте VPN в быстрые настройки или используйте совместимый виджет.</p><p><b>iPhone:</b> откройте настройки iOS → VPN или приложение WireGuard и включите конфигурацию.</p><p class="small muted">Это управление в системе устройства. Кнопка в Mini App не имитирует включение VPN.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a></div></div>`+
+main.innerHTML=section('VPN','Ваши устройства.','Выбирайте WireGuard или AmneziaWG. Туннель включается в соответствующем приложении на устройстве.')+
+`<div class="vpn-control" id="vpn-control"><div class="vpn-control-head"><span class="kicker">STILL / СТАТУС ПОДКЛЮЧЕНИЯ</span><span id="vpn-activity" class="pill">Проверяем устройства…</span></div><div class="vpn-control-main"><div class="vpn-power" aria-hidden="true">⏻</div><div><h2>VPN под вашим контролем</h2><p class="small muted">Mini App показывает данные сервера, но не может включать системный VPN без приложения.</p></div></div><button id="vpn-how-toggle" class="button secondary compact">Как включать / выключать быстро ↗</button><div id="vpn-how" class="vpn-how" hidden><p><b>Android:</b> для WireGuard откройте WireGuard, для AmneziaWG 3.1 — AmneziaVPN и активируйте профиль. Для быстрого доступа добавьте VPN в быстрые настройки или используйте совместимый виджет.</p><p><b>iPhone:</b> откройте настройки iOS → VPN или приложение WireGuard и включите конфигурацию.</p><p class="small muted">Это управление в системе устройства. Кнопка в Mini App не имитирует включение VPN.</p><a href="https://www.wireguard.com/install/" target="_blank" rel="noopener noreferrer">Установить WireGuard ↗</a></div></div>`+
 (!e?'<div class="notice error">Для создания конфигурации активируйте тариф или пробный период.</div>':'')+
-`<div class="panel"><h3>Новое подключение</h3><label>Название устройства</label><input id="dev-name" maxlength="60" placeholder="Мой iPhone" autocomplete="off"><label>Платформа</label><select id="dev-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select><div style="height:18px"></div><button id="create-device" class="button" ${!e?'disabled':''}>Создать конфигурацию</button></div>`+
+`<div class="panel"><h3>Новое подключение</h3><label>Название устройства</label><input id="dev-name" maxlength="60" placeholder="Мой iPhone" autocomplete="off"><label>Платформа</label><select id="dev-platform"><option value="android">Android</option><option value="ios">iOS</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select><label>Протокол</label><select id="dev-protocol"><option value="wireguard">WireGuard · скорость</option>${me.awg_available?'<option value="amneziawg">AmneziaWG 3.1 · устойчивость к DPI</option>':''}</select><div style="height:18px"></div><button id="create-device" class="button" ${!e?'disabled':''}>Создать конфигурацию</button></div>`+
 `<div id="new-config"></div><div class="section"><h2>Добавленные устройства</h2><div id="device-list"></div></div>`;
 $('#create-device').onclick=createDevice;$('#vpn-how-toggle').onclick=()=>{$('#vpn-how').hidden=!$('#vpn-how').hidden};loadDevices();}
 async function loadDevices(){try{devices=await api('devices');if(page!=='connect')return;
 const indicator=$('#vpn-activity');if(indicator){const active=devices.filter(d=>d.enabled&&d.provisioned);const recent=active.some(d=>d.last_handshake&&Date.now()-new Date(d.last_handshake).getTime()<180000);indicator.textContent=recent?'Связь с сервером недавно':active.length?'Профиль готов':'Нет активного профиля';indicator.className='pill '+(recent?'vpn-status-fresh':'vpn-status-idle')}
-const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.platform)} · ${day(d.created_at)}<br>${d.last_handshake?'Последняя активность '+day(d.last_handshake):'Нет данных о подключении'}</span></div><span class="pill">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div><div class="row" style="justify-content:flex-start;margin-top:13px">${d.enabled?`<button class="button ghost compact" data-rename="${d.id}">Переименовать</button><button class="button ghost compact" data-delete="${d.id}">Отозвать</button>`:''}</div></div>`).join(''):'<p class="muted small">Устройства пока не добавлены.</p>';
+const box=$('#device-list');box.innerHTML=devices.length?devices.map(d=>`<div class="device"><div class="row"><div><h3>${esc(d.name)}</h3><span class="small muted">${esc(d.protocol==='amneziawg'?'AmneziaWG 3.1':'WireGuard')} · ${esc(d.platform)} · ${day(d.created_at)}<br>${d.last_handshake?'Последняя активность '+day(d.last_handshake):'Нет данных о подключении'}</span></div><span class="pill">${!d.enabled?'Отозван':d.provisioned?'Выдан':'Ожидает'}</span></div><div class="row" style="justify-content:flex-start;margin-top:13px">${d.enabled?`<button class="button ghost compact" data-rename="${d.id}">Переименовать</button><button class="button ghost compact" data-delete="${d.id}">Отозвать</button>`:''}</div></div>`).join(''):'<p class="muted small">Устройства пока не добавлены.</p>';
 box.querySelectorAll('[data-rename]').forEach(b=>b.onclick=async()=>{const d=devices.find(x=>x.id===b.dataset.rename),name=prompt('Новое название',d.name);if(!name)return;try{await api('devices/'+d.id,{method:'PATCH',body:JSON.stringify({name})});loadDevices()}catch(e){toast(e.message,true)}});
 box.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Отозвать VPN-доступ для этого устройства?'))return;try{await api('devices/'+b.dataset.delete,{method:'DELETE'});toast('Отзыв отправлен');loadDevices();await reload()}catch(e){toast(e.message,true)}});
 }catch(e){toast(e.message,true)}}
@@ -5504,16 +5673,16 @@ async function saveWireguardConf(conf,filename){
  toast('Если файл не появился в загрузках Telegram, нажмите «Копировать» и сохраните .conf локально.',true);
 }
 async function createDevice(){const btn=$('#create-device');btn.disabled=true;btn.textContent='Создание ключа…';
- try{const name=$('#dev-name').value.trim(),platform=$('#dev-platform').value;if(!name)throw new Error('Введите название устройства');
- const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,public_key:keys.publicKey})});
- const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = ${response.mtu}\n\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
+ try{const name=$('#dev-name').value.trim(),platform=$('#dev-platform').value,protocol=$('#dev-protocol').value;if(!name)throw new Error('Введите название устройства');
+ const keys=await wgKeyPair();const response=await api('devices',{method:'POST',body:JSON.stringify({name,platform,protocol,public_key:keys.publicKey})});
+ const conf=`[Interface]\nPrivateKey = ${keys.privateKey}\nAddress = ${response.address}\nDNS = ${response.dns}\nMTU = ${response.mtu}\n${response.extra_interface||''}\n[Peer]\nPublicKey = ${response.server_key}\nAllowedIPs = ${response.protocol==='amneziawg'?'0.0.0.0/0, ::/0':'0.0.0.0/0'}\nEndpoint = ${response.endpoint}\nPersistentKeepalive = 25\n`;
  currentConfig={name,conf,deviceId:response.id,privateKey:keys.privateKey};
- const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Ключ создан локально. При нажатии «Получить в Telegram» он однократно передаётся защищённому API и в ваш личный чат; сервер не сохраняет его в базе. При потере конфигурации удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><button id="send-conf-telegram" class="button">✉ Получить .conf в личный чат Telegram</button><p class="export-info">По вашему нажатию ключ отправляется боту по HTTPS, затем приходит личным документом в Telegram. Хранение файла в Telegram зависит от настроек и политики мессенджера.</p><div class="export-actions"><button id="share-conf" class="button secondary compact">Сохранить локально</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">Храните профиль как пароль. Не отправляйте файл посторонним. Для максимальной приватности выбирайте локальное сохранение. Профиль покрывает только IPv4: IPv6 может обходить VPN — проверьте настройки устройства.</p><p class="small muted" id="install-help"></p></div>`;
+ const root=$('#new-config');root.innerHTML=`<div class="panel"><h2>Конфигурация готова</h2><div class="notice ${response.status==='ready'?'':'error'}">${response.status==='ready'?'VPN-профиль добавлен на сервер.':'Сервер пока не подтвердил создание. Конфигурация сохранится только если вы её скачаете; проверьте статус позже.'}</div><p class="small muted">Ключ создан локально. При нажатии «Получить в Telegram» он однократно передаётся защищённому API и в ваш личный чат; сервер не сохраняет его в базе. При потере конфигурации удалите устройство и создайте новое.</p><div id="qr"></div><div class="code" id="config-text"></div><div class="export-primary"><button id="send-conf-telegram" class="button">✉ Получить .conf в личный чат Telegram</button><p class="export-info">По вашему нажатию ключ отправляется боту по HTTPS, затем приходит личным документом в Telegram. Хранение файла в Telegram зависит от настроек и политики мессенджера.</p><div class="export-actions"><button id="share-conf" class="button secondary compact">Сохранить локально</button><button id="copy-conf" class="button secondary compact">Копировать текст</button></div><button id="download" class="button ghost compact">Обычная загрузка .conf</button></div><p class="export-info">Храните профиль как пароль. Не отправляйте файл посторонним. Для максимальной приватности выбирайте локальное сохранение. Выход в IPv6 на сервере не настроен. AmneziaWG направляет ::/0 в туннель, но сайты только с IPv6 могут быть недоступны. Проверьте DNS/IP после подключения.</p><p class="small muted" id="install-help"></p></div>`;
  $('#config-text').textContent=conf;
  const tips={android:'Android: установите WireGuard из Google Play или F-Droid, добавьте туннель из файла или QR-кода.',ios:'iPhone/iPad: установите WireGuard из App Store, откройте приложение и выберите «Создать туннель» → из файла или QR-кода.',windows:'Windows: установите официальный WireGuard с wireguard.com/install, затем «Import tunnel(s) from file».',macos:'macOS: установите WireGuard, выберите «Import tunnel(s) from file».',linux:'Linux: установите wireguard-tools, сохраните файл как /etc/wireguard/wg-still.conf (права 600) и запустите sudo wg-quick up wg-still.'};
- $('#install-help').textContent=(tips[platform]||'')+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
+ $('#install-help').textContent=(response.protocol==='amneziawg'?'На Android импортируйте файл в AmneziaVPN с поддержкой AmneziaWG 3.1 (проверенный клиент).':(tips[platform]||''))+' Для всех платформ: скачайте конфигурацию, импортируйте её и активируйте туннель. Не пересылайте приватный ключ.';
  if(window.QRCode){try{new QRCode($('#qr'),{text:conf,width:205,height:205,correctLevel:QRCode.CorrectLevel.L})}catch{$('#qr').textContent='QR слишком большой. Скачайте файл.'}}else $('#qr').textContent='QR не загрузился. Скачайте файл.';
- const confFilename='still-'+name.replace(/[^a-z0-9-_]/gi,'-')+'.conf';
+ const confFilename=(response.protocol==='amneziawg'?'sawg-':'swg-')+response.id.slice(0,8)+'.conf';
  $('#send-conf-telegram').onclick=async()=>{const b=$('#send-conf-telegram');if(!confirm('Отправить конфигурацию с приватным ключом в ваш личный Telegram-чат? Сервер не будет хранить ключ, но файл останется в Telegram.'))return;b.disabled=true;b.textContent='Отправляем в чат…';try{await api('devices/'+response.id+'/send-conf',{method:'POST',body:JSON.stringify({private_key:keys.privateKey})});toast('Файл отправлен в личный чат с ботом. Закройте Mini App, чтобы найти его.');b.textContent='✓ Файл отправлен в Telegram'}catch(e){toast(e.message,true);b.disabled=false;b.textContent='✉ Получить .conf в личный чат Telegram'}};
  $('#download').onclick=()=>wireguardBlobDownload(conf,confFilename);
  $('#share-conf').onclick=()=>saveWireguardConf(conf,confFilename);
